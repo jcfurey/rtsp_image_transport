@@ -11,6 +11,7 @@ jobs:
           - {ROS_DISTRO: jazzy}
           - {ROS_DISTRO: rolling}
     env:
+      ROSDEP_SKIP_KEYS: 'live555 live555_vendor'
       UPSTREAM_WORKSPACE: 'github:fkie/live555_vendor#main'
     runs-on: ubuntu-latest
     steps:
