@@ -1,22 +1,20 @@
 <?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
     <name>rtsp_image_transport</name>
-    <version>0.1.0</version>
+    <version>2.0.0</version>
     <description>Transmit video streams with the Real-Time Streaming Protocol</description>
     <license>Apache-2.0</license>
-    <author>Timo Röhling</author>
+    <author email="timo.roehling@fkie.fraunhofer.de">Timo Röhling</author>
     <maintainer email="timo.roehling@fkie.fraunhofer.de">Timo Röhling</maintainer>
-    <buildtool_depend>catkin</buildtool_depend>
-    <build_depend>message_generation</build_depend>
+    <buildtool_depend>ament_cmake</buildtool_depend>
     <depend>cv_bridge</depend>
-    <depend>dynamic_reconfigure</depend>
     <depend>ffmpeg</depend>
     <depend>image_transport</depend>
-    <depend>live555</depend>
+    <depend>live555_vendor</depend>
     <depend>pluginlib</depend>
-    <depend>std_msgs</depend>
-    <exec_depend>message_runtime</exec_depend>
+    <depend>rclcpp</depend>
     <export>
-        <image_transport plugin="${prefix}/rtsp_image_transport_plugins.xml" />
+        <build_type>ament_cmake</build_type>
     </export>
 </package>

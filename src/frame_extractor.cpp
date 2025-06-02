@@ -1,8 +1,9 @@
 /****************************************************************************
  *
  * rtsp_image_transport
- * Copyright © 2021 Fraunhofer FKIE
+ * Copyright © 2021-2025 Fraunhofer FKIE
  * Author: Timo Röhling
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,9 +22,11 @@
 
 #include "frame_data.h"
 #include "stream_client.h"
+#include "streaming_error.h"
 
-#include <boost/format.hpp>
-#include <ros/console.h>
+#include <rclcpp/logging.hpp>
+
+#include <format>
 
 namespace rtsp_image_transport
 {
@@ -35,23 +38,19 @@ const unsigned char MPEG_START_CODE[] = {0x00, 0x00, 0x00, 0x01};
 
 }
 
-FrameExtractor*
-FrameExtractor::createNew(const std::weak_ptr<StreamClient>& stream_client,
-                          UsageEnvironment& env, MediaSubsession* subsession)
+FrameExtractor* FrameExtractor::createNew(const std::weak_ptr<StreamClient>& stream_client, UsageEnvironment& env,
+                                          MediaSubsession* subsession)
 {
     return new FrameExtractor(stream_client, env, subsession);
 }
 
-FrameExtractor::FrameExtractor(const std::weak_ptr<StreamClient>& stream_client,
-                               UsageEnvironment& env,
+FrameExtractor::FrameExtractor(const std::weak_ptr<StreamClient>& stream_client, UsageEnvironment& env,
                                MediaSubsession* subsession)
     : MediaSink(env), stream_client_(stream_client), subsession_(subsession),
       codec_(fromRTSPCodecName(subsession_->codecName())), buffer_length_(0)
 {
     if (codec_ == VideoCodec::Unknown)
-        throw StreamingError((boost::format("unsupported video codec %1%")
-                              % subsession->codecName())
-                                 .str());
+        throw StreamingError(std::format("unsupported video codec {}", subsession->codecName()));
     if (codec_ == VideoCodec::H264 || codec_ == VideoCodec::H265)
     {
         /* Pass out-of-band PPS and SPS NAL units */
@@ -65,16 +64,12 @@ FrameExtractor::FrameExtractor(const std::weak_ptr<StreamClient>& stream_client,
                 SPropRecord* nals = parseSPropParameterSets(sprops, num_nals);
                 for (unsigned i = 0; i < num_nals; ++i)
                 {
-                    if (buffer_length_ + nals[i].sPropLength + 4
-                        > buffer_.size())
+                    if (buffer_length_ + nals[i].sPropLength + 4 > buffer_.size())
                         throw StreamingError("frame buffer overflow");
-                    std::copy_n(MPEG_START_CODE, sizeof(MPEG_START_CODE),
-                                buffer_.data() + buffer_length_);
+                    std::copy_n(MPEG_START_CODE, sizeof(MPEG_START_CODE), buffer_.data() + buffer_length_);
                     std::copy_n(nals[i].sPropBytes, nals[i].sPropLength,
-                                buffer_.data() + buffer_length_
-                                    + sizeof(MPEG_START_CODE));
-                    buffer_length_ +=
-                        nals[i].sPropLength + sizeof(MPEG_START_CODE);
+                                buffer_.data() + buffer_length_ + sizeof(MPEG_START_CODE));
+                    buffer_length_ += nals[i].sPropLength + sizeof(MPEG_START_CODE);
                 }
                 delete[] nals;
             }
@@ -93,20 +88,16 @@ Boolean FrameExtractor::continuePlaying()
     {
         if (buffer_.size() - sizeof(MPEG_START_CODE) >= buffer_length_)
         {
-            std::copy_n(MPEG_START_CODE, sizeof(MPEG_START_CODE),
-                        buffer_.data() + buffer_length_);
+            std::copy_n(MPEG_START_CODE, sizeof(MPEG_START_CODE), buffer_.data() + buffer_length_);
             buffer_length_ += sizeof(MPEG_START_CODE);
         }
     }
-    fSource->getNextFrame(buffer_.data() + buffer_length_,
-                          buffer_.size() - buffer_length_, newFrameCallback,
-                          this, onSourceClosure, this);
+    fSource->getNextFrame(buffer_.data() + buffer_length_, buffer_.size() - buffer_length_, newFrameCallback, this,
+                          onSourceClosure, this);
     return True;
 }
 
-void FrameExtractor::deliverFrame(unsigned frameSize,
-                                  unsigned numTruncatedBytes,
-                                  struct timeval presentationTime,
+void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes, struct timeval presentationTime,
                                   unsigned durationInMicroseconds)
 {
     std::shared_ptr<StreamClient> sc = stream_client_.lock();
@@ -114,31 +105,25 @@ void FrameExtractor::deliverFrame(unsigned frameSize,
     {
         if (numTruncatedBytes)
         {
-            ROS_WARN_STREAM("FrameExtractor buffer is " << numTruncatedBytes
-                                                        << " bytes too small");
+            RCLCPP_WARN(rclcpp::get_logger("FrameExtractor"), "FrameExtractor buffer is %u bytes too small",
+                        numTruncatedBytes);
         }
         buffer_length_ += frameSize;
-        ros::Time ts(presentationTime.tv_sec,
-                     1000ull * presentationTime.tv_usec);
+        rclcpp::Time ts(presentationTime.tv_sec, 1000ull * presentationTime.tv_usec);
         if (buffer_length_ > 48)
         {
-            sc->receiveStreamData(codec_, subsession_,
-                                  std::make_shared<FrameData>(
-                                      buffer_.data(), buffer_length_, ts));
+            sc->receiveStreamData(codec_, subsession_, std::make_shared<FrameData>(buffer_.data(), buffer_length_, ts));
             buffer_length_ = 0;
         }
         continuePlaying();
     }
 }
 
-void FrameExtractor::newFrameCallback(void* obj, unsigned frameSize,
-                                      unsigned numTruncatedBytes,
-                                      struct timeval presentationTime,
-                                      unsigned durationInMicroseconds)
+void FrameExtractor::newFrameCallback(void* obj, unsigned frameSize, unsigned numTruncatedBytes,
+                                      struct timeval presentationTime, unsigned durationInMicroseconds)
 {
     FrameExtractor* self = static_cast<FrameExtractor*>(obj);
-    self->deliverFrame(frameSize, numTruncatedBytes, presentationTime,
-                       durationInMicroseconds);
+    self->deliverFrame(frameSize, numTruncatedBytes, presentationTime, durationInMicroseconds);
 }
 
 }  // namespace rtsp_image_transport

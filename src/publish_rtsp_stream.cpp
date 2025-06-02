@@ -1,8 +1,9 @@
 /****************************************************************************
  *
  * rtsp_image_transport
- * Copyright © 2021 Fraunhofer FKIE
+ * Copyright © 2021-2025 Fraunhofer FKIE
  * Author: Timo Röhling
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,12 +18,12 @@
  * limitations under the License.
  *
  ****************************************************************************/
-#include <cv_bridge/cv_bridge.h>
+#include <cv_bridge/cv_bridge.hpp>
 #include <opencv2/imgcodecs.hpp>
-#include <ros/ros.h>
-#include <sensor_msgs/Image.h>
-#include <sensor_msgs/image_encodings.h>
-#include <std_msgs/String.h>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/image_encodings.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <std_msgs/msg/string.hpp>
 
 extern char _binary_rtsp_only_png_start;
 extern char _binary_rtsp_only_png_end;
@@ -34,49 +35,47 @@ int main(int argc, char** argv)
     if (n != std::string::npos)
         self = self.substr(n + 1);
 
-    ros::init(argc, argv, self, ros::init_options::AnonymousName);
-    std::string topic = ros::names::remap("image");
+    rclcpp::init(argc, argv);
+    std::vector<std::string> args = rclcpp::remove_ros_arguments(argc, argv);
+    rclcpp::Node::SharedPtr node = std::make_shared<rclcpp::Node>(self);
+    rclcpp::Logger logger = node->get_logger();
+    std::string topic = node->get_node_topics_interface()->resolve_topic_name("image");
 
-    if (argc < 2)
+    if (args.size() < 2)
     {
-        ROS_ERROR(
-            "Missing stream URL. Typical command line usage:\n"
-            "  $ rosrun " ROS_PACKAGE_NAME
-            " %s image:=<image topic> rtsp://url",
-            self.c_str());
+        RCLCPP_ERROR(logger,
+                     "Missing stream URL. Typical command line usage:\n"
+                     "  $ ros2 run " ROS_PACKAGE_NAME " %s rtsp://<url> --ros-args --remap image:=<image topic>",
+                     self.c_str());
         return 2;
     }
     if (topic == "image")
     {
-        ROS_WARN(
-            "Topic 'image' has not been remapped! Typical command line usage:\n"
-            "  $ rosrun " ROS_PACKAGE_NAME
-            " %s image:=<image topic> rtsp://url",
-            self.c_str());
+        RCLCPP_WARN(logger,
+                    "Topic 'image' has not been remapped! Typical command line usage:\n"
+                    "  $ ros2 run " ROS_PACKAGE_NAME " %s rtsp://<url> --ros-args --remap image:=<image topic>",
+                    self.c_str());
     }
-    if (argc > 2)
+    if (args.size() > 2)
     {
-        ROS_WARN("Extra command line arguments ignored");
+        RCLCPP_WARN(logger, "Extra command line arguments ignored");
     }
-    std_msgs::String url;
-    url.data = argv[1];
+    std_msgs::msg::String url;
+    url.data = args[1];
     if (url.data.substr(0, 7) != "rtsp://")
     {
-        ROS_WARN("URL does not begin with rtsp://");
+        RCLCPP_WARN(logger, "URL does not begin with rtsp://");
     }
-    ros::NodeHandle nh;
     int png_size = &_binary_rtsp_only_png_end - &_binary_rtsp_only_png_start;
     const cv::Mat rtsp_only_mat =
-        cv::imdecode(cv::Mat(1, png_size, CV_8U, &_binary_rtsp_only_png_start),
-                     cv::IMREAD_COLOR);
-    sensor_msgs::ImagePtr rtsp_only_img =
-        cv_bridge::CvImage(std_msgs::Header(),
-                           sensor_msgs::image_encodings::BGR8, rtsp_only_mat)
-            .toImageMsg();
-    ros::Publisher pub0 = nh.advertise<sensor_msgs::Image>(topic, 1, true);
-    pub0.publish(rtsp_only_img);
-    ros::Publisher pub =
-        nh.advertise<std_msgs::String>(topic + "/rtsp", 1, true);
-    pub.publish(url);
-    ros::spin();
+        cv::imdecode(cv::Mat(1, png_size, CV_8U, &_binary_rtsp_only_png_start), cv::IMREAD_COLOR);
+    sensor_msgs::msg::Image::SharedPtr rtsp_only_img =
+        cv_bridge::CvImage(std_msgs::msg::Header(), sensor_msgs::image_encodings::BGR8, rtsp_only_mat).toImageMsg();
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub0 = node->create_publisher<sensor_msgs::msg::Image>(
+        topic, rclcpp::QoS(rclcpp::KeepLast(1)).durability(RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL));
+    pub0->publish(*rtsp_only_img);
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub = node->create_publisher<std_msgs::msg::String>(
+        topic + "/rtsp", rclcpp::QoS(rclcpp::KeepLast(1)).durability(RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL));
+    pub->publish(url);
+    rclcpp::spin(node);
 }

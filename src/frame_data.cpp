@@ -1,8 +1,9 @@
 /****************************************************************************
  *
  * rtsp_image_transport
- * Copyright © 2021 Fraunhofer FKIE
+ * Copyright © 2021-2025 Fraunhofer FKIE
  * Author: Timo Röhling
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,7 +31,7 @@ namespace rtsp_image_transport
 {
 
 FrameData::FrameData(const unsigned char* data, std::size_t length,
-                     const ros::Time& stamp)
+                     const rclcpp::Time& stamp)
     : data_(new unsigned char[length + AV_INPUT_BUFFER_PADDING_SIZE]),
       length_(length), stamp_(stamp)
 {

@@ -1,8 +1,9 @@
 /****************************************************************************
  *
  * rtsp_image_transport
- * Copyright © 2021 Fraunhofer FKIE
+ * Copyright © 2021-2025 Fraunhofer FKIE
  * Author: Timo Röhling
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,14 +22,13 @@
 #define RTSP_IMAGE_TRANSPORT_STREAM_CLIENT_H_
 
 #include "frame_data.h"
-#include "streaming_error.h"
 #include "video_codec.h"
 
 #include <BasicUsageEnvironment.hh>
 #include <liveMedia.hh>
+#include <rclcpp/logger.hpp>
 
 #include <chrono>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -39,6 +39,7 @@ namespace rtsp_image_transport
 
 class Live555Client;
 class FrameExtractor;
+class StreamingError;
 
 class StreamClient : public std::enable_shared_from_this<StreamClient>
 {
@@ -46,17 +47,15 @@ class StreamClient : public std::enable_shared_from_this<StreamClient>
     friend class FrameExtractor;
 
 public:
-    using SubsessionStartedHandler =
-        std::function<void(VideoCodec codec, MediaSubsession* subsession)>;
+    using SubsessionStartedHandler = std::function<void(VideoCodec codec, MediaSubsession* subsession)>;
     using SubsessionFinishedHandler = std::function<void(MediaSubsession*)>;
-    using SessionFailedHandler =
-        std::function<void(int code, const std::string& message)>;
+    using SessionFailedHandler = std::function<void(int code, const std::string& message)>;
     using SessionReadyHandler = std::function<void()>;
     using SessionStartedHandler = std::function<void()>;
     using SessionFinishedHandler = std::function<void()>;
     using SessionTimeoutHandler = std::function<void()>;
-    using ReceiveStreamDataHandler = std::function<void(
-        VideoCodec codec, MediaSubsession* subsession, const FrameDataPtr&)>;
+    using ReceiveStreamDataHandler =
+        std::function<void(VideoCodec codec, MediaSubsession* subsession, const FrameDataPtr&)>;
 
     ~StreamClient();
     StreamClient(const StreamClient&) = delete;
@@ -66,12 +65,12 @@ public:
     VideoCodec codec() const noexcept;
     std::string url() const noexcept;
     std::string topicName() const noexcept;
+    const rclcpp::Logger& logger() const noexcept;
     void connect();
     void disconnect();
     void setSessionTimeout(const std::chrono::milliseconds& timeout) noexcept;
     void setSubsessionStartedHandler(SubsessionStartedHandler handler) noexcept;
-    void
-    setSubsessionFinishedHandler(SubsessionFinishedHandler handler) noexcept;
+    void setSubsessionFinishedHandler(SubsessionFinishedHandler handler) noexcept;
     void setSessionFailedHandler(SessionFailedHandler handler) noexcept;
     void setSessionReadyHandler(SessionReadyHandler handler) noexcept;
     void setSessionStartedHandler(SessionStartedHandler handler) noexcept;
@@ -80,7 +79,8 @@ public:
     void setReceiveStreamDataHandler(ReceiveStreamDataHandler handler) noexcept;
 
     static std::shared_ptr<StreamClient>
-    create(const std::string& topic_name, const std::string& url) noexcept;
+    create(const std::string& topic_name, const std::string& url,
+           const rclcpp::Logger& logger = rclcpp::get_logger("StreamClient")) noexcept;
 
 protected:
     void subsessionStarted(VideoCodec codec, MediaSubsession* subsession);
@@ -90,16 +90,15 @@ protected:
     void sessionStarted();
     void sessionFinished();
     void sessionTimeout();
-    void receiveStreamData(VideoCodec codec, MediaSubsession* subsession,
-                           const FrameDataPtr& data);
+    void receiveStreamData(VideoCodec codec, MediaSubsession* subsession, const FrameDataPtr& data);
 
 private:
-    StreamClient(const std::string& topic_name,
-                 const std::string& url) noexcept;
+    StreamClient(const std::string& topic_name, const std::string& url, const rclcpp::Logger& logger) noexcept;
 
     std::string topic_name_, url_;
+    rclcpp::Logger logger_;
     VideoCodec codec_;
-    char quit_flag_;
+    EventLoopWatchVariable quit_flag_;
     bool retried_on_454_error_;
     std::chrono::milliseconds timeout_;
     std::mutex client_mutex_;

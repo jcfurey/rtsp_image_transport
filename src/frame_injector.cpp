@@ -1,8 +1,9 @@
 /****************************************************************************
  *
  * rtsp_image_transport
- * Copyright © 2021 Fraunhofer FKIE
+ * Copyright © 2021-2025 Fraunhofer FKIE
  * Author: Timo Röhling
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -86,7 +87,7 @@ void FrameInjector::deliverFrame()
         fFrameSize = fMaxSize;
         fNumTruncatedBytes = frame->length() - fMaxSize;
     }
-    uint64_t nsec = frame->stamp().toNSec();
+    uint64_t nsec = frame->stamp().nanoseconds();
     fPresentationTime.tv_sec = nsec / 1000000000ull;
     fPresentationTime.tv_usec = (nsec % 1000000000ull) / 1000ull;
     std::copy_n(frame->data(), fFrameSize, fTo);

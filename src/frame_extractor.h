@@ -1,8 +1,9 @@
 /****************************************************************************
  *
  * rtsp_image_transport
- * Copyright © 2021 Fraunhofer FKIE
+ * Copyright © 2021-2025 Fraunhofer FKIE
  * Author: Timo Röhling
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,42 +21,37 @@
 #ifndef RTSP_IMAGE_TRANSPORT_FRAME_EXTRACTOR_H_
 #define RTSP_IMAGE_TRANSPORT_FRAME_EXTRACTOR_H_
 
-#include "streaming_error.h"
 #include "video_codec.h"
 
 #include <liveMedia.hh>
-#include <ros/time.h>
 
 #include <array>
-#include <cstdint>
+#include <cstddef>
 #include <memory>
 
 namespace rtsp_image_transport
 {
 
 class StreamClient;
+class StreamingError;
 
 class FrameExtractor : public MediaSink
 {
 public:
-    static FrameExtractor*
-    createNew(const std::weak_ptr<StreamClient>& stream_client,
-              UsageEnvironment& env, MediaSubsession* subsession);
+    static FrameExtractor* createNew(const std::weak_ptr<StreamClient>& stream_client, UsageEnvironment& env,
+                                     MediaSubsession* subsession);
     VideoCodec codec() const;
 
 protected:
     Boolean continuePlaying();
 
 private:
-    FrameExtractor(const std::weak_ptr<StreamClient>& stream_client,
-                   UsageEnvironment& env, MediaSubsession* subsession);
+    FrameExtractor(const std::weak_ptr<StreamClient>& stream_client, UsageEnvironment& env,
+                   MediaSubsession* subsession);
 
-    static void newFrameCallback(void* self, unsigned frameSize,
-                                 unsigned numTruncatedBytes,
-                                 struct timeval presentationTime,
-                                 unsigned durationInMicroseconds);
-    void deliverFrame(unsigned frameSize, unsigned numTruncatedBytes,
-                      struct timeval presentationTime,
+    static void newFrameCallback(void* self, unsigned frameSize, unsigned numTruncatedBytes,
+                                 struct timeval presentationTime, unsigned durationInMicroseconds);
+    void deliverFrame(unsigned frameSize, unsigned numTruncatedBytes, struct timeval presentationTime,
                       unsigned durationInMicroseconds);
 
     std::weak_ptr<StreamClient> stream_client_;

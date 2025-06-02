@@ -1,8 +1,9 @@
 /****************************************************************************
  *
  * rtsp_image_transport
- * Copyright © 2021 Fraunhofer FKIE
+ * Copyright © 2021-2025 Fraunhofer FKIE
  * Author: Timo Röhling
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,10 +20,13 @@
  ****************************************************************************/
 #include "stream_decoder.h"
 
-#include "log_level.h"
+#include "streaming_error.h"
 
-#include <boost/format.hpp>
-#include <sensor_msgs/image_encodings.h>
+#include <sensor_msgs/image_encodings.hpp>
+
+#include <format>
+#include <map>
+#include <vector>
 
 extern "C"
 {
@@ -30,10 +34,7 @@ extern "C"
 #include <libavutil/opt.h>
 }
 
-#include <ros/console.h>
-
-#include <map>
-#include <vector>
+#include <rclcpp/logging.hpp>
 
 namespace rtsp_image_transport
 {
@@ -57,61 +58,48 @@ void free_packet(AVPacket* packet)
 }
 
 const std::map<VideoCodec, std::vector<std::string>> FFMPEG_DECODERS{
-    {VideoCodec::H264, {"h264_cuvid", "h264"}},
-    {VideoCodec::H265, {"hevc_cuvid", "h265"}},
-    {VideoCodec::MPEG4, {"mpeg4_cuvid", "mpeg4"}},
-    {VideoCodec::VP8, {"vp8_cuvid", "vp8"}},
-    {VideoCodec::VP9, {"vp9_cuvid", "vp9"}},
-    {VideoCodec::MJPEG, {"mjpeg_cuvid", "mjpeg"}}};
+    {VideoCodec::H264, {"h264_cuvid", "h264"}},    {VideoCodec::H265, {"hevc_cuvid", "h265"}},
+    {VideoCodec::MPEG4, {"mpeg4_cuvid", "mpeg4"}}, {VideoCodec::VP8, {"vp8_cuvid", "vp8"}},
+    {VideoCodec::VP9, {"vp9_cuvid", "vp9"}},       {VideoCodec::MJPEG, {"mjpeg_cuvid", "mjpeg"}}};
 
 }  // namespace
 
-StreamDecoder::StreamDecoder(VideoCodec codec, bool use_hw_decoder)
-    : codec_(codec), initialized_(false), width_(0), height_(0),
-      last_pixel_format_(AV_PIX_FMT_NONE)
+StreamDecoder::StreamDecoder(VideoCodec codec, bool use_hw_decoder, const rclcpp::Logger& logger)
+    : logger_(logger), codec_(codec), initialized_(false), width_(0), height_(0), last_pixel_format_(AV_PIX_FMT_NONE)
 {
     auto decoders = FFMPEG_DECODERS.find(codec);
     if (decoders == FFMPEG_DECODERS.end())
-        throw StreamingError(
-            (boost::format("no decoder support available for %1%")
-             % videoCodecName(codec))
-                .str());
+        throw StreamingError(std::format("no decoder support available for {}", videoCodecName(codec)));
     for (const std::string& codec_name : decoders->second)
     {
         if (!use_hw_decoder && codec_name.find("_") != std::string::npos)
             continue;
-        AVCodec* decoder = nullptr;
+        const AVCodec* decoder = nullptr;
         try
         {
             decoder = avcodec_find_decoder_by_name(codec_name.c_str());
             if (decoder)
             {
-                ROS_DEBUG_STREAM("[" << codec_name
-                                     << "] attempting to initialize decoder");
+                RCLCPP_DEBUG(logger_, "[%s] attempting to initialize decoder", codec_name.c_str());
                 setupDecoder(decoder);
                 break;
             }
             else
             {
-                ROS_DEBUG_STREAM("["
-                                 << codec_name
-                                 << "] not available in your FFmpeg library");
+                RCLCPP_DEBUG(logger_, "[%s] not available in your FFmpeg library", codec_name.c_str());
             }
         }
         catch (const std::exception& e)
         {
             ctx_.reset();
-            ROS_DEBUG_STREAM("[" << decoder->name << "] " << e.what());
+            RCLCPP_DEBUG(logger_, "[%s] %s", decoder ? decoder->name : "(nullptr)", e.what());
         }
     }
     if (!ctx_)
-        throw StreamingError(
-            (boost::format("no usable decoder available for %1%")
-             % videoCodecName(codec))
-                .str());
+        throw StreamingError(std::format("no usable decoder available for {}", videoCodecName(codec)));
 }
 
-void StreamDecoder::setupDecoder(AVCodec* decoder)
+void StreamDecoder::setupDecoder(const AVCodec* decoder)
 {
     ctx_.reset(avcodec_alloc_context3(decoder), free_context);
     if (!ctx_)
@@ -159,32 +147,27 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
     }
     pkt_->data = const_cast<unsigned char*>(data->data());
     pkt_->size = data->length();
-    ctx_->reordered_opaque = data->stamp().toNSec();
+    ctx_->reordered_opaque = data->stamp().nanoseconds();
     int result;
     if ((result = avcodec_send_packet(ctx_.get(), pkt_.get())) != 0)
     {
         char errbuf[80];
-        throw DecodingError(
-            (boost::format("failed to send bitstream packet to decoder: %1%")
-             % av_make_error_string(errbuf, sizeof(errbuf), result))
-                .str());
+        throw DecodingError(std::format("failed to send bitstream packet to decoder: {}",
+                                        av_make_error_string(errbuf, sizeof(errbuf), result)));
     }
     std::size_t count = 0;
     while ((result = avcodec_receive_frame(ctx_.get(), frm_.get())) == 0)
     {
-        if (!sws_ || frm_->width != width_ || frm_->height != height_
-            || frm_->format != last_pixel_format_)
+        if (!sws_ || frm_->width != width_ || frm_->height != height_ || frm_->format != last_pixel_format_)
         {
             width_ = frm_->width;
             height_ = frm_->height;
             last_pixel_format_ = static_cast<AVPixelFormat>(frm_->format);
-            sws_.reset(sws_getContext(width_, height_, last_pixel_format_,
-                                      width_, height_, AV_PIX_FMT_BGR24,
-                                      SWS_FAST_BILINEAR, nullptr, nullptr,
-                                      nullptr),
+            sws_.reset(sws_getContext(width_, height_, last_pixel_format_, width_, height_, AV_PIX_FMT_BGR24,
+                                      SWS_FAST_BILINEAR, nullptr, nullptr, nullptr),
                        sws_freeContext);
         }
-        sensor_msgs::ImagePtr img{new sensor_msgs::Image()};
+        sensor_msgs::msg::Image::UniquePtr img = std::make_unique<sensor_msgs::msg::Image>();
         img->encoding = sensor_msgs::image_encodings::BGR8;
         img->header.stamp = data->stamp();
         img->width = width_;
@@ -194,28 +177,25 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
         img->data.resize(3 * width_ * height_);
         unsigned char* rgb_data[] = {img->data.data()};
         int rgb_linesize[] = {3 * width_};
-        sws_scale(sws_.get(), frm_->data, frm_->linesize, 0, height_, rgb_data,
-                  rgb_linesize);
+        sws_scale(sws_.get(), frm_->data, frm_->linesize, 0, height_, rgb_data, rgb_linesize);
         count++;
-        frames_.push_back(img);
+        frames_.push_back(std::move(img));
     }
     av_frame_unref(frm_.get());
     if (result != AVERROR(EAGAIN))
     {
         char errbuf[80];
-        throw DecodingError(
-            (boost::format("failed to receive frames from decoder: %1%")
-             % av_make_error_string(errbuf, sizeof(errbuf), result))
-                .str());
+        throw DecodingError(std::format("failed to receive frames from decoder: {}",
+                                        av_make_error_string(errbuf, sizeof(errbuf), result)));
     }
     return count;
 }
 
-sensor_msgs::ImageConstPtr StreamDecoder::nextFrame() noexcept
+sensor_msgs::msg::Image::UniquePtr StreamDecoder::nextFrame() noexcept
 {
     if (frames_.empty())
-        return sensor_msgs::ImageConstPtr();
-    sensor_msgs::ImageConstPtr img = frames_.front();
+        return sensor_msgs::msg::Image::UniquePtr();
+    sensor_msgs::msg::Image::UniquePtr img = std::move(frames_.front());
     frames_.pop_front();
     return img;
 }

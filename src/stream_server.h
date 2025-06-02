@@ -1,8 +1,9 @@
 /****************************************************************************
  *
  * rtsp_image_transport
- * Copyright © 2021 Fraunhofer FKIE
+ * Copyright © 2021-2025 Fraunhofer FKIE
  * Author: Timo Röhling
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,12 +23,12 @@
 
 #include "frame_data.h"
 #include "frame_injector.h"
-#include "streaming_error.h"
 #include "video_codec.h"
 
 #include <BasicUsageEnvironment.hh>
 #include <GroupsockHelper.hh>
 #include <liveMedia.hh>
+#include <rclcpp/logger.hpp>
 
 #include <map>
 #include <memory>
@@ -58,25 +59,25 @@ public:
     std::string url() const noexcept;
     void start(VideoCodec codec, bool use_multicast);
     void stop();
-    static std::shared_ptr<StreamServer> create(const std::string& topic_name,
-                                                unsigned udp_port,
-                                                unsigned udp_packet_size);
+    static std::shared_ptr<StreamServer> create(const std::string& topic_name, unsigned udp_port,
+                                                unsigned udp_packet_size,
+                                                const rclcpp::Logger& logger = rclcpp::get_logger("StreamServer"));
 
 protected:
-    void newStreamSource(FramedSource* source,
-                         FrameInjector* injector) noexcept;
+    void newStreamSource(FramedSource* source, FrameInjector* injector) noexcept;
     void closeStreamSource(FramedSource* source) noexcept;
     RTPSink* activeSinkForSDP();
 
 private:
     using StreamMapping = std::map<FramedSource*, FrameInjector*>;
 
-    StreamServer(const std::string& topic_name, unsigned udp_port,
-                 unsigned udp_packet_size);
+    StreamServer(const std::string& topic_name, unsigned udp_port, unsigned udp_packet_size,
+                 const rclcpp::Logger& logger);
 
+    rclcpp::Logger logger_;
     VideoCodec codec_;
     std::string topic_name_;
-    char quit_flag_;
+    EventLoopWatchVariable quit_flag_;
     unsigned udp_packet_size_;
     std::string url_;
     /* The order of the following member variables is important,

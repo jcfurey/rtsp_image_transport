@@ -1,8 +1,9 @@
 /****************************************************************************
  *
  * rtsp_image_transport
- * Copyright © 2021 Fraunhofer FKIE
+ * Copyright © 2021-2025 Fraunhofer FKIE
  * Author: Timo Röhling
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,10 +22,11 @@
 #define RTSP_IMAGE_TRANSPORT_STREAM_ENCODER_H_
 
 #include "frame_data.h"
-#include "streaming_error.h"
 #include "video_codec.h"
 
-#include <sensor_msgs/Image.h>
+#include <rclcpp/logger.hpp>
+#include <rclcpp/time.hpp>
+#include <sensor_msgs/msg/image.hpp>
 
 #include <cstdint>
 #include <deque>
@@ -39,23 +41,28 @@ extern "C"
 namespace rtsp_image_transport
 {
 
+class StreamingError;
+class EncodingError;
+
 class StreamEncoder
 {
 public:
-    StreamEncoder(VideoCodec codec, bool use_hw_encoder = true);
+    StreamEncoder(VideoCodec codec, bool use_hw_encoder = true,
+                  const rclcpp::Logger& logger = rclcpp::get_logger("StreamEncoder"));
     void setBitrate(unsigned long bit_rate);
     void setFramerate(unsigned fps);
     void setPackageSizeHint(unsigned size);
     bool hwAccel() const noexcept;
     VideoCodec codec() const noexcept;
-    std::size_t encodeVideo(const sensor_msgs::Image& image);
+    std::size_t encodeVideo(const sensor_msgs::msg::Image& image);
     FrameDataPtr nextPacket() noexcept;
     AVCodecContext* context() noexcept;
 
 private:
-    void setupEncoder(AVCodec* encoder, bool silent);
+    void setupEncoder(const AVCodec* encoder, bool silent);
     void openEncoder(int width, int height);
 
+    rclcpp::Logger logger_;
     VideoCodec codec_;
     bool initialized_, is_vaapi_;
     std::shared_ptr<AVCodecContext> ctx_;
@@ -69,7 +76,7 @@ private:
     std::shared_ptr<AVPacket> pkt_;
     AVPixelFormat last_pixel_format_;
     std::shared_ptr<SwsContext> sws_;
-    ros::Time first_ts_;
+    rclcpp::Time first_ts_;
     std::int64_t last_pts_;
     int picture_number_;
     std::deque<FrameDataPtr> packets_;

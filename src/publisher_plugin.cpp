@@ -1,8 +1,9 @@
 /****************************************************************************
  *
  * rtsp_image_transport
- * Copyright © 2021 Fraunhofer FKIE
+ * Copyright © 2021-2025 Fraunhofer FKIE
  * Author: Timo Röhling
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,21 +25,31 @@
 #include "stream_server.h"
 #include "video_codec.h"
 
-#include <pluginlib/class_list_macros.h>
-
 namespace rtsp_image_transport
 {
 
-static_assert(static_cast<int>(VideoCodec::H264) == RTSPPublisher_H264);
-static_assert(static_cast<int>(VideoCodec::H265) == RTSPPublisher_H265);
-static_assert(static_cast<int>(VideoCodec::MPEG4) == RTSPPublisher_MPEG4);
-static_assert(static_cast<int>(VideoCodec::VP8) == RTSPPublisher_VP8);
-static_assert(static_cast<int>(VideoCodec::VP9) == RTSPPublisher_VP9);
+struct RTSP_IMAGE_TRANSPORT_NO_EXPORT PublisherPlugin::Config
+{
+    VideoCodec codec = VideoCodec::Unknown;
+    unsigned bit_rate = 1000;
+    unsigned frame_rate = 30;
+    bool use_hw_encoder = true;
+    unsigned udp_port = 0;
+    unsigned udp_packet_size = 1396;
+    bool use_ip_multicast = false;
+};
 
-using SuperClass = image_transport::SimplePublisherPlugin<std_msgs::String>;
+const std::map<std::string, VideoCodec> CODEC_NAMES = {{"H264", VideoCodec::H264},
+                                                       {"H265", VideoCodec::H265},
+                                                       {"MPEG4", VideoCodec::MPEG4},
+                                                       {"VP8", VideoCodec::VP8},
+                                                       {"VP9", VideoCodec::VP9}};
+
+using SuperClass = image_transport::SimplePublisherPlugin<std_msgs::msg::String>;
 
 PublisherPlugin::PublisherPlugin()
-    : SuperClass(), update_url_(false), failed_(false)
+    : SuperClass(), logger_(rclcpp::get_logger("rtsp_image_transport")), config_(std::make_unique<Config>()),
+      update_url_(false), failed_(false)
 {
     global_initialize();
 }
@@ -46,7 +57,9 @@ PublisherPlugin::PublisherPlugin()
 void PublisherPlugin::shutdown()
 {
     SuperClass::shutdown();
-    config_server_.reset();
+    if (graph_monitor_)
+        graph_monitor_->removeListener(this);
+    graph_monitor_.reset();
     server_.reset();
     encoder_.reset();
 }
@@ -56,35 +69,139 @@ std::string PublisherPlugin::getTransportName() const
     return "rtsp";
 }
 
-void PublisherPlugin::advertiseImpl(
-    ros::NodeHandle& nh, const std::string& base_topic, uint32_t queue_size,
-    const image_transport::SubscriberStatusCallback& user_connect_cb,
-    const image_transport::SubscriberStatusCallback& user_disconnect_cb,
-    const ros::VoidPtr& tracked_object, bool latch)
+void PublisherPlugin::advertiseImpl(rclcpp::Node* node, const std::string& base_topic, rmw_qos_profile_t custom_qos,
+                                    rclcpp::PublisherOptions options)
 {
-    SuperClass::advertiseImpl(nh, base_topic, queue_size, user_connect_cb,
-                              user_disconnect_cb, tracked_object, true);
+    custom_qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
+    custom_qos.history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+    custom_qos.depth = 1;
+    custom_qos.durability = RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
+    SuperClass::advertiseImpl(node, base_topic, custom_qos, options);
+    graph_monitor_ = GraphMonitor::instance(node, this);
+    logger_ = node->get_logger();
     topic_name_ = base_topic;
+    node_param_ = rclcpp::node_interfaces::get_node_parameters_interface(node);
+    std::size_t len = node->get_effective_namespace().length();
+    param_base_name_ = base_topic.substr(len);
+    std::replace(param_base_name_.begin(), param_base_name_.end(), '/', '.');
+    if (!param_base_name_.empty() && param_base_name_[0] == '.')
+        param_base_name_ = param_base_name_.substr(1);
+    if (!param_base_name_.empty())
+        param_base_name_.push_back('.');
+    param_base_name_ += getTransportName();
+    setupParameters(node);
+    param_cb_handle_ = node->add_post_set_parameters_callback([this](const std::vector<rclcpp::Parameter>&)
+                                                              { this->updateParameters(); });
+    updateParameters();
+}
+
+void PublisherPlugin::setupParameters(rclcpp::Node* node)
+{
+    using rcl_interfaces::msg::ParameterDescriptor;
+    if (!node->has_parameter(param_base_name_ + ".codec"))
+        node->declare_parameter<std::string>(param_base_name_ + ".codec", "H264",
+                                             ParameterDescriptor().set__description("video encoding format"));
+    if (!node->has_parameter(param_base_name_ + ".bit_rate"))
+        node->declare_parameter<int>(
+            param_base_name_ + ".bit_rate", config_->bit_rate,
+            ParameterDescriptor()
+                .set__description("desired video bandwidth [kbit/s]")
+                .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(100000)}));
+    if (!node->has_parameter(param_base_name_ + ".frame_rate"))
+        node->declare_parameter<int>(
+            param_base_name_ + ".frame_rate", config_->frame_rate,
+            ParameterDescriptor()
+                .set__description("desired video frame rate [frames/s]")
+                .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(1).set__to_value(100)}));
+    if (!node->has_parameter(param_base_name_ + ".use_hw_encoder"))
+        node->declare_parameter<bool>(
+            param_base_name_ + ".use_hw_encoder", config_->use_hw_encoder,
+            ParameterDescriptor().set__description("use NVENC or VAAPI hardware acceleration if possible"));
+    if (!node->has_parameter(param_base_name_ + ".udp_port"))
+        node->declare_parameter<int>(
+            param_base_name_ + ".udp_port", config_->udp_port,
+            ParameterDescriptor()
+                .set__description("force UDP port for RTSP server (0 = auto select)")
+                .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(65535)}));
+    if (!node->has_parameter(param_base_name_ + ".udp_packet_size"))
+        node->declare_parameter<int>(
+            param_base_name_ + ".udp_packet_size", config_->udp_packet_size,
+            ParameterDescriptor()
+                .set__description("size limit for UDP packets [octets]")
+                .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(576).set__to_value(9000)}));
+    if (!node->has_parameter(param_base_name_ + ".use_ip_multicast"))
+        node->declare_parameter<bool>(param_base_name_ + ".use_ip_multicast", config_->use_ip_multicast,
+                                      ParameterDescriptor().set__description("use IP multicast for RTP stream"));
+}
+
+void PublisherPlugin::updateParameters()
+{
+    constexpr int LVL_SERVER = 4;
+    constexpr int LVL_SESSION = 2;
+    constexpr int LVL_CODEC = 1;
+
+    rclcpp::node_interfaces::NodeParametersInterface::SharedPtr np = node_param_.lock();
+    if (!np)
+        return;
+    Config new_config;
+    std::string codec_str = np->get_parameter(param_base_name_ + ".codec").as_string();
+    std::string codec_str_canon;
+    for (char ch : codec_str)
+    {
+        if (ch >= 'a' && ch <= 'z')
+            ch -= 32;
+        if (ch >= 'A' && ch <= 'Z')
+            codec_str_canon.push_back(ch);
+        if (ch >= '0' && ch <= '9')
+            codec_str_canon.push_back(ch);
+    }
+    auto codec_iter = CODEC_NAMES.find(codec_str_canon);
+    new_config.codec = codec_iter != CODEC_NAMES.end() ? codec_iter->second : VideoCodec::Unknown;
+    new_config.bit_rate = np->get_parameter(param_base_name_ + ".bit_rate").as_int();
+    new_config.frame_rate = np->get_parameter(param_base_name_ + ".frame_rate").as_int();
+    new_config.use_hw_encoder = np->get_parameter(param_base_name_ + ".use_hw_encoder").as_bool();
+    new_config.udp_port = np->get_parameter(param_base_name_ + ".udp_port").as_int();
+    new_config.udp_packet_size = np->get_parameter(param_base_name_ + ".udp_packet_size").as_int();
+    new_config.use_ip_multicast = np->get_parameter(param_base_name_ + ".use_ip_multicast").as_bool();
+
+    int changelevel = 0;
+    if (!server_ || config_->udp_port != new_config.udp_port || config_->udp_packet_size != config_->udp_packet_size)
+        changelevel |= LVL_SERVER;
+    if (config_->codec != new_config.codec || config_->use_ip_multicast != new_config.use_ip_multicast)
+        changelevel |= LVL_SESSION;
+    if (config_->bit_rate != new_config.bit_rate || config_->frame_rate != new_config.frame_rate
+        || config_->use_hw_encoder != new_config.use_hw_encoder)
+        changelevel |= LVL_CODEC;
+
+    *config_ = new_config;
     try
     {
-        config_server_ = std::make_shared<ConfigServer>(this->nh());
-        ConfigServer::CallbackType cb =
-            std::bind(&PublisherPlugin::configUpdate, this,
-                      std::placeholders::_1, std::placeholders::_2);
-        config_server_->setCallback(cb);
+        if (changelevel >= LVL_SERVER)
+        {
+            server_.reset();
+            server_ = StreamServer::create(topic_name_, config_->udp_port, config_->udp_packet_size - 42, logger_);
+        }
+        if (changelevel >= LVL_SESSION)
+        {
+            if (changelevel < LVL_SERVER)
+                server_->stop();
+            server_->start(config_->codec, config_->use_ip_multicast);
+            update_url_ = true;
+        }
+        if (changelevel >= LVL_CODEC)
+            encoder_.reset();
     }
     catch (std::exception& e)
     {
         server_.reset();
         encoder_.reset();
-        ROS_ERROR_STREAM("[" << topic_name_ << "] " << e.what());
         update_url_ = false;
         failed_ = true;
+        RCLCPP_ERROR(logger_, "[%s] %s", topic_name_.c_str(), e.what());
     }
 }
 
-void PublisherPlugin::publish(const sensor_msgs::Image& image,
-                              const PublishFn& publish_fn) const
+void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const PublishFn& publish_fn) const
 {
     try
     {
@@ -92,7 +209,7 @@ void PublisherPlugin::publish(const sensor_msgs::Image& image,
             return;
         if (update_url_)
         {
-            std_msgs::String url;
+            std_msgs::msg::String url;
             url.data = server_->url();
             publish_fn(url);
             update_url_ = false;
@@ -111,10 +228,9 @@ void PublisherPlugin::publish(const sensor_msgs::Image& image,
             // will always be active and transmitting.
             if (encoder_)
             {
-                ROS_INFO_STREAM("[" << topic_name_ << "] stop encoding for "
-                                    << server_->url());
+                RCLCPP_INFO(logger_, "[%s] stop encoding for %s", topic_name_.c_str(), server_->url().c_str());
                 encoder_.reset();
-                std_msgs::String url;
+                std_msgs::msg::String url;
                 url.data = server_->url();
                 publish_fn(url);
             }
@@ -122,25 +238,20 @@ void PublisherPlugin::publish(const sensor_msgs::Image& image,
         }
         if (!encoder_)
         {
-            encoder_ = std::make_shared<StreamEncoder>(
-                static_cast<VideoCodec>(config_.codec), config_.use_hw_encoder);
-            encoder_->setBitrate(1000 * config_.bit_rate);
-            encoder_->setFramerate(config_.frame_rate);
+            encoder_ = std::make_unique<StreamEncoder>(config_->codec, config_->use_hw_encoder, logger_);
+            encoder_->setBitrate(1000 * config_->bit_rate);
+            encoder_->setFramerate(config_->frame_rate);
             encoder_->setPackageSizeHint(server_->maxPacketSize() - 24);
-            ROS_INFO_STREAM("[" << topic_name_ << "] start encoding ("
-                                << encoder_->context()->codec->name << "; "
-                                << config_.bit_rate << " kbit/s; "
-                                << config_.frame_rate << " fps) for "
-                                << server_->url());
+            RCLCPP_INFO(logger_, "[%s] start encoding (%s; %u kbit/s; %u fps) for %s", topic_name_.c_str(),
+                        encoder_->context()->codec->name, config_->bit_rate, config_->frame_rate,
+                        server_->url().c_str());
         }
-        if (image.header.stamp.isZero())
-            ROS_WARN_STREAM(
-                "image header time stamp is not set, expect broken RTSP "
-                "stream");
+        if (image.header.stamp.sec == 0 && image.header.stamp.nanosec == 0)
+            RCLCPP_WARN(logger_, "[%s] image header time stamp is not set, expect broken RTSP stream",
+                        topic_name_.c_str());
         if (encoder_->encodeVideo(image) > 0)
         {
-            FrameDataPtr data;
-            while (data = encoder_->nextPacket())
+            while (FrameDataPtr data = encoder_->nextPacket())
                 server_->sendFrame(data);
         }
     }
@@ -148,58 +259,20 @@ void PublisherPlugin::publish(const sensor_msgs::Image& image,
     {
         encoder_.reset();
         failed_ = true;
-        ROS_ERROR_STREAM("[" << topic_name_ << "] " << e.what());
+        RCLCPP_ERROR(logger_, "[%s] %s", topic_name_.c_str(), e.what());
     }
 }
 
-void PublisherPlugin::disconnectCallback(const ros::SingleSubscriberPublisher&)
+void PublisherPlugin::onGraphChange()
 {
     if (getNumSubscribers() == 0 && encoder_ && server_)
     {
-        ROS_INFO_STREAM("[" << topic_name_ << "] stop encoding for "
-                            << server_->url());
+        RCLCPP_INFO(logger_, "[%s] stop encoding for %s", topic_name_.c_str(), server_->url().c_str());
         encoder_.reset();
-    }
-}
-
-void PublisherPlugin::configUpdate(RTSPPublisherConfig& cfg, uint32_t level)
-{
-    config_ = cfg;
-    if (!server_)
-        level |= 4;
-    try
-    {
-        failed_ = false;
-        if (level >= 4)
-        {
-            server_.reset();
-            server_ = StreamServer::create(topic_name_, config_.udp_port,
-                                           config_.udp_packet_size - 42);
-        }
-        if (level >= 2)
-        {
-            if (level < 4)
-                server_->stop();
-            server_->start(static_cast<VideoCodec>(config_.codec),
-                           config_.use_ip_multicast);
-            update_url_ = true;
-        }
-        if (level >= 1)
-        {
-            encoder_.reset();
-        }
-    }
-    catch (const std::exception& e)
-    {
-        server_.reset();
-        encoder_.reset();
-        update_url_ = false;
-        failed_ = true;
-        ROS_ERROR_STREAM("[" << topic_name_ << "] " << e.what());
     }
 }
 
 }  // namespace rtsp_image_transport
 
-PLUGINLIB_EXPORT_CLASS(rtsp_image_transport::PublisherPlugin,
-                       image_transport::PublisherPlugin)
+#include <pluginlib/class_list_macros.hpp>
+PLUGINLIB_EXPORT_CLASS(rtsp_image_transport::PublisherPlugin, image_transport::PublisherPlugin)

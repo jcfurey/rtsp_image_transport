@@ -1,8 +1,9 @@
 /****************************************************************************
  *
  * rtsp_image_transport
- * Copyright © 2021 Fraunhofer FKIE
+ * Copyright © 2021-2025 Fraunhofer FKIE
  * Author: Timo Röhling
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,10 +21,14 @@
 #ifndef RTSP_IMAGE_TRANSPORT_INIT_H_
 #define RTSP_IMAGE_TRANSPORT_INIT_H_
 
+#define FKIE_VERSION_TUPLE(major, minor, patch) (65536 * (major) + 256 * (minor) + patch)
+
 namespace rtsp_image_transport
 {
+
 void global_initialize();
 int ros_interface_socket();
+
 }  // namespace rtsp_image_transport
 
 #endif

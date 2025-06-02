@@ -1,8 +1,9 @@
 /****************************************************************************
  *
  * rtsp_image_transport
- * Copyright © 2021 Fraunhofer FKIE
+ * Copyright © 2021-2025 Fraunhofer FKIE
  * Author: Timo Röhling
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,10 +25,9 @@
 #include "rtsp_image_transport_export.h"
 #include "video_codec.h"
 
-#include <dynamic_reconfigure/server.h>
-#include <image_transport/simple_subscriber_plugin.h>
-#include <rtsp_image_transport/RTSPSubscriberConfig.h>
-#include <std_msgs/String.h>
+#include <image_transport/simple_subscriber_plugin.hpp>
+#include <rclcpp/timer.hpp>
+#include <std_msgs/msg/string.hpp>
 
 #include <deque>
 #include <mutex>
@@ -41,7 +41,7 @@ class StreamClient;
 class StreamDecoder;
 
 class RTSP_IMAGE_TRANSPORT_EXPORT SubscriberPlugin
-    : public image_transport::SimpleSubscriberPlugin<std_msgs::String>
+    : public image_transport::SimpleSubscriberPlugin<std_msgs::msg::String>
 {
 public:
     SubscriberPlugin();
@@ -49,19 +49,12 @@ public:
     std::string getTransportName() const override;
 
 protected:
-    void subscribeImpl(
-        ros::NodeHandle& nh, const std::string& base_topic, uint32_t queue_size,
-        const Callback& callback, const ros::VoidPtr& tracked_object,
-        const image_transport::TransportHints& transport_hints) override;
-    void internalCallback(const std_msgs::String::ConstPtr& message,
-                          const Callback& callback) override;
+    void subscribeImpl(rclcpp::Node* node, const std::string& base_topic, const Callback& callback,
+                       rmw_qos_profile_t custom_qos, rclcpp::SubscriptionOptions options) override;
+    void internalCallback(const std_msgs::msg::String::ConstSharedPtr& message, const Callback& callback) override;
 
 private:
-    using ConfigServer = dynamic_reconfigure::Server<RTSPSubscriberConfig>;
-
-    void configUpdate(RTSPSubscriberConfig& cfg, uint32_t level);
-    void receiveDataStream(VideoCodec codec, MediaSubsession* subsession,
-                           const FrameDataPtr& data);
+    void receiveDataStream(VideoCodec codec, MediaSubsession* subsession, const FrameDataPtr& data);
     void subsessionStarted(VideoCodec codec, MediaSubsession* subsession);
     void sessionFailed(int code, const std::string& message);
     void sessionStarted();
@@ -69,24 +62,32 @@ private:
     void sessionTimeout();
     void processFrame();
     void reconnect();
-    void cooldownTimerCallback(const ros::WallTimerEvent& event);
-
+    void cooldownTimerCallback();
     void pushFrame(const FrameDataPtr& frame);
     FrameDataPtr popFrame();
-    ros::Duration frameLag() const noexcept;
+    rclcpp::Duration frameLag() const noexcept;
     void clearQueuedFrames();
+    void setupParameters(rclcpp::Node* node);
+    void updateParameters();
 
-    std::shared_ptr<ConfigServer> config_server_;
-    std::string topic_name_;
+    struct Config;
+    rclcpp::Logger logger_;
+    std::string topic_name_, param_base_name_;
     bool failed_;
-    double cooldown_;
-    ros::Duration old_lag_;
-    ros::WallTimer cooldown_timer_;
-    std::shared_ptr<ros::NodeHandle> nh_;
+    std::chrono::milliseconds cooldown_;
+    std::unique_ptr<Config> config_;
+    rclcpp::node_interfaces::NodeTimersInterface::WeakPtr node_timers_;
+    rclcpp::node_interfaces::NodeBaseInterface::WeakPtr node_base_;
+    rclcpp::node_interfaces::NodeParametersInterface::WeakPtr node_param_;
+    rclcpp::Node::PostSetParametersCallbackHandle::SharedPtr param_cb_handle_;
+    rclcpp::Clock::SharedPtr clock_;
+    rclcpp::CallbackGroup::SharedPtr cooldown_cb_group_, scheduled_cb_group_;
+    rclcpp::Duration old_lag_;
+    rclcpp::WallTimer<rclcpp::VoidCallbackType>::SharedPtr cooldown_timer_;
+    rclcpp::Waitable::SharedPtr scheduled_cb_;
     Callback callback_;
     std::shared_ptr<StreamClient> client_;
     std::shared_ptr<StreamDecoder> decoder_;
-    RTSPSubscriberConfig config_;
 
     mutable std::mutex queue_mutex_;
     std::deque<FrameDataPtr> queue_;

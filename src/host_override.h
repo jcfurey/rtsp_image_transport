@@ -18,32 +18,16 @@
  * limitations under the License.
  *
  ****************************************************************************/
-#ifndef RTSP_IMAGE_TRANSPORT_LOG_LEVEL_H_
-#define RTSP_IMAGE_TRANSPORT_LOG_LEVEL_H_
+#ifndef RTSP_IMAGE_TRANSPORT_HOST_OVERRIDE_H_
+#define RTSP_IMAGE_TRANSPORT_HOST_OVERRIDE_H_
 
-extern "C"
-{
-#include <libavutil/log.h>
-}
+#include <string>
 
 namespace rtsp_image_transport
 {
 
-class TemporaryAvLogLevel
-{
-public:
-    TemporaryAvLogLevel(int level) : old_log_level_(av_log_get_level())
-    {
-        av_log_set_level(level);
-    }
-    ~TemporaryAvLogLevel()
-    {
-        av_log_set_level(old_log_level_);
-    }
-
-private:
-    int old_log_level_;
-};
+int create_host_override_socket(const char* node, bool numeric = false);
+std::string socket_bound_address(int sock);
 
 }  // namespace rtsp_image_transport
 

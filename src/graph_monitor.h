@@ -18,31 +18,46 @@
  * limitations under the License.
  *
  ****************************************************************************/
-#ifndef RTSP_IMAGE_TRANSPORT_LOG_LEVEL_H_
-#define RTSP_IMAGE_TRANSPORT_LOG_LEVEL_H_
+#ifndef RTSP_IMAGE_TRANSPORT_GRAPH_MONITOR_H_
+#define RTSP_IMAGE_TRANSPORT_GRAPH_MONITOR_H_
 
-extern "C"
-{
-#include <libavutil/log.h>
-}
+#include <rclcpp/node.hpp>
+
+#include <memory>
+#include <mutex>
+#include <set>
+#include <thread>
 
 namespace rtsp_image_transport
 {
 
-class TemporaryAvLogLevel
+class GraphMonitorListener
 {
 public:
-    TemporaryAvLogLevel(int level) : old_log_level_(av_log_get_level())
-    {
-        av_log_set_level(level);
-    }
-    ~TemporaryAvLogLevel()
-    {
-        av_log_set_level(old_log_level_);
-    }
+    virtual void onGraphChange() = 0;
+};
+
+class GraphMonitor
+{
+public:
+    using SharedPtr = std::shared_ptr<GraphMonitor>;
+    void addListener(GraphMonitorListener* listener);
+    void removeListener(GraphMonitorListener* listener);
+
+    static SharedPtr instance(rclcpp::Node* node, GraphMonitorListener* listener = nullptr);
 
 private:
-    int old_log_level_;
+    explicit GraphMonitor(rclcpp::Node* node);
+    void eventLoop();
+
+    rclcpp::node_interfaces::NodeGraphInterface::SharedPtr node_graph_;
+    rclcpp::Event::SharedPtr event_;
+    std::set<GraphMonitorListener*> listeners_;
+    std::atomic_bool shutdown_flag_;
+    std::thread thread_;
+
+    static std::mutex mutex_;
+    static SharedPtr instance_;
 };
 
 }  // namespace rtsp_image_transport

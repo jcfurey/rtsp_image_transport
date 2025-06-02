@@ -1,8 +1,9 @@
 /****************************************************************************
  *
  * rtsp_image_transport
- * Copyright © 2021 Fraunhofer FKIE
+ * Copyright © 2021-2025 Fraunhofer FKIE
  * Author: Timo Röhling
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,9 +21,9 @@
 #ifndef RTSP_IMAGE_TRANSPORT_FRAME_DATA_H_
 #define RTSP_IMAGE_TRANSPORT_FRAME_DATA_H_
 
-#include <ros/time.h>
+#include <rclcpp/time.hpp>
 
-#include <cstdint>
+#include <cstddef>
 #include <memory>
 
 namespace rtsp_image_transport
@@ -32,7 +33,7 @@ class FrameData
 {
 public:
     FrameData(const unsigned char* data, std::size_t length,
-              const ros::Time& stamp);
+              const rclcpp::Time& stamp);
     ~FrameData();
     FrameData(const FrameData&) = delete;
     FrameData& operator=(const FrameData&) = delete;
@@ -40,15 +41,15 @@ public:
     {
         return data_;
     }
-    std::size_t length() const
+    std::size_t length() const noexcept
     {
         return length_;
     }
-    const ros::Time& stamp() const
+    const rclcpp::Time& stamp() const noexcept
     {
         return stamp_;
     }
-    void setStamp(const ros::Time& stamp)
+    void setStamp(const rclcpp::Time& stamp) noexcept
     {
         stamp_ = stamp;
     }
@@ -56,7 +57,7 @@ public:
 private:
     unsigned char* data_;
     std::size_t length_;
-    ros::Time stamp_;
+    rclcpp::Time stamp_;
 };
 
 using FrameDataPtr = std::shared_ptr<FrameData>;

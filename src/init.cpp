@@ -1,8 +1,9 @@
 /****************************************************************************
  *
  * rtsp_image_transport
- * Copyright © 2021 Fraunhofer FKIE
+ * Copyright © 2021-2025 Fraunhofer FKIE
  * Author: Timo Röhling
+ * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,9 +20,9 @@
  ****************************************************************************/
 #include "init.h"
 
-#include <GroupsockHelper.hh>
-#include <netdb.h>
-#include <ros/console.h>
+#include "host_override.h"
+
+#include <rclcpp/logging.hpp>
 
 #include <mutex>
 
@@ -40,6 +41,7 @@ namespace
 
 void ffmpeg_log_to_ros(void* avcl, int level, const char* fmt, va_list ap)
 {
+    static rclcpp::Logger logger = rclcpp::get_logger("ffmpeg");
     if (level > av_log_get_level())
         return;
     char buf[256];
@@ -60,41 +62,24 @@ void ffmpeg_log_to_ros(void* avcl, int level, const char* fmt, va_list ap)
     {
         case AV_LOG_PANIC:
         case AV_LOG_FATAL:
-            ROS_FATAL_NAMED("ffmpeg", "[%s] %s", class_name, buf);
+            RCLCPP_FATAL(logger, "[%s] %s", class_name, buf);
             break;
         case AV_LOG_ERROR:
-            ROS_ERROR_NAMED("ffmpeg", "[%s] %s", class_name, buf);
+            RCLCPP_ERROR(logger, "[%s] %s", class_name, buf);
             break;
         case AV_LOG_WARNING:
-            ROS_WARN_NAMED("ffmpeg", "[%s] %s", class_name, buf);
+            RCLCPP_WARN(logger, "[%s] %s", class_name, buf);
             break;
         case AV_LOG_INFO:
-            ROS_INFO_NAMED("ffmpeg", "[%s] %s", class_name, buf);
+            RCLCPP_INFO(logger, "[%s] %s", class_name, buf);
             break;
         default:
-            ROS_DEBUG_NAMED("ffmpeg", "[%s] %s", class_name, buf);
+            RCLCPP_DEBUG(logger, "[%s] %s", class_name, buf);
             break;
     }
 }
 
 int ros_interface_socket_ = -1;
-
-int create_local_socket(netAddressBits addr)
-{
-    struct sockaddr_in sa;
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0)
-        return -1;
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = addr;
-    if (bind(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) < 0)
-    {
-        close(fd);
-        return -1;
-    }
-    return fd;
-}
 
 void do_global_initialize()
 {
@@ -105,32 +90,20 @@ void do_global_initialize()
 #endif
     av_log_set_callback(ffmpeg_log_to_ros);
     av_log_set_level(AV_LOG_ERROR);
-    const char* var;
-    if ((var = getenv("ROS_HOSTNAME")))
+    if (const char* node = getenv("ROS_HOSTNAME"))
     {
-        struct hostent* he = gethostbyname(var);
-        if (he && he->h_addr_list && he->h_addr_list[0]
-            && he->h_addrtype == AF_INET)
-        {
-            netAddressBits addr =
-                *reinterpret_cast<const netAddressBits*>(he->h_addr_list[0]);
-            ros_interface_socket_ = create_local_socket(addr);
-        }
+        ros_interface_socket_ = create_host_override_socket(node);
     }
-    else if ((var = getenv("ROS_IP")))
+    else if (const char* node = getenv("ROS_IP"))
     {
-        ros_interface_socket_ = create_local_socket(our_inet_addr(var));
+        ros_interface_socket_ = create_host_override_socket(node, true);
     }
     if (ros_interface_socket_ >= 0)
     {
-        struct sockaddr_in sa;
-        socklen_t slen = sizeof(sockaddr_in);
-        getsockname(ros_interface_socket_,
-                    reinterpret_cast<struct sockaddr*>(&sa), &slen);
-        ROS_INFO(
-            "ROS_HOSTNAME/ROS_IP override: RTSP server will advertise IP "
-            "address %s",
-            inet_ntoa(sa.sin_addr));
+        RCLCPP_INFO(rclcpp::get_logger("rtsp_image_transport"),
+                    "ROS_HOSTNAME/ROS_IP override: RTSP server will advertise IP "
+                    "address %s",
+                    socket_bound_address(ros_interface_socket_).c_str());
     }
 }
 
