@@ -64,6 +64,7 @@ private:
     std::shared_ptr<StreamServer> server_;
     std::shared_ptr<GraphMonitor> graph_monitor_;
     mutable std::unique_ptr<StreamEncoder> encoder_;
+    mutable std::mutex mutex_;
     mutable bool update_url_, failed_;
 };
 

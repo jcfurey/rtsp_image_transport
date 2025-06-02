@@ -173,6 +173,7 @@ void PublisherPlugin::updateParameters()
         || config_->use_hw_encoder != new_config.use_hw_encoder)
         changelevel |= LVL_CODEC;
 
+    std::lock_guard<std::mutex> lock{mutex_};
     *config_ = new_config;
     try
     {
@@ -203,6 +204,7 @@ void PublisherPlugin::updateParameters()
 
 void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const PublishFn& publish_fn) const
 {
+    std::lock_guard<std::mutex> lock{mutex_};
     try
     {
         if (!server_ || failed_)
@@ -265,6 +267,7 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
 
 void PublisherPlugin::onGraphChange()
 {
+    std::lock_guard<std::mutex> lock{mutex_};
     if (getNumSubscribers() == 0 && encoder_ && server_)
     {
         RCLCPP_INFO(logger_, "[%s] stop encoding for %s", topic_name_.c_str(), server_->url().c_str());
