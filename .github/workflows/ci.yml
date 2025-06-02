@@ -7,15 +7,13 @@ jobs:
     strategy:
       matrix:
         env:
-          - {ROS_DISTRO: melodic}
-          - {ROS_DISTRO: noetic}
+          - {ROS_DISTRO: humble}
+          - {ROS_DISTRO: jazzy}
+          - {ROS_DISTRO: rolling}
     env:
-      CATKIN_LINT: 'true'
-      CATKIN_LINT_ARGS: '--ignore unknown_package'
-      ROSDEP_SKIP_KEYS: 'live555'
-      AFTER_INSTALL_TARGET_DEPENDENCIES: 'apt-get install -y liblivemedia-dev'
+      UPSTREAM_WORKSPACE: 'github:fkie/live555_vendor'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
-      - uses: 'ros-industrial/industrial_ci@0.10.0'
+      - uses: 'ros-industrial/industrial_ci@master'
         env: ${{ matrix.env }}
