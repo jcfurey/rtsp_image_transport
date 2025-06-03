@@ -45,21 +45,21 @@ with FFmpeg 4, some codecs are hardware acceleratable. The following table
 summarizes the options, subject to availability in your FFmpeg version and
 compatible hardware:
 
-+----------+----------+----------+----------+----------+
-|          | Software | NVIDIA   | VAAPI    | OMX      |
-+==========+==========+==========+==========+==========+
-| H.264    | Yes      | Yes      | Encoding | Encoding |
-+----------+----------+----------+----------+----------+
-| H.265    | Yes      | Yes      | Encoding | No       |
-+----------+----------+----------+----------+----------+
-| MPEG-4   | Yes      | Decoding | Encoding | No       |
-+----------+----------+----------+----------+----------+
-| VP8      | Yes      | Decoding | Encoding | No       |
-+----------+----------+----------+----------+----------+
-| VP9      | Yes      | Decoding | Encoding | No       |
-+----------+----------+----------+----------+----------+
-| MJPEG    | Decoding | Decoding | No       | No       |
-+----------+----------+----------+----------+----------+
++----------+----------+----------+----------+----------+----------+
+|          | Software | NVIDIA   | QSV      | VAAPI    | OMX      |
++==========+==========+==========+==========+==========+==========+
+| H.264    | Yes      | Yes      | Yes      | Encoding | Encoding |
++----------+----------+----------+----------+----------+----------+
+| H.265    | Yes      | Yes      | Yes      | Encoding | No       |
++----------+----------+----------+----------+----------+----------+
+| MPEG-4   | Yes      | Decoding | No       | Encoding | No       |
++----------+----------+----------+----------+----------+----------+
+| VP8      | Yes      | Decoding | Decoding | Encoding | No       |
++----------+----------+----------+----------+----------+----------+
+| VP9      | Yes      | Decoding | Yes      | Encoding | No       |
++----------+----------+----------+----------+----------+----------+
+| MJPEG    | Decoding | Decoding | Decoding | No       | No       |
++----------+----------+----------+----------+----------+----------+
 
 .. note::
     ``rtsp_image_transport`` cannot create Motion JPEG (MJPEG) streams,
