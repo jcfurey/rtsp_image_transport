@@ -42,7 +42,9 @@ namespace
 void ffmpeg_log_to_ros(void* avcl, int level, const char* fmt, va_list ap)
 {
     static rclcpp::Logger logger = rclcpp::get_logger("ffmpeg");
-    if (level > av_log_get_level())
+    int effective_log_level =
+        logger.get_effective_level() == rclcpp::Logger::Level::Debug ? AV_LOG_INFO : av_log_get_level();
+    if (level > effective_log_level)
         return;
     char buf[256];
     const char* class_name = "misc";
