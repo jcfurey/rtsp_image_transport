@@ -68,6 +68,8 @@ compatible hardware:
     frames for your video stream, you can use the
     `compressed_image_transport`_ with JPEG compression instead.
 
+.. note::
+    You need to install the Ubuntu package ``libmfx-gen1.2`` for QSV support.
 
 IP cameras
 ==========

@@ -216,11 +216,11 @@ std::size_t splitNALs(FrameContainer& output, const unsigned char* data, std::si
 }
 
 const std::map<VideoCodec, std::vector<std::string>> FFMPEG_ENCODERS{
-    {VideoCodec::H264, {"h264_qsv", "h264_nvenc", "h264_vulkan", "h264_omx", "h264_vaapi", "libx264", "h264"}},
-    {VideoCodec::H265, {"hevc_qsv", "hevc_nvenc", "hevc_vulkan", "hevc_vaapi", "libx265", "h265"}},
-    {VideoCodec::MPEG4, {"mjpeg_qsv", "mjpeg_vaapi", "mpeg4_omx", "libxvid", "mpeg4"}},
-    {VideoCodec::VP8, {"vp8_qsv", "vp8_vaapi", "libvpx", "vp8"}},
-    {VideoCodec::VP9, {"vp9_qsv", "vp9_vaapi", "libvpx-vp9", "vp9"}}};
+    {VideoCodec::H264, {"h264_vaapi", "h264_qsv", "h264_nvenc", "h264_vulkan", "h264_omx", "libx264", "h264"}},
+    {VideoCodec::H265, {"hevc_vaapi", "hevc_qsv", "hevc_nvenc", "hevc_vulkan", "libx265", "h265"}},
+    {VideoCodec::MPEG4, {"mjpeg_vaapi", "mjpeg_qsv", "mpeg4_omx", "libxvid", "mpeg4"}},
+    {VideoCodec::VP8, {"vp8_vaapi", "vp8_qsv", "libvpx", "vp8"}},
+    {VideoCodec::VP9, {"vp9_vaapi", "vp9_qsv", "libvpx-vp9", "vp9"}}};
 
 }  // namespace
 
@@ -336,14 +336,15 @@ void StreamEncoder::setupEncoder(const AVCodec* encoder, bool silent)
     }
     if (codec_ == VideoCodec::VP8 || codec_ == VideoCodec::VP9)
     {
-        set_codec_option(ctx_, "deadline", "realtime", silent, logger_);
+        if (strstr(encoder->name, "vpx"))
+            set_codec_option(ctx_, "deadline", "realtime", silent, logger_);
     }
     if (codec_ == VideoCodec::MPEG4)
     {
         ctx_->max_b_frames = 0;
         ctx_->trellis = 1;
-        ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
     }
+    ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
 }
 
 void StreamEncoder::setBitrate(unsigned long bit_rate)

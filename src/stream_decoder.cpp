@@ -63,7 +63,7 @@ const std::map<VideoCodec, std::vector<std::string>> FFMPEG_DECODERS{
     {VideoCodec::MPEG4, {"mpeg4_cuvid", "mpeg4"}},
     {VideoCodec::VP8, {"vp8_qsv", "vp8_cuvid", "vp8"}},
     {VideoCodec::VP9, {"vp9_qsv", "vp9_cuvid", "vp9"}},
-    {VideoCodec::MJPEG, {"mjpeg_qsv", "mjpeg_cuvid", "mjpeg_vaapi", "mjpeg"}}};
+    {VideoCodec::MJPEG, {"mjpeg_qsv", "mjpeg_cuvid", "mjpeg"}}};
 
 }  // namespace
 
