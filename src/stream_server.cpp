@@ -39,6 +39,28 @@ uint16_t sockToPort(const in_addr& addr)
     return 16384 + (ntohl(addr.s_addr) & 0x7ffe);
 }
 
+bool isSupported(VideoCodec codec)
+{
+    switch (codec)
+    {
+        case VideoCodec::H264:
+#ifdef LIVE555_HAS_H265_SUPPORT
+        case VideoCodec::H265:
+#endif
+        case VideoCodec::MPEG4:
+#ifdef LIVE555_HAS_VPX_SUPPORT
+        case VideoCodec::VP8:
+        case VideoCodec::VP9:
+#endif
+#ifdef LIVE555_HAS_AV1_SUPPORT
+        case VideoCodec::AV1:
+#endif
+            return true;
+        default:
+            return false;
+    }
+}
+
 VideoRTPSink* createVideoRTPSink(VideoCodec codec, UsageEnvironment& env, Groupsock* rtpGroupsock,
                                  unsigned char rtpPayloadTypeIfDynamic)
 {
@@ -57,6 +79,10 @@ VideoRTPSink* createVideoRTPSink(VideoCodec codec, UsageEnvironment& env, Groups
             return VP8VideoRTPSink::createNew(env, rtpGroupsock, rtpPayloadTypeIfDynamic);
         case VideoCodec::VP9:
             return VP9VideoRTPSink::createNew(env, rtpGroupsock, rtpPayloadTypeIfDynamic);
+#endif
+#ifdef LIVE555_HAS_AV1_SUPPORT
+        case VideoCodec::AV1:
+            return AV1VideoRTPSink::createNew(env, rtpGroupsock, rtpPayloadTypeIfDynamic);
 #endif
         default:
             return nullptr;
@@ -78,6 +104,8 @@ FramedSource* createDiscreteFramer(VideoCodec codec, UsageEnvironment& env, Fram
         case VideoCodec::VP8:
             return source;
         case VideoCodec::VP9:
+            return source;
+        case VideoCodec::AV1:
             return source;
         default:
             return nullptr;
@@ -204,6 +232,8 @@ FramedSource* UnicastServerMediaSubsession::createNewStreamSource(unsigned clien
         else
         {
             injector->shutdown();
+            RCLCPP_ERROR(s->logger_, "[%s] unable to create RTP sink for %s", s->topic_name_.c_str(),
+                         videoCodecName(s->codec()).c_str());
         }
     }
     return source;
@@ -243,6 +273,8 @@ void StreamServer::start(VideoCodec codec, bool use_multicast)
     RTCPInstance* rtcp = nullptr;
     OutPacketBuffer::increaseMaxSizeTo(131072);
     stop();
+    if (!isSupported(codec))
+        throw StreamingError(std::format("{} is not supported on your system", videoCodecName(codec)));
     codec_ = codec;
     if (use_multicast)
     {

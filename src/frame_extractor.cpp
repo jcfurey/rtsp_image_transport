@@ -105,8 +105,7 @@ void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes
     {
         if (numTruncatedBytes)
         {
-            RCLCPP_WARN(rclcpp::get_logger("FrameExtractor"), "FrameExtractor buffer is %u bytes too small",
-                        numTruncatedBytes);
+            RCLCPP_WARN(sc->logger_, "FrameExtractor buffer is %u bytes too small", numTruncatedBytes);
         }
         buffer_length_ += frameSize;
         rclcpp::Time ts(presentationTime.tv_sec, 1000ull * presentationTime.tv_usec);

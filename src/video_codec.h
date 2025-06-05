@@ -41,6 +41,7 @@ enum class VideoCodec
     MPEG4 = 2,
     VP8 = 3,
     VP9 = 4,
+    AV1 = 5,
     MJPEG = 1001 /* Decoding only */
 };
 

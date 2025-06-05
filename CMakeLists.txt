@@ -94,6 +94,17 @@ int main()
 ]==]
     LIVE555_HAS_VPX_SUPPORT
 )
+check_cxx_source_compiles(
+    [==[
+#include <liveMedia.hh>
+
+int main()
+{
+    AV1VideoRTPSink* sink = nullptr;
+}
+]==]
+    LIVE555_HAS_AV1_SUPPORT
+)
 
 unset(CMAKE_REQUIRED_LIBRARIES)
 
@@ -129,6 +140,7 @@ target_compile_definitions(
     ${PROJECT_NAME}
     PRIVATE $<$<BOOL:${LIVE555_HAS_H265_SUPPORT}>:LIVE555_HAS_H265_SUPPORT>
             $<$<BOOL:${LIVE555_HAS_VPX_SUPPORT}>:LIVE555_HAS_VPX_SUPPORT>
+            $<$<BOOL:${LIVE555_HAS_AV1_SUPPORT}>:LIVE555_HAS_AV1_SUPPORT>
             $<$<BOOL:${FFMPEG_HAS_HWFRAME_SUPPORT}>:FFMPEG_HAS_HWFRAME_SUPPORT>
             CURRENT_RCLCPP_VERSION=${computed_rclcpp_version}
 )

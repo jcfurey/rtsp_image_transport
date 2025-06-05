@@ -220,7 +220,8 @@ const std::map<VideoCodec, std::vector<std::string>> FFMPEG_ENCODERS{
     {VideoCodec::H265, {"hevc_vaapi", "hevc_qsv", "hevc_nvenc", "hevc_vulkan", "libx265", "h265"}},
     {VideoCodec::MPEG4, {"mjpeg_vaapi", "mjpeg_qsv", "mpeg4_omx", "libxvid", "mpeg4"}},
     {VideoCodec::VP8, {"vp8_vaapi", "vp8_qsv", "libvpx", "vp8"}},
-    {VideoCodec::VP9, {"vp9_vaapi", "vp9_qsv", "libvpx-vp9", "vp9"}}};
+    {VideoCodec::VP9, {"vp9_vaapi", "vp9_qsv", "libvpx-vp9", "vp9"}},
+    {VideoCodec::AV1, {"av1_vaapi", "av1_qsv", "av1_nvenc", "librav1e", "libaom-av1"}}};
 
 }  // namespace
 
@@ -338,6 +339,10 @@ void StreamEncoder::setupEncoder(const AVCodec* encoder, bool silent)
     {
         if (strstr(encoder->name, "vpx"))
             set_codec_option(ctx_, "deadline", "realtime", silent, logger_);
+    }
+    if (codec_ == VideoCodec::AV1)
+    {
+        set_codec_option(ctx_, "speed", 10, silent, logger_);
     }
     if (codec_ == VideoCodec::MPEG4)
     {

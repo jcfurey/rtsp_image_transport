@@ -37,6 +37,8 @@ std::string videoCodecName(VideoCodec codec)
             return "VP8";
         case VideoCodec::VP9:
             return "VP9";
+        case VideoCodec::AV1:
+            return "AV1";
         case VideoCodec::MJPEG:
             return "Motion JPEG";
         default:
@@ -58,6 +60,8 @@ VideoCodec fromRTSPCodecName(const std::string& name)
         return VideoCodec::VP9;
     if (name == "JPEG")
         return VideoCodec::MJPEG;
+    if (name == "AV1")
+        return VideoCodec::AV1;
     return VideoCodec::Unknown;
 }
 

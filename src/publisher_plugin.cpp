@@ -56,7 +56,7 @@ struct RTSP_IMAGE_TRANSPORT_NO_EXPORT PublisherPlugin::Config
 
 const std::map<std::string, VideoCodec> CODEC_NAMES = {
     {"H264", VideoCodec::H264},   {"AVC", VideoCodec::H264}, {"H265", VideoCodec::H265}, {"HEVC", VideoCodec::H265},
-    {"MPEG4", VideoCodec::MPEG4}, {"VP8", VideoCodec::VP8},  {"VP9", VideoCodec::VP9}};
+    {"MPEG4", VideoCodec::MPEG4}, {"VP8", VideoCodec::VP8},  {"VP9", VideoCodec::VP9},   {"AV1", VideoCodec::AV1}};
 
 using SuperClass = image_transport::SimplePublisherPlugin<std_msgs::msg::String>;
 
@@ -178,7 +178,8 @@ void PublisherPlugin::updateParameters()
     new_config.use_ip_multicast = np->get_parameter(param_base_name_ + ".use_ip_multicast").as_bool();
 
     int changelevel = 0;
-    if (!server_ || config_->udp_port != new_config.udp_port || config_->udp_packet_size != config_->udp_packet_size)
+    if ((!server_ && !failed_) || config_->udp_port != new_config.udp_port
+        || config_->udp_packet_size != config_->udp_packet_size)
         changelevel |= LVL_SERVER;
     if (config_->codec != new_config.codec || config_->use_ip_multicast != new_config.use_ip_multicast)
         changelevel |= LVL_SESSION;
