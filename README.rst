@@ -33,7 +33,7 @@ by image processing algorithms. The lossy compression introduces artifacts
 which may not be visible to the human eye but interfere with many algorithms
 nevertheless.
 
-You cannot use `rosbag`_ to record data from ``rtsp_image_transport``; you will
+You cannot use `rosbag2`_ to record data from ``rtsp_image_transport``; you will
 just end up with a bunch of useless URL string messages.
 
 Supported Formats
@@ -80,14 +80,14 @@ image topic with RTSP transport that reuses the existing RTSP stream.
 
 .. _Real Time Streaming Protocol (RTSP): https://en.wikipedia.org/wiki/Real_Time_Streaming_Protocol
 
-.. _image_transport: http://wiki.ros.org/image_transport
+.. _image_transport: https://index.ros.org/p/image_transport/
 
-.. _compressed_image_transport: http://wiki.ros.org/compressed_image_transport
+.. _compressed_image_transport: https://index.ros.org/p/compressed_image_transport/
 
-.. _std_msgs/String: http://docs.ros.org/en/api/std_msgs/html/msg/String.html
+.. _std_msgs/String: https://docs.ros.org/en/rolling/p/std_msgs/msg/String.html
 
-.. _Live555: http://www.live555.com/
+.. _Live555: http://www.live555.com/liveMedia
 
 .. _FFmpeg: https://ffmpeg.org/
 
-.. _rosbag: http://wiki.ros.org/rosbag
+.. _rosbag2: https://index.ros.org/p/rosbag2/
