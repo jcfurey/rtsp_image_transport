@@ -28,11 +28,26 @@
 namespace rtsp_image_transport
 {
 
+namespace
+{
+
+template<typename Number>
+std::string withSI(Number value)
+{
+    if (value < 10000)
+        return std::format("{} ", value);
+    if (value < 10000000)
+        return std::format("{} k", value / 1000);
+    return std::format("{} M", value / 1000000);
+}
+
+}  // namespace
+
 struct RTSP_IMAGE_TRANSPORT_NO_EXPORT PublisherPlugin::Config
 {
     VideoCodec codec = VideoCodec::Unknown;
-    unsigned bit_rate = 1000;
-    unsigned frame_rate = 30;
+    unsigned target_bitrate = 1000000;
+    unsigned expected_framerate = 30;
     bool use_hw_encoder = true;
     unsigned udp_port = 0;
     unsigned udp_packet_size = 1396;
@@ -101,17 +116,17 @@ void PublisherPlugin::setupParameters(rclcpp::Node* node)
     if (!node->has_parameter(param_base_name_ + ".codec"))
         node->declare_parameter<std::string>(param_base_name_ + ".codec", "H264",
                                              ParameterDescriptor().set__description("video encoding format"));
-    if (!node->has_parameter(param_base_name_ + ".bit_rate"))
+    if (!node->has_parameter(param_base_name_ + ".target_bitrate"))
         node->declare_parameter<int>(
-            param_base_name_ + ".bit_rate", config_->bit_rate,
+            param_base_name_ + ".target_bitrate", config_->target_bitrate,
             ParameterDescriptor()
-                .set__description("desired video bandwidth [kbit/s]")
-                .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(100000)}));
-    if (!node->has_parameter(param_base_name_ + ".frame_rate"))
+                .set__description("targeted encoding bitrate [bits/s]")
+                .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(100000000)}));
+    if (!node->has_parameter(param_base_name_ + ".expected_framerate"))
         node->declare_parameter<int>(
-            param_base_name_ + ".frame_rate", config_->frame_rate,
+            param_base_name_ + ".expected_framerate", config_->expected_framerate,
             ParameterDescriptor()
-                .set__description("desired video frame rate [frames/s]")
+                .set__description("expected video frame rate [frames/s]")
                 .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(1).set__to_value(100)}));
     if (!node->has_parameter(param_base_name_ + ".use_hw_encoder"))
         node->declare_parameter<bool>(
@@ -157,8 +172,8 @@ void PublisherPlugin::updateParameters()
     }
     auto codec_iter = CODEC_NAMES.find(codec_str_canon);
     new_config.codec = codec_iter != CODEC_NAMES.end() ? codec_iter->second : VideoCodec::Unknown;
-    new_config.bit_rate = np->get_parameter(param_base_name_ + ".bit_rate").as_int();
-    new_config.frame_rate = np->get_parameter(param_base_name_ + ".frame_rate").as_int();
+    new_config.target_bitrate = np->get_parameter(param_base_name_ + ".target_bitrate").as_int();
+    new_config.expected_framerate = np->get_parameter(param_base_name_ + ".expected_framerate").as_int();
     new_config.use_hw_encoder = np->get_parameter(param_base_name_ + ".use_hw_encoder").as_bool();
     new_config.udp_port = np->get_parameter(param_base_name_ + ".udp_port").as_int();
     new_config.udp_packet_size = np->get_parameter(param_base_name_ + ".udp_packet_size").as_int();
@@ -169,7 +184,8 @@ void PublisherPlugin::updateParameters()
         changelevel |= LVL_SERVER;
     if (config_->codec != new_config.codec || config_->use_ip_multicast != new_config.use_ip_multicast)
         changelevel |= LVL_SESSION;
-    if (config_->bit_rate != new_config.bit_rate || config_->frame_rate != new_config.frame_rate
+    if (config_->target_bitrate != new_config.target_bitrate
+        || config_->expected_framerate != new_config.expected_framerate
         || config_->use_hw_encoder != new_config.use_hw_encoder)
         changelevel |= LVL_CODEC;
 
@@ -241,12 +257,12 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
         if (!encoder_)
         {
             encoder_ = std::make_unique<StreamEncoder>(config_->codec, config_->use_hw_encoder, logger_);
-            encoder_->setBitrate(1000 * config_->bit_rate);
-            encoder_->setFramerate(config_->frame_rate);
+            encoder_->setBitrate(config_->target_bitrate);
+            encoder_->setFramerate(config_->expected_framerate);
             encoder_->setPackageSizeHint(server_->maxPacketSize() - 24);
-            RCLCPP_INFO(logger_, "[%s] start encoding (%s; %u kbit/s; %u fps) for %s", topic_name_.c_str(),
-                        encoder_->context()->codec->name, config_->bit_rate, config_->frame_rate,
-                        server_->url().c_str());
+            RCLCPP_INFO(logger_, "[%s] start encoding (%s; %sbit/s; %u fps) for %s", topic_name_.c_str(),
+                        encoder_->context()->codec->name, withSI(config_->target_bitrate).c_str(),
+                        config_->expected_framerate, server_->url().c_str());
         }
         if (image.header.stamp.sec == 0 && image.header.stamp.nanosec == 0)
             RCLCPP_WARN(logger_, "[%s] image header time stamp is not set, expect broken RTSP stream",
