@@ -54,11 +54,9 @@ struct RTSP_IMAGE_TRANSPORT_NO_EXPORT PublisherPlugin::Config
     bool use_ip_multicast = false;
 };
 
-const std::map<std::string, VideoCodec> CODEC_NAMES = {{"H264", VideoCodec::H264},
-                                                       {"H265", VideoCodec::H265},
-                                                       {"MPEG4", VideoCodec::MPEG4},
-                                                       {"VP8", VideoCodec::VP8},
-                                                       {"VP9", VideoCodec::VP9}};
+const std::map<std::string, VideoCodec> CODEC_NAMES = {
+    {"H264", VideoCodec::H264},   {"AVC", VideoCodec::H264}, {"H265", VideoCodec::H265}, {"HEVC", VideoCodec::H265},
+    {"MPEG4", VideoCodec::MPEG4}, {"VP8", VideoCodec::VP8},  {"VP9", VideoCodec::VP9}};
 
 using SuperClass = image_transport::SimplePublisherPlugin<std_msgs::msg::String>;
 
