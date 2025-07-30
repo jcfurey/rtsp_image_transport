@@ -49,15 +49,11 @@ public:
     std::shared_ptr<void> take_data_by_entity_id(std::size_t id) override;
     void set_on_ready_callback(std::function<void(std::size_t, int)>) override;
     void clear_on_ready_callback() override;
-#if CURRENT_RCLCPP_VERSION >= FKIE_VERSION_TUPLE(29, 6, 0)
     void add_to_wait_set(rcl_wait_set_t& wait_set) override;
     bool is_ready(const rcl_wait_set_t&) override;
     void execute(const std::shared_ptr<void>&) override;
+#if CURRENT_RCLCPP_VERSION >= FKIE_VERSION_TUPLE(29, 4, 0)
     std::vector<std::shared_ptr<rclcpp::TimerBase>> get_timers() const override;
-#else
-    void add_to_wait_set(rcl_wait_set_t* wait_set) override;
-    bool is_ready(rcl_wait_set_t*) override;
-    void execute(std::shared_ptr<void>&) override;
 #endif
 
 private:
@@ -91,7 +87,6 @@ void ScheduledCB::set_on_ready_callback(std::function<void(std::size_t, int)>) {
 
 void ScheduledCB::clear_on_ready_callback() {}
 
-#if CURRENT_RCLCPP_VERSION >= FKIE_VERSION_TUPLE(29, 6, 0)
 void ScheduledCB::add_to_wait_set(rcl_wait_set_t& wait_set)
 {
     cond_.add_to_wait_set(wait_set);
@@ -107,24 +102,10 @@ void ScheduledCB::execute(const std::shared_ptr<void>&)
     func_();
 }
 
+#if CURRENT_RCLCPP_VERSION >= FKIE_VERSION_TUPLE(29, 4, 0)
 std::vector<std::shared_ptr<rclcpp::TimerBase>> ScheduledCB::get_timers() const
 {
     return {};
-}
-#else
-void ScheduledCB::add_to_wait_set(rcl_wait_set_t* wait_set)
-{
-    cond_.add_to_wait_set(*wait_set);
-}
-
-bool ScheduledCB::is_ready(rcl_wait_set_t*)
-{
-    return true;
-}
-
-void ScheduledCB::execute(std::shared_ptr<void>&)
-{
-    func_();
 }
 #endif
 
