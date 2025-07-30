@@ -50,32 +50,29 @@ with FFmpeg 4, some codecs are hardware acceleratable. The following table
 summarizes the options, subject to availability in your FFmpeg version and
 compatible hardware:
 
-+----------+----------+----------+----------+----------+----------+
-|          | Software | NVIDIA   | QSV      | VAAPI    | OMX      |
-+==========+==========+==========+==========+==========+==========+
-| H.264    | Yes      | Yes      | Yes      | Encoding | Encoding |
-+----------+----------+----------+----------+----------+----------+
-| H.265    | Yes      | Yes      | Yes      | Encoding | No       |
-+----------+----------+----------+----------+----------+----------+
-| MPEG-4   | Yes      | Decoding | No       | Encoding | No       |
-+----------+----------+----------+----------+----------+----------+
-| VP8      | Yes      | Decoding | Decoding | Encoding | No       |
-+----------+----------+----------+----------+----------+----------+
-| VP9      | Yes      | Decoding | Yes      | Encoding | No       |
-+----------+----------+----------+----------+----------+----------+
-| MJPEG    | Decoding | Decoding | Decoding | No       | No       |
-+----------+----------+----------+----------+----------+----------+
++------------+----------+----------+-----------+----------+----------+
+|            | Software | NVIDIA   | QSV [2]_  | VAAPI    | OMX      |
++============+==========+==========+===========+==========+==========+
+| H.264      | Yes      | Yes      | Yes       | Encoding | Encoding |
++------------+----------+----------+-----------+----------+----------+
+| H.265      | Yes      | Yes      | Yes       | Encoding | No       |
++------------+----------+----------+-----------+----------+----------+
+| MPEG-4     | Yes      | Decoding | No        | Encoding | No       |
++------------+----------+----------+-----------+----------+----------+
+| VP8        | Yes      | Decoding | Decoding  | Encoding | No       |
++------------+----------+----------+-----------+----------+----------+
+| VP9        | Yes      | Decoding | Yes       | Encoding | No       |
++------------+----------+----------+-----------+----------+----------+
+| MJPEG [1]_ | Decoding | Decoding | Decoding  | No       | No       |
++------------+----------+----------+-----------+----------+----------+
 
-Notes and Caveats
-~~~~~~~~~~~~~~~~~
+.. [1] ``rtsp_image_transport`` cannot create Motion JPEG (MJPEG) streams,
+    only receive them for backwards compatibility with some ancient IP
+    cameras. If you really want to have independently compressed JPEG
+    frames for your video stream, you can use the
+    `compressed_image_transport`_ with JPEG compression instead.
 
-1. ``rtsp_image_transport`` cannot create Motion JPEG (MJPEG) streams,
-   only receive them for backwards compatibility with some ancient IP
-   cameras. If you really want to have independently compressed JPEG
-   frames for your video stream, you can use the
-   `compressed_image_transport`_ with JPEG compression instead.
-
-2. You need to install the Ubuntu package ``libmfx-gen1.2`` for QSV support.
+.. [2] You need to install the Ubuntu package ``libmfx-gen1.2`` for QSV support.
 
 .. _Real Time Streaming Protocol (RTSP): https://en.wikipedia.org/wiki/Real_Time_Streaming_Protocol
 
