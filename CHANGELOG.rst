@@ -2,8 +2,8 @@
 Changelog for package rtsp_image_transport
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Forthcoming
------------
+2.0.1 (2025-07-30)
+------------------
 * Drop support for pre-Jazzy Waitable API
 * Add ROS Kilted to CI
 * Update links in README.rst for ROS 2
