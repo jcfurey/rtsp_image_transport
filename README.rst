@@ -21,6 +21,11 @@ users. The RTSP server supports multicast transmission, so it will potentially
 save a huge amount of bandwidth if many clients are viewing the same video
 stream.
 
+The ``rtsp_image_transport`` plugin is compatible with many commercially
+available IP cameras. You can use the ``publish_rtsp_stream`` node to create an
+image topic with RTSP transport that reuses the existing RTSP stream.
+
+
 Limitations
 ===========
 
@@ -61,22 +66,16 @@ compatible hardware:
 | MJPEG    | Decoding | Decoding | Decoding | No       | No       |
 +----------+----------+----------+----------+----------+----------+
 
-.. note::
-    ``rtsp_image_transport`` cannot create Motion JPEG (MJPEG) streams,
-    only receive them for backwards compatibility with some ancient IP
-    cameras. If you really want to have independently compressed JPEG
-    frames for your video stream, you can use the
-    `compressed_image_transport`_ with JPEG compression instead.
+Notes and Caveats
+~~~~~~~~~~~~~~~~~
 
-.. note::
-    You need to install the Ubuntu package ``libmfx-gen1.2`` for QSV support.
+1. ``rtsp_image_transport`` cannot create Motion JPEG (MJPEG) streams,
+   only receive them for backwards compatibility with some ancient IP
+   cameras. If you really want to have independently compressed JPEG
+   frames for your video stream, you can use the
+   `compressed_image_transport`_ with JPEG compression instead.
 
-IP cameras
-==========
-
-The ``rtsp_image_transport`` plugin is compatible with many commercially
-available IP cameras. You can use the ``publish_rtsp_stream`` node to create an
-image topic with RTSP transport that reuses the existing RTSP stream.
+2. You need to install the Ubuntu package ``libmfx-gen1.2`` for QSV support.
 
 .. _Real Time Streaming Protocol (RTSP): https://en.wikipedia.org/wiki/Real_Time_Streaming_Protocol
 
