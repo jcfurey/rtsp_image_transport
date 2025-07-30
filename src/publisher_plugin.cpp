@@ -217,7 +217,7 @@ void PublisherPlugin::updateParameters()
     }
 }
 
-void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const PublishFn& publish_fn) const
+void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const PublisherT& publisher) const
 {
     std::lock_guard<std::mutex> lock{mutex_};
     try
@@ -226,9 +226,9 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
             return;
         if (update_url_)
         {
-            std_msgs::msg::String url;
-            url.data = server_->url();
-            publish_fn(url);
+            std_msgs::msg::String::UniquePtr url = std::make_unique<std_msgs::msg::String>();
+            url->data = server_->url();
+            publisher->publish(std::move(url));
             update_url_ = false;
         }
         if (!server_->hasActiveStreams())
@@ -247,9 +247,9 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
             {
                 RCLCPP_INFO(logger_, "[%s] stop encoding for %s", topic_name_.c_str(), server_->url().c_str());
                 encoder_.reset();
-                std_msgs::msg::String url;
-                url.data = server_->url();
-                publish_fn(url);
+                std_msgs::msg::String::UniquePtr url = std::make_unique<std_msgs::msg::String>();
+                url->data = server_->url();
+                publisher->publish(std::move(url));
             }
             return;
         }

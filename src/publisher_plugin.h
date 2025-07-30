@@ -48,7 +48,7 @@ public:
 protected:
     void advertiseImpl(rclcpp::Node* node, const std::string& base_topic, rmw_qos_profile_t custom_qos,
                        rclcpp::PublisherOptions options) override;
-    void publish(const sensor_msgs::msg::Image& image, const PublishFn& publish_fn) const override;
+    void publish(const sensor_msgs::msg::Image& image, const PublisherT& publisher) const override;
 
 private:
     void setupParameters(rclcpp::Node* node);
