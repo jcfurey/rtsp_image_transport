@@ -230,7 +230,7 @@ StreamEncoder::StreamEncoder(VideoCodec codec, bool use_hw_encoder, const rclcpp
 #ifdef FFMPEG_HAS_HWFRAME_SUPPORT
       hw_device_ctx_(nullptr), hw_frames_ctx_(nullptr),
 #endif
-      last_pixel_format_(AV_PIX_FMT_NONE), last_pts_(-1), picture_number_(0)
+      last_pixel_format_(AV_PIX_FMT_NONE), last_pts_(-1)
 {
     auto encoders = FFMPEG_ENCODERS.find(codec);
     if (encoders == FFMPEG_ENCODERS.end())
@@ -439,7 +439,6 @@ std::size_t StreamEncoder::encodeVideo(const sensor_msgs::msg::Image& image)
         pkt_.reset(av_packet_alloc(), free_packet);
         first_ts_ = image.header.stamp;
         last_pts_ = -1;
-        picture_number_ = 0;
         packets_.clear();
         last_pixel_format_ = AV_PIX_FMT_NONE;
         initialized_ = true;
@@ -486,7 +485,6 @@ std::size_t StreamEncoder::encodeVideo(const sensor_msgs::msg::Image& image)
     if (pts <= last_pts_)
         pts = last_pts_ + 1;
     encoder_input->pts = pts;
-    encoder_input->display_picture_number = picture_number_++;
     last_pts_ = pts;
     if ((result = avcodec_send_frame(ctx_.get(), encoder_input)) != 0)
     {

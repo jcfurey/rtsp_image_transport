@@ -78,7 +78,6 @@ private:
     std::shared_ptr<SwsContext> sws_;
     rclcpp::Time first_ts_;
     std::int64_t last_pts_;
-    int picture_number_;
     std::deque<FrameDataPtr> packets_;
 };
 
