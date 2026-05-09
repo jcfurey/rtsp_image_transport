@@ -151,7 +151,6 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
     }
     pkt_->data = const_cast<unsigned char*>(data->data());
     pkt_->size = data->length();
-    ctx_->reordered_opaque = data->stamp().nanoseconds();
     int result;
     if ((result = avcodec_send_packet(ctx_.get(), pkt_.get())) != 0)
     {
