@@ -9,6 +9,7 @@ jobs:
         env:
           - {ROS_DISTRO: jazzy}
           - {ROS_DISTRO: kilted}
+          - {ROS_DISTRO: lyrical}
           - {ROS_DISTRO: rolling}
     env:
       ROSDEP_SKIP_KEYS: 'live555 live555_vendor'
