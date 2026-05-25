@@ -2,6 +2,14 @@
 Changelog for package rtsp_image_transport
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+Forthcoming
+-----------
+* Drop obsolete display_picture_number
+* Add ROS Lyrical to CI workflow
+* Drop obsolete reordered_opaque
+  The variable was set but never used anyway
+* Contributors: Timo Röhling
+
 2.0.1 (2025-07-30)
 ------------------
 * Drop support for pre-Jazzy Waitable API
