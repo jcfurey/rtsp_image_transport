@@ -2,8 +2,8 @@
 Changelog for package rtsp_image_transport
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Forthcoming
------------
+2.0.2 (2026-05-25)
+------------------
 * Drop obsolete display_picture_number
 * Add ROS Lyrical to CI workflow
 * Drop obsolete reordered_opaque
