@@ -82,7 +82,11 @@ GraphMonitor::SharedPtr GraphMonitor::instance(rclcpp::Node* node, GraphMonitorL
     if (instance_)
     {
         if (!instance_->shutdown_flag_.load())
+        {
+            if (listener != nullptr)
+                instance_->listeners_.insert(listener);
             return instance_;
+        }
         while (instance_)
             std::this_thread::yield();
     }
