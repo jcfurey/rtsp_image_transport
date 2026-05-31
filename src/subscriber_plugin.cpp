@@ -123,7 +123,7 @@ using namespace std::chrono_literals;
 
 struct RTSP_IMAGE_TRANSPORT_NO_EXPORT SubscriberPlugin::Config
 {
-    bool use_hw_decoder = false;
+    bool use_hw_decoder = true;
     ReconnectPolicy reconnect_policy = ReconnectOnTimeout;
     std::chrono::milliseconds timeout = 2s;
     std::chrono::milliseconds reconnect_minwait = 100ms;

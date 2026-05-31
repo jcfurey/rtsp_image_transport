@@ -42,6 +42,22 @@ namespace rtsp_image_transport
 namespace
 {
 
+void set_codec_option(std::shared_ptr<AVCodecContext> ctx, const std::string& option, const std::string& value,
+                      const rclcpp::Logger& logger = rclcpp::get_logger("ffmpeg"))
+{
+    int result = av_opt_set(ctx->priv_data, option.c_str(), value.c_str(), 0);
+    if (result != 0)
+        RCLCPP_WARN(logger, "[%s] cannot set codec option %s=\"%s\"", ctx->codec->name, option.c_str(), value.c_str());
+}
+
+void set_codec_option(std::shared_ptr<AVCodecContext> ctx, const std::string& option, int value,
+                      const rclcpp::Logger& logger = rclcpp::get_logger("ffmpeg"))
+{
+    int result = av_opt_set_int(ctx->priv_data, option.c_str(), value, 0);
+    if (result != 0)
+        RCLCPP_WARN(logger, "[%s] cannot set codec option %s=%d", ctx->codec->name, option.c_str(), value);
+}
+
 void free_context(AVCodecContext* ctx)
 {
     avcodec_free_context(&ctx);
@@ -108,6 +124,10 @@ void StreamDecoder::setupDecoder(const AVCodec* decoder)
     ctx_.reset(avcodec_alloc_context3(decoder), free_context);
     if (!ctx_)
         throw StreamingError("failed to initialize decoder context");
+    if (strstr(decoder->name, "qsv"))
+    {
+        set_codec_option(ctx_, "async_depth", 1, logger_);
+    }
     ctx_->log_level_offset = 8;  // Turn errors into warnings
     if (codec_ == VideoCodec::H264 || codec_ == VideoCodec::H265)
     {

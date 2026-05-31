@@ -324,10 +324,17 @@ void StreamEncoder::setupEncoder(const AVCodec* encoder, bool silent)
             set_codec_option(ctx_, "preset", "fast", silent, logger_);
             set_codec_option(ctx_, "tune", "zerolatency", silent, logger_);
         }
+        else if (strstr(encoder->name, "qsv"))
+        {
+            set_codec_option(ctx_, "look_ahead", "0", silent, logger_);
+            set_codec_option(ctx_, "preset", "fast", silent, logger_);
+            set_codec_option(ctx_, "tune", "zerolatency", silent, logger_);
+        }
         if (is_vaapi_)
         {
             // set_codec_option(ctx_, "rc_mode", "CQP", silent, logger_);
             ctx_->global_quality = 20;
+            set_codec_option(ctx_, "async_depth", 1, silent, logger_);
         }
     }
     if (codec_ == VideoCodec::H264)
