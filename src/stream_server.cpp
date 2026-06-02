@@ -319,7 +319,7 @@ void StreamServer::start(VideoCodec codec, bool use_multicast)
         sms_ = ServerMediaSession::createNew(*env_, "", "rtsp_image_transport", topic_name_.c_str(),
                                              /*multicast*/ False);
         sms_->addSubsession(
-            UnicastServerMediaSubsession::createNew(*env_, shared_from_this(), 1024 + random() % 58976, False));
+            UnicastServerMediaSubsession::createNew(*env_, shared_from_this(), 49152 + 2 * (random() % 8192), False));
         rtsp_->addServerMediaSession(sms_);
     }
     std::shared_ptr<char> tmp(rtsp_->rtspURL(sms_, ros_interface_socket()), [](char* p) { delete[] p; });
