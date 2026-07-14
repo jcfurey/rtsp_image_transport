@@ -5,6 +5,7 @@ on: [push, pull_request]
 jobs:
   industrial_ci:
     strategy:
+      fail-fast: false
       matrix:
         env:
           - {ROS_DISTRO: jazzy}
@@ -16,6 +17,6 @@ jobs:
       UPSTREAM_WORKSPACE: 'github:fkie/live555_vendor#main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
       - uses: 'ros-industrial/industrial_ci@master'
         env: ${{ matrix.env }}
