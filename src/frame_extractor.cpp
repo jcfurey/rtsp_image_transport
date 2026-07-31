@@ -27,6 +27,7 @@
 #include <rclcpp/logging.hpp>
 
 #include <format>
+#include <memory>
 
 namespace rtsp_image_transport
 {
@@ -53,26 +54,35 @@ FrameExtractor::FrameExtractor(const std::weak_ptr<StreamClient>& stream_client,
         throw StreamingError(std::format("unsupported video codec {}", subsession->codecName()));
     if (codec_ == VideoCodec::H264 || codec_ == VideoCodec::H265)
     {
-        /* Pass out-of-band PPS and SPS NAL units */
-        char const* sprops = subsession->fmtp_spropparametersets();
-        if (sprops)
+        /* Pass the out-of-band parameter-set NAL units before media data.
+         * H.264 carries SPS/PPS together in sprop-parameter-sets, while
+         * RFC 7798 gives H.265 distinct sprop-vps/sps/pps attributes. */
+        auto append_parameter_sets = [this](char const* sprops)
         {
-            std::shared_ptr<StreamClient> sc = stream_client_.lock();
-            if (sc)
+            if (!sprops || !*sprops)
+                return;
+            unsigned num_nals = 0;
+            std::unique_ptr<SPropRecord[]> nals(parseSPropParameterSets(sprops, num_nals));
+            for (unsigned i = 0; i < num_nals; ++i)
             {
-                unsigned num_nals;
-                SPropRecord* nals = parseSPropParameterSets(sprops, num_nals);
-                for (unsigned i = 0; i < num_nals; ++i)
-                {
-                    if (buffer_length_ + nals[i].sPropLength + 4 > buffer_.size())
-                        throw StreamingError("frame buffer overflow");
-                    std::copy_n(MPEG_START_CODE, sizeof(MPEG_START_CODE), buffer_.data() + buffer_length_);
-                    std::copy_n(nals[i].sPropBytes, nals[i].sPropLength,
-                                buffer_.data() + buffer_length_ + sizeof(MPEG_START_CODE));
-                    buffer_length_ += nals[i].sPropLength + sizeof(MPEG_START_CODE);
-                }
-                delete[] nals;
+                if (buffer_length_ + nals[i].sPropLength + sizeof(MPEG_START_CODE) > buffer_.size())
+                    throw StreamingError("frame buffer overflow");
+                std::copy_n(MPEG_START_CODE, sizeof(MPEG_START_CODE), buffer_.data() + buffer_length_);
+                std::copy_n(nals[i].sPropBytes, nals[i].sPropLength,
+                            buffer_.data() + buffer_length_ + sizeof(MPEG_START_CODE));
+                buffer_length_ += nals[i].sPropLength + sizeof(MPEG_START_CODE);
             }
+        };
+
+        if (codec_ == VideoCodec::H264)
+        {
+            append_parameter_sets(subsession->fmtp_spropparametersets());
+        }
+        else
+        {
+            append_parameter_sets(subsession->fmtp_spropvps());
+            append_parameter_sets(subsession->fmtp_spropsps());
+            append_parameter_sets(subsession->fmtp_sproppps());
         }
     }
 }

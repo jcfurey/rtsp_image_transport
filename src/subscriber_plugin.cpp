@@ -124,6 +124,7 @@ using namespace std::chrono_literals;
 struct RTSP_IMAGE_TRANSPORT_NO_EXPORT SubscriberPlugin::Config
 {
     bool use_hw_decoder = true;
+    int video_subsession = 0;
     ReconnectPolicy reconnect_policy = ReconnectOnTimeout;
     std::chrono::milliseconds timeout = 2s;
     std::chrono::milliseconds reconnect_minwait = 100ms;
@@ -200,6 +201,7 @@ void SubscriberPlugin::internalCallback(const std_msgs::msg::String::ConstShared
     try
     {
         client_ = StreamClient::create(topic_name_, msg->data, logger_);
+        client_->setVideoSubsession(static_cast<std::size_t>(config_->video_subsession));
         client_->setSessionTimeout(config_->timeout);
         client_->setReceiveStreamDataHandler(std::bind(&SubscriberPlugin::receiveDataStream, this,
                                                        std::placeholders::_1, std::placeholders::_2,
@@ -248,6 +250,12 @@ void SubscriberPlugin::setupParameters(rclcpp::Node* node)
         node->declare_parameter<bool>(
             param_base_name_ + ".use_hw_decoder", config_->use_hw_decoder,
             ParameterDescriptor().set__description("use NVDEC hardware acceleration if possible"));
+    if (!node->has_parameter(param_base_name_ + ".video_subsession"))
+        node->declare_parameter<int>(
+            param_base_name_ + ".video_subsession", config_->video_subsession,
+            ParameterDescriptor()
+                .set__description("zero-based supported video subsession to decode")
+                .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(31)}));
     if (!node->has_parameter(param_base_name_ + ".reconnect_policy"))
         node->declare_parameter<int>(
             param_base_name_ + ".reconnect_policy", config_->reconnect_policy,
@@ -280,12 +288,15 @@ void SubscriberPlugin::setupParameters(rclcpp::Node* node)
 void SubscriberPlugin::updateParameters()
 {
     static constexpr int LVL_CODEC = 1;
+    static constexpr int LVL_CONNECTION = 2;
 
     rclcpp::node_interfaces::NodeParametersInterface::SharedPtr np = node_param_.lock();
     if (!np)
         return;
     Config new_config;
     new_config.use_hw_decoder = np->get_parameter(param_base_name_ + ".use_hw_decoder").as_bool();
+    new_config.video_subsession =
+        static_cast<int>(np->get_parameter(param_base_name_ + ".video_subsession").as_int());
     new_config.reconnect_policy =
         static_cast<ReconnectPolicy>(np->get_parameter(param_base_name_ + ".reconnect_policy").as_int());
     new_config.timeout = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
@@ -298,6 +309,8 @@ void SubscriberPlugin::updateParameters()
     int changelevel = 0;
     if (new_config.use_hw_decoder != config_->use_hw_decoder)
         changelevel |= LVL_CODEC;
+    if (new_config.video_subsession != config_->video_subsession)
+        changelevel |= LVL_CONNECTION;
 
     *config_ = new_config;
     try
@@ -308,6 +321,11 @@ void SubscriberPlugin::updateParameters()
         if (client_)
         {
             client_->setSessionTimeout(config_->timeout);
+            if (changelevel & LVL_CONNECTION)
+            {
+                reconnect();
+                return;
+            }
             if (changelevel >= LVL_CODEC)
             {
                 decoder_ = std::make_shared<StreamDecoder>(client_->codec(), config_->use_hw_decoder, logger_);
@@ -434,6 +452,7 @@ void SubscriberPlugin::sessionFinished()
 void SubscriberPlugin::reconnect()
 {
     client_->disconnect();
+    client_->setVideoSubsession(static_cast<std::size_t>(config_->video_subsession));
     clearQueuedFrames();
     rclcpp::node_interfaces::NodeBaseInterface::SharedPtr nb = node_base_.lock();
     rclcpp::node_interfaces::NodeTimersInterface::SharedPtr nt = node_timers_.lock();

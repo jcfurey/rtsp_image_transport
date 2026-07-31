@@ -30,9 +30,10 @@ include(CheckCXXSourceCompiles)
 
 # Dependencies
 find_package(ament_cmake REQUIRED)
-find_package(cv_bridge REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(live555 REQUIRED)
 find_package(PkgConfig REQUIRED)
 
@@ -150,36 +151,27 @@ set_target_properties(
 )
 target_link_libraries(
     ${PROJECT_NAME}
-    PRIVATE cv_bridge::cv_bridge image_transport::image_transport
-            live555::liveMedia PkgConfig::ffmpeg pluginlib::pluginlib
-            rclcpp::rclcpp
+    PRIVATE image_transport::image_transport live555::liveMedia
+            PkgConfig::ffmpeg pluginlib::pluginlib rclcpp::rclcpp
+            sensor_msgs::sensor_msgs std_msgs::std_msgs
 )
 
-# Make the "RTSP Only" test image embeddable
-add_custom_command(
-    OUTPUT rtsp_only.o
-    MAIN_DEPENDENCY rtsp_only.png
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMAND ld -z noexecstack -r -b binary -o
-            ${CMAKE_CURRENT_BINARY_DIR}/rtsp_only.o rtsp_only.png
-)
-
-add_executable(publish_rtsp_stream rtsp_only.o src/publish_rtsp_stream.cpp)
+add_executable(publish_rtsp_stream src/publish_rtsp_stream.cpp)
 target_compile_definitions(
     publish_rtsp_stream PRIVATE "ROS_PACKAGE_NAME=\"${PROJECT_NAME}\""
 )
 target_link_libraries(
-    publish_rtsp_stream PRIVATE cv_bridge::cv_bridge rclcpp::rclcpp
+    publish_rtsp_stream PRIVATE rclcpp::rclcpp sensor_msgs::sensor_msgs
+                                std_msgs::std_msgs
 )
 
 add_executable(
-    rtsp_camera_proxy rtsp_only.o src/host_override.cpp
-                      src/rtsp_camera_proxy.cpp
+    rtsp_camera_proxy src/host_override.cpp src/rtsp_camera_proxy.cpp
 )
 target_compile_features(rtsp_camera_proxy PRIVATE cxx_std_20)
 target_link_libraries(
-    rtsp_camera_proxy PRIVATE cv_bridge::cv_bridge live555::liveMedia
-                              rclcpp::rclcpp
+    rtsp_camera_proxy PRIVATE live555::liveMedia rclcpp::rclcpp
+                              sensor_msgs::sensor_msgs std_msgs::std_msgs
 )
 
 # Installation

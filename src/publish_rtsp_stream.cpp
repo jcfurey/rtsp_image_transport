@@ -18,15 +18,10 @@
  * limitations under the License.
  *
  ****************************************************************************/
-#include <cv_bridge/cv_bridge.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/string.hpp>
-
-extern char _binary_rtsp_only_png_start;
-extern char _binary_rtsp_only_png_end;
 
 int main(int argc, char** argv)
 {
@@ -66,11 +61,12 @@ int main(int argc, char** argv)
     {
         RCLCPP_WARN(logger, "URL does not begin with rtsp://");
     }
-    int png_size = &_binary_rtsp_only_png_end - &_binary_rtsp_only_png_start;
-    const cv::Mat rtsp_only_mat =
-        cv::imdecode(cv::Mat(1, png_size, CV_8U, &_binary_rtsp_only_png_start), cv::IMREAD_COLOR);
-    sensor_msgs::msg::Image::SharedPtr rtsp_only_img =
-        cv_bridge::CvImage(std_msgs::msg::Header(), sensor_msgs::image_encodings::BGR8, rtsp_only_mat).toImageMsg();
+    sensor_msgs::msg::Image::SharedPtr rtsp_only_img = std::make_shared<sensor_msgs::msg::Image>();
+    rtsp_only_img->height = 1;
+    rtsp_only_img->width = 1;
+    rtsp_only_img->encoding = sensor_msgs::image_encodings::BGR8;
+    rtsp_only_img->step = 3;
+    rtsp_only_img->data = {0, 0, 0};
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub0 = node->create_publisher<sensor_msgs::msg::Image>(
         topic, rclcpp::QoS(rclcpp::KeepLast(1)).durability(RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL));
     pub0->publish(*rtsp_only_img);

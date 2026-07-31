@@ -29,6 +29,7 @@
 #include <rclcpp/logger.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -66,8 +67,10 @@ public:
     std::string url() const noexcept;
     std::string topicName() const noexcept;
     const rclcpp::Logger& logger() const noexcept;
+    std::size_t videoSubsession() const noexcept;
     void connect();
     void disconnect();
+    void setVideoSubsession(std::size_t index) noexcept;
     void setSessionTimeout(const std::chrono::milliseconds& timeout) noexcept;
     void setSubsessionStartedHandler(SubsessionStartedHandler handler) noexcept;
     void setSubsessionFinishedHandler(SubsessionFinishedHandler handler) noexcept;
@@ -98,10 +101,11 @@ private:
     std::string topic_name_, url_;
     rclcpp::Logger logger_;
     VideoCodec codec_;
+    std::size_t video_subsession_;
     EventLoopWatchVariable quit_flag_;
     bool retried_on_454_error_;
     std::chrono::milliseconds timeout_;
-    std::mutex client_mutex_;
+    mutable std::mutex client_mutex_;
 
     SubsessionStartedHandler subsession_started_handler_;
     SubsessionFinishedHandler subsession_finished_handler_;

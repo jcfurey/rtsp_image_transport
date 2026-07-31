@@ -21,9 +21,7 @@
 #include "host_override.h"
 
 #include <BasicUsageEnvironment.hh>
-#include <cv_bridge/cv_bridge.hpp>
 #include <liveMedia.hh>
-#include <opencv2/imgcodecs.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -31,9 +29,6 @@
 
 #include <format>
 #include <thread>
-
-extern char _binary_rtsp_only_png_start;
-extern char _binary_rtsp_only_png_end;
 
 int main(int argc, char** argv)
 {
@@ -56,11 +51,12 @@ int main(int argc, char** argv)
                     "address %s",
                     rtsp_image_transport::socket_bound_address(ros_sock).c_str());
     }
-    int png_size = &_binary_rtsp_only_png_end - &_binary_rtsp_only_png_start;
-    const cv::Mat rtsp_only_mat =
-        cv::imdecode(cv::Mat(1, png_size, CV_8U, &_binary_rtsp_only_png_start), cv::IMREAD_COLOR);
-    sensor_msgs::msg::Image::ConstSharedPtr rtsp_only_img =
-        cv_bridge::CvImage(std_msgs::msg::Header(), sensor_msgs::image_encodings::BGR8, rtsp_only_mat).toImageMsg();
+    sensor_msgs::msg::Image::SharedPtr rtsp_only_img = std::make_shared<sensor_msgs::msg::Image>();
+    rtsp_only_img->height = 1;
+    rtsp_only_img->width = 1;
+    rtsp_only_img->encoding = sensor_msgs::image_encodings::BGR8;
+    rtsp_only_img->step = 3;
+    rtsp_only_img->data = {0, 0, 0};
     OutPacketBuffer::maxSize = 500000;
     TaskScheduler* scheduler = BasicTaskScheduler::createNew();
     UsageEnvironment* env = BasicUsageEnvironment::createNew(*scheduler);

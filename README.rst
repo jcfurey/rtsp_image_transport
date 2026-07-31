@@ -25,6 +25,21 @@ The ``rtsp_image_transport`` plugin is compatible with many commercially
 available IP cameras. You can use the ``publish_rtsp_stream`` node to create an
 image topic with RTSP transport that reuses the existing RTSP stream.
 
+Multiple Video Subsessions
+==========================
+
+This Nautilus fork adds the subscriber parameter ``video_subsession``. It is a
+zero-based index over supported video subsessions in SDP order and defaults to
+``0`` for upstream-compatible behavior. For an ``image_transport republish``
+input named ``in``, select the second video subsession with
+``-p in.rtsp.video_subsession:=1``.
+
+The fork also handles H.265 SDP initialization correctly by prepending the
+separate ``sprop-vps``, ``sprop-sps``, and ``sprop-pps`` parameter sets defined
+by RFC 7798. Upstream treated H.265 like H.264 and looked only for the combined
+``sprop-parameter-sets`` attribute, leaving some HEVC decoders without the
+configuration needed to decode the first keyframe.
+
 
 Limitations
 ===========

@@ -62,7 +62,7 @@ private:
                   int verbosity, char const* appName, portNumBits tunnelOverHTTPPortNum, int socketNumToServer) noexcept
         : RTSPClient(env, url, verbosity, appName, tunnelOverHTTPPortNum, socketNumToServer),
           stream_client_(stream_client), session_(nullptr), subsession_(nullptr), has_video_(false),
-          session_active_(false), timeout_task_(nullptr), received_packets_(0)
+          session_active_(false), video_subsession_index_(0), timeout_task_(nullptr), received_packets_(0)
     {
     }
 
@@ -79,6 +79,7 @@ private:
     std::shared_ptr<MediaSession> session_;
     MediaSubsession* subsession_;
     bool has_video_, session_active_;
+    std::size_t video_subsession_index_;
     std::unique_ptr<MediaSubsessionIterator> iter_;
     std::chrono::milliseconds timeout_;
     TaskToken timeout_task_;
@@ -158,6 +159,7 @@ void Live555Client::continueAfterDESCRIBE(RTSPClient* client, int resultCode, ch
         }
         RCLCPP_DEBUG(sc->logger(), "[%s] received SDP parameters:\n%s", sc->topicName().c_str(), sdpInfo.get());
         c->has_video_ = false;
+        c->video_subsession_index_ = 0;
         MediaSession* session = MediaSession::createNew(env, sdpInfo.get());
         if (!session)
         {
@@ -257,38 +259,38 @@ void Live555Client::setupNextSubsession(Live555Client* c) noexcept
         c->subsession_ = c->iter_->next();
         if (c->subsession_)
         {
+            std::string codecName = c->subsession_->codecName();
+            VideoCodec codec = fromRTSPCodecName(codecName);
+            if (codec == VideoCodec::Unknown)
+            {
+                RCLCPP_WARN(sc->logger(), "[%s] ignoring RTSP media subsession with unsupported codec %s",
+                            sc->topicName().c_str(), codecName.c_str());
+                setupNextSubsession(c);
+                return;
+            }
+
+            const std::size_t index = c->video_subsession_index_++;
+            const std::size_t selected = sc->videoSubsession();
+            if (index != selected)
+            {
+                RCLCPP_INFO(sc->logger(), "[%s] skipping RTSP video subsession %zu with %s video (selected %zu)",
+                            sc->topicName().c_str(), index, videoCodecName(codec).c_str(), selected);
+                setupNextSubsession(c);
+                return;
+            }
+
             if (c->subsession_->initiate())
             {
-                std::string codecName = c->subsession_->codecName();
-                RCLCPP_DEBUG(sc->logger(), "[%s] initiated RTSP media subsession with %s stream",
-                             sc->topicName().c_str(), codecName.c_str());
-                VideoCodec codec = fromRTSPCodecName(codecName);
-                if (codec != VideoCodec::Unknown)
-                {
-                    if (!c->has_video_)
-                    {
-                        RCLCPP_DEBUG(sc->logger(), "[%s] sending SETUP command for media subsession",
-                                     sc->topicName().c_str());
-                        c->sendSetupCommand(*c->subsession_, continueAfterSETUP);
-                    }
-                    else
-                    {
-                        RCLCPP_WARN(sc->logger(), "[%s] ignoring additional RTSP media subsession with %s video",
-                                    sc->topicName().c_str(), videoCodecName(codec).c_str());
-                        setupNextSubsession(c);
-                    }
-                }
-                else
-                {
-                    RCLCPP_WARN(sc->logger(), "[%s] ignoring RTSP media subsession with unsupported codec %s",
-                                sc->topicName().c_str(), codecName.c_str());
-                    setupNextSubsession(c);
-                }
+                RCLCPP_DEBUG(sc->logger(), "[%s] initiated RTSP video subsession %zu with %s stream",
+                             sc->topicName().c_str(), index, codecName.c_str());
+                RCLCPP_INFO(sc->logger(), "[%s] selected RTSP video subsession %zu with %s video",
+                            sc->topicName().c_str(), index, videoCodecName(codec).c_str());
+                c->sendSetupCommand(*c->subsession_, continueAfterSETUP);
             }
             else
             {
-                RCLCPP_WARN(sc->logger(), "[%s] failed to initiate RTSP media subsession: %s", sc->topicName().c_str(),
-                            env.getResultMsg());
+                RCLCPP_WARN(sc->logger(), "[%s] failed to initiate RTSP video subsession %zu: %s",
+                            sc->topicName().c_str(), index, env.getResultMsg());
                 setupNextSubsession(c);
             }
             return;
@@ -376,7 +378,7 @@ std::shared_ptr<StreamClient> StreamClient::create(const std::string& topic_name
 }
 
 StreamClient::StreamClient(const std::string& topic_name, const std::string& url, const rclcpp::Logger& logger) noexcept
-    : topic_name_(topic_name), url_(url), logger_(logger), codec_(VideoCodec::Unknown), quit_flag_(0),
+    : topic_name_(topic_name), url_(url), logger_(logger), codec_(VideoCodec::Unknown), video_subsession_(0), quit_flag_(0),
       retried_on_454_error_(false), timeout_(0), scheduler_(BasicTaskScheduler::createNew()),
       env_(BasicUsageEnvironment::createNew(*scheduler_), reclaim_env),
       event_loop_thread_([this]() { this->env_->taskScheduler().doEventLoop(&this->quit_flag_); }), client_(nullptr)
@@ -403,6 +405,18 @@ std::string StreamClient::topicName() const noexcept
 const rclcpp::Logger& StreamClient::logger() const noexcept
 {
     return logger_;
+}
+
+std::size_t StreamClient::videoSubsession() const noexcept
+{
+    std::lock_guard<std::mutex> lock{client_mutex_};
+    return video_subsession_;
+}
+
+void StreamClient::setVideoSubsession(std::size_t index) noexcept
+{
+    std::lock_guard<std::mutex> lock{client_mutex_};
+    video_subsession_ = index;
 }
 
 std::string StreamClient::url() const noexcept
