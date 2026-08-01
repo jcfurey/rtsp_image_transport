@@ -123,8 +123,7 @@ using namespace std::chrono_literals;
 
 struct RTSP_IMAGE_TRANSPORT_NO_EXPORT SubscriberPlugin::Config
 {
-    bool use_hw_decoder = true;
-    bool low_latency = true;
+    StreamDecoder::Options decoder;
     int video_subsession = 0;
     ReconnectPolicy reconnect_policy = ReconnectOnTimeout;
     std::chrono::milliseconds timeout = 2s;
@@ -236,9 +235,31 @@ void SubscriberPlugin::subsessionStarted(VideoCodec codec, MediaSubsession* subs
 {
     old_lag_ = rclcpp::Duration(0, 0);
     RCLCPP_DEBUG(logger_, "[%s] setting up decoder for %s", topic_name_.c_str(), videoCodecName(codec).c_str());
-    decoder_ = std::make_shared<StreamDecoder>(codec, config_->use_hw_decoder, config_->low_latency, logger_);
-    RCLCPP_INFO(logger_, "[%s] start decoding (%s) from %s", topic_name_.c_str(), decoder_->context()->codec->name,
-                client_->url().c_str());
+    decoder_ = std::make_shared<StreamDecoder>(codec, config_->decoder, logger_);
+    RCLCPP_INFO(logger_, "[%s] start decoding %s with %s from %s", topic_name_.c_str(),
+                videoCodecName(codec).c_str(), decoder_->description().c_str(), client_->url().c_str());
+    reportMissingHwDecoder();
+}
+
+/* Hardware decoding was asked for but we ended up in software. The device probe
+   has already run at this point, so listing what the machine can do is free and
+   turns a silent performance cliff into an actionable message. */
+void SubscriberPlugin::reportMissingHwDecoder()
+{
+    if (!decoder_ || decoder_->isHardwareAccelerated())
+        return;
+    if (!config_->decoder.use_hw_decoder || config_->decoder.hw_device == "none")
+        return;
+    std::string available;
+    for (const std::string& name : StreamDecoder::availableHwDevices())
+    {
+        if (!available.empty())
+            available += ", ";
+        available += name;
+    }
+    RCLCPP_INFO(logger_, "[%s] no hardware decoder available, decoding in software (hardware devices on this "
+                         "machine: %s)",
+                topic_name_.c_str(), available.empty() ? "none" : available.c_str());
 }
 
 void SubscriberPlugin::receiveDataStream(VideoCodec codec, MediaSubsession* subsession, const FrameDataPtr& data)
@@ -254,10 +275,21 @@ void SubscriberPlugin::setupParameters(rclcpp::Node* node)
     using rcl_interfaces::msg::ParameterDescriptor;
     if (!node->has_parameter(param_base_name_ + ".use_hw_decoder"))
         node->declare_parameter<bool>(
-            param_base_name_ + ".use_hw_decoder", config_->use_hw_decoder,
-            ParameterDescriptor().set__description("use NVDEC hardware acceleration if possible"));
+            param_base_name_ + ".use_hw_decoder", config_->decoder.use_hw_decoder,
+            ParameterDescriptor().set__description("use GPU accelerated video decoding if possible"));
+    if (!node->has_parameter(param_base_name_ + ".hw_device"))
+        node->declare_parameter<std::string>(
+            param_base_name_ + ".hw_device", config_->decoder.hw_device,
+            ParameterDescriptor().set__description(
+                "hardware device for video decoding: auto, none, or a specific FFmpeg device "
+                "(cuda, vaapi, qsv, vdpau, drm, vulkan, videotoolbox, d3d11va)"));
+    if (!node->has_parameter(param_base_name_ + ".decoder"))
+        node->declare_parameter<std::string>(
+            param_base_name_ + ".decoder", config_->decoder.decoder,
+            ParameterDescriptor().set__description(
+                "force a specific FFmpeg decoder, e.g. hevc_cuvid or h264_qsv (empty = choose automatically)"));
     if (!node->has_parameter(param_base_name_ + ".low_latency"))
-        node->declare_parameter<bool>(param_base_name_ + ".low_latency", config_->low_latency,
+        node->declare_parameter<bool>(param_base_name_ + ".low_latency", config_->decoder.low_latency,
                                       ParameterDescriptor().set__description(
                                           "decode with minimal buffering; disable for streams with B-frames"));
     if (!node->has_parameter(param_base_name_ + ".video_subsession"))
@@ -304,8 +336,10 @@ void SubscriberPlugin::updateParameters()
     if (!np)
         return;
     Config new_config;
-    new_config.use_hw_decoder = np->get_parameter(param_base_name_ + ".use_hw_decoder").as_bool();
-    new_config.low_latency = np->get_parameter(param_base_name_ + ".low_latency").as_bool();
+    new_config.decoder.use_hw_decoder = np->get_parameter(param_base_name_ + ".use_hw_decoder").as_bool();
+    new_config.decoder.hw_device = np->get_parameter(param_base_name_ + ".hw_device").as_string();
+    new_config.decoder.decoder = np->get_parameter(param_base_name_ + ".decoder").as_string();
+    new_config.decoder.low_latency = np->get_parameter(param_base_name_ + ".low_latency").as_bool();
     new_config.video_subsession =
         static_cast<int>(np->get_parameter(param_base_name_ + ".video_subsession").as_int());
     new_config.reconnect_policy =
@@ -318,7 +352,10 @@ void SubscriberPlugin::updateParameters()
         1000 * np->get_parameter(param_base_name_ + ".reconnect_maxwait").as_double()));
 
     int changelevel = 0;
-    if (new_config.use_hw_decoder != config_->use_hw_decoder || new_config.low_latency != config_->low_latency)
+    if (new_config.decoder.use_hw_decoder != config_->decoder.use_hw_decoder
+        || new_config.decoder.low_latency != config_->decoder.low_latency
+        || new_config.decoder.hw_device != config_->decoder.hw_device
+        || new_config.decoder.decoder != config_->decoder.decoder)
         changelevel |= LVL_CODEC;
     if (new_config.video_subsession != config_->video_subsession)
         changelevel |= LVL_CONNECTION;
@@ -339,10 +376,11 @@ void SubscriberPlugin::updateParameters()
             }
             if ((changelevel & LVL_CODEC) && decoder_)
             {
-                decoder_ = std::make_shared<StreamDecoder>(client_->codec(), config_->use_hw_decoder,
-                                                           config_->low_latency, logger_);
-                RCLCPP_INFO(logger_, "[%s] start decoding (%s) from %s", topic_name_.c_str(),
-                            decoder_->context()->codec->name, client_->url().c_str());
+                decoder_ = std::make_shared<StreamDecoder>(client_->codec(), config_->decoder, logger_);
+                RCLCPP_INFO(logger_, "[%s] start decoding %s with %s from %s", topic_name_.c_str(),
+                            videoCodecName(client_->codec()).c_str(), decoder_->description().c_str(),
+                            client_->url().c_str());
+                reportMissingHwDecoder();
             }
         }
     }

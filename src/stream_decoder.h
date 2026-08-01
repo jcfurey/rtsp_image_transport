@@ -26,6 +26,8 @@
 
 extern "C"
 {
+#include <libavutil/buffer.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 }
 
@@ -35,12 +37,27 @@ extern "C"
 #include <cstddef>
 #include <deque>
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace rtsp_image_transport
 {
 
 class StreamingError;
 class DecodingError;
+
+/* One way of decoding the stream: an FFmpeg decoder, optionally combined with a
+   hardware device that provides the acceleration. */
+struct DecoderCandidate
+{
+    std::string decoder_name;
+    /* AV_HWDEVICE_TYPE_NONE means the decoder needs no device context of its
+       own, which covers both software decoders and the standalone hardware
+       decoders such as h264_cuvid or hevc_qsv. */
+    AVHWDeviceType hw_device_type = AV_HWDEVICE_TYPE_NONE;
+    AVPixelFormat hw_pixel_format = AV_PIX_FMT_NONE;
+    bool hardware = false;
+};
 
 class StreamDecoder
 {
@@ -52,26 +69,57 @@ public:
         Key,
         None
     };
-    StreamDecoder(VideoCodec codec, bool use_hw_decoder = true, bool low_latency = true,
+    struct Options
+    {
+        bool use_hw_decoder = true;
+        bool low_latency = true;
+        /* "auto" picks the first working device, "none" forces software
+           decoding, anything else names an FFmpeg hardware device type such as
+           "cuda", "vaapi", "qsv", "vdpau" or "vulkan". */
+        std::string hw_device = "auto";
+        /* Forces a specific FFmpeg decoder (e.g. "hevc_cuvid") when not empty */
+        std::string decoder;
+    };
+
+    StreamDecoder(VideoCodec codec, const Options& options,
                   const rclcpp::Logger& logger = rclcpp::get_logger("StreamDecoder"));
     VideoCodec codec() const noexcept;
     std::size_t decodeVideo(const FrameDataPtr& data);
     sensor_msgs::msg::Image::UniquePtr nextFrame() noexcept;
     AVCodecContext* context() noexcept;
+    /* Human readable description of the decoder in use, e.g. "hevc + CUDA" */
+    const std::string& description() const noexcept;
+    bool isHardwareAccelerated() const noexcept;
     void setDecodeFrames(DecodeFrames which) noexcept;
 
+    /* Hardware device types this build of FFmpeg can instantiate right now.
+       Probed once and cached; intended for diagnostics. */
+    static std::vector<std::string> availableHwDevices();
+
 private:
-    void setupDecoder(const AVCodec* decoder);
-    void convertToBGR(sensor_msgs::msg::Image& img);
+    static AVPixelFormat selectPixelFormat(AVCodecContext* ctx, const AVPixelFormat* formats);
+
+    std::vector<DecoderCandidate> buildCandidates() const;
+    std::vector<AVHWDeviceType> hwDevicePreference() const;
+    void openCandidate(const DecoderCandidate& candidate);
+    bool fallBackToNextCandidate(const std::string& reason);
+    AVFrame* downloadIfHardwareFrame(AVFrame* frame);
+    void convertToBGR(sensor_msgs::msg::Image& img, AVFrame* source);
+    void resetWorkingBuffers();
 
     rclcpp::Logger logger_;
     VideoCodec codec_;
-    bool initialized_, low_latency_, sws_threaded_;
+    Options options_;
+    bool initialized_, sws_threaded_, hardware_;
     int width_, height_;
-    AVPixelFormat last_pixel_format_;
+    AVPixelFormat last_pixel_format_, hw_pixel_format_;
+    std::string description_;
+    std::vector<DecoderCandidate> candidates_;
+    std::size_t candidate_index_;
+    std::shared_ptr<AVBufferRef> hw_device_;
     std::shared_ptr<AVCodecContext> ctx_;
     std::shared_ptr<AVPacket> pkt_;
-    std::shared_ptr<AVFrame> frm_, bgr_frm_;
+    std::shared_ptr<AVFrame> frm_, sw_frm_, bgr_frm_;
     std::shared_ptr<SwsContext> sws_;
     std::deque<sensor_msgs::msg::Image::UniquePtr> frames_;
 };

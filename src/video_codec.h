@@ -42,7 +42,10 @@ enum class VideoCodec
     VP8 = 3,
     VP9 = 4,
     AV1 = 5,
-    MJPEG = 1001 /* Decoding only */
+    /* Decoding only */
+    MJPEG = 1001,
+    MPEG2 = 1002,
+    H263 = 1003
 };
 
 std::string videoCodecName(VideoCodec codec);
