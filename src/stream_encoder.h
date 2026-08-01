@@ -57,6 +57,10 @@ public:
     std::size_t encodeVideo(const sensor_msgs::msg::Image& image);
     FrameDataPtr nextPacket() noexcept;
     AVCodecContext* context() noexcept;
+    /* Presentation time stamp of the most recent frame, in the encoder time
+       base. Exposed so tests can check that frame pacing survives a ROS clock
+       that jumps. */
+    std::int64_t lastPresentationTimestamp() const noexcept;
 
 private:
     void setupEncoder(const AVCodec* encoder, bool silent);
@@ -76,7 +80,7 @@ private:
     std::shared_ptr<AVPacket> pkt_;
     AVPixelFormat last_pixel_format_;
     std::shared_ptr<SwsContext> sws_;
-    rclcpp::Time first_ts_;
+    rclcpp::Time last_ts_;
     std::int64_t last_pts_;
     std::deque<FrameDataPtr> packets_;
 };

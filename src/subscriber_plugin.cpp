@@ -32,6 +32,17 @@
 namespace rtsp_image_transport
 {
 
+/* From image_transport 6.4 the plugin entry points take node interfaces rather
+   than a node, and the old ones are never called. This transport cannot be
+   ported to them yet: RequiredInterfaces carries neither the clock interface
+   the subscriber needs to honour simulated time, nor the waitables interface it
+   uses to hand decoding to the executor, nor the graph interface the publisher
+   watches for departing subscribers. Overriding the new entry point at least
+   turns a silent black screen into something the log explains. */
+#define RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES \
+    (CURRENT_IMAGE_TRANSPORT_VERSION >= FKIE_VERSION_TUPLE(6, 4, 0))
+
+
 namespace
 {
 
@@ -121,9 +132,25 @@ enum ReconnectPolicy
 
 using namespace std::chrono_literals;
 
+/* Where the time stamp on a published image comes from */
+enum TimestampSource
+{
+    /* The sender's clock, taken from RTP/RTCP. Accurate when the camera is
+       synchronised, but it is wall clock time and therefore meaningless to a
+       node running on simulated time. */
+    TimestampFromSender = 0,
+    /* The node clock at the moment the frame arrives. Always in the node's own
+       time base, at the cost of network jitter. */
+    TimestampFromReceiver = 1,
+    /* Sender time on a wall clock node, receive time when simulated time is in
+       use. */
+    TimestampAuto = 2,
+};
+
 struct RTSP_IMAGE_TRANSPORT_NO_EXPORT SubscriberPlugin::Config
 {
     StreamDecoder::Options decoder;
+    TimestampSource timestamp_source = TimestampAuto;
     int video_subsession = 0;
     ReconnectPolicy reconnect_policy = ReconnectOnTimeout;
     std::chrono::milliseconds timeout = 2s;
@@ -156,13 +183,43 @@ std::string SubscriberPlugin::getTransportName() const
     return "rtsp";
 }
 
+/* True when images should be stamped with the time they arrived rather than
+   with the sender's clock. Re-evaluated per frame because use_sim_time can be
+   switched at runtime. */
+bool SubscriberPlugin::useReceiveTimestamps() const
+{
+    switch (config_->timestamp_source)
+    {
+        case TimestampFromSender:
+            return false;
+        case TimestampFromReceiver:
+            return true;
+        default:
+            return clock_ && clock_->ros_time_is_active();
+    }
+}
+
 void SubscriberPlugin::subscribeImpl(rclcpp::Node* node, const std::string& base_topic, const Callback& callback,
                                      rmw_qos_profile_t custom_qos, rclcpp::SubscriptionOptions options)
 {
+    /* The transport topic carries a latched URL rather than image data, so a
+       late joining subscriber has to be able to fetch the current value. That
+       fixes reliability, durability and history; every other policy the caller
+       asked for is left untouched. */
     custom_qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
     custom_qos.history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
     custom_qos.depth = 1;
     custom_qos.durability = RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
+    /* An incompatible publisher otherwise just means no video, with nothing in
+       the log to explain it. */
+    options.event_callbacks.incompatible_qos_callback =
+        [this](rclcpp::QOSRequestedIncompatibleQoSInfo& info)
+    {
+        RCLCPP_ERROR(logger_,
+                     "[%s] the RTSP URL publisher offers an incompatible QoS policy (%d); this transport needs "
+                     "RELIABLE and TRANSIENT_LOCAL, so no video will arrive",
+                     topic_name_.c_str(), static_cast<int>(info.last_policy_kind));
+    };
     SuperClass::subscribeImpl(node, base_topic, callback, custom_qos, options);
     logger_ = node->get_logger();
     clock_ = node->get_clock();
@@ -191,6 +248,23 @@ void SubscriberPlugin::subscribeImpl(rclcpp::Node* node, const std::string& base
                                                               { this->updateParameters(); });
     updateParameters();
 }
+
+#if RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
+void SubscriberPlugin::subscribeImpl(image_transport::RequiredInterfaces node_interfaces,
+                                     const std::string& base_topic, const Callback& callback,
+                                     rclcpp::QoS custom_qos, rclcpp::SubscriptionOptions options)
+{
+    rclcpp::Logger logger = node_interfaces.get_node_logging_interface()->get_logger();
+    RCLCPP_ERROR(logger,
+                 "[%s] the rtsp transport is not supported with image_transport %d.%d: its plugin API no longer "
+                 "provides the clock, waitables and graph interfaces this transport needs. The topic will be "
+                 "subscribed but no images will be decoded. Use image_transport 6.3 or earlier, or the raw "
+                 "transport.",
+                 base_topic.c_str(), CURRENT_IMAGE_TRANSPORT_VERSION >> 16,
+                 (CURRENT_IMAGE_TRANSPORT_VERSION >> 8) & 0xff);
+    SuperClass::subscribeImpl(node_interfaces, base_topic, callback, custom_qos, options);
+}
+#endif
 
 void SubscriberPlugin::internalCallback(const std_msgs::msg::String::ConstSharedPtr& msg, const Callback& callback)
 {
@@ -265,6 +339,12 @@ void SubscriberPlugin::reportMissingHwDecoder()
 void SubscriberPlugin::receiveDataStream(VideoCodec codec, MediaSubsession* subsession, const FrameDataPtr& data)
 {
     RCLCPP_DEBUG_THROTTLE(logger_, *clock_, 30000, "[%s] receiving video frames from RTSP stream", topic_name_.c_str());
+    if (useReceiveTimestamps())
+    {
+        /* The RTP presentation time is the sender's wall clock, which says
+           nothing about the node's time base when that is simulated. */
+        data->setStamp(clock_->now());
+    }
     pushFrame(data);
     if (notify_frame_)
         notify_frame_();
@@ -299,6 +379,13 @@ void SubscriberPlugin::setupParameters(rclcpp::Node* node)
         node->declare_parameter<bool>(param_base_name_ + ".low_latency", config_->decoder.low_latency,
                                       ParameterDescriptor().set__description(
                                           "decode with minimal buffering; disable for streams with B-frames"));
+    if (!node->has_parameter(param_base_name_ + ".timestamp_source"))
+        node->declare_parameter<int>(
+            param_base_name_ + ".timestamp_source", config_->timestamp_source,
+            ParameterDescriptor()
+                .set__description("image time stamp source (0 = sender clock via RTCP, 1 = time of reception, "
+                                  "2 = automatic: sender clock unless simulated time is in use)")
+                .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(2)}));
     if (!node->has_parameter(param_base_name_ + ".video_subsession"))
         node->declare_parameter<int>(
             param_base_name_ + ".video_subsession", config_->video_subsession,
@@ -348,6 +435,8 @@ void SubscriberPlugin::updateParameters()
     new_config.decoder.hw_device_path = np->get_parameter(param_base_name_ + ".hw_device_path").as_string();
     new_config.decoder.decoder = np->get_parameter(param_base_name_ + ".decoder").as_string();
     new_config.decoder.low_latency = np->get_parameter(param_base_name_ + ".low_latency").as_bool();
+    new_config.timestamp_source =
+        static_cast<TimestampSource>(np->get_parameter(param_base_name_ + ".timestamp_source").as_int());
     new_config.video_subsession =
         static_cast<int>(np->get_parameter(param_base_name_ + ".video_subsession").as_int());
     new_config.reconnect_policy =

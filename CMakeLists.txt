@@ -146,6 +146,14 @@ math(
     "65536 * ${rclcpp_VERSION_MAJOR} + 256 * ${rclcpp_VERSION_MINOR} + ${rclcpp_VERSION_PATCH}"
 )
 
+# image_transport version. From 6.4 onwards the plugin entry points take node
+# interfaces instead of a node, and the old ones are no longer called.
+math(
+    EXPR
+    computed_image_transport_version
+    "65536 * ${image_transport_VERSION_MAJOR} + 256 * ${image_transport_VERSION_MINOR} + ${image_transport_VERSION_PATCH}"
+)
+
 # Targets
 
 # Everything except the two image_transport plugins lives in a static core
@@ -161,6 +169,7 @@ add_library(
     src/graph_monitor.cpp
     src/host_override.cpp
     src/init.cpp
+    src/stream_clock.cpp
     src/stream_client.cpp
     src/stream_decoder.cpp
     src/stream_encoder.cpp
@@ -185,6 +194,7 @@ target_compile_definitions(
            $<$<BOOL:${FFMPEG_HAS_HWFRAME_SUPPORT}>:FFMPEG_HAS_HWFRAME_SUPPORT>
            $<$<BOOL:${FFMPEG_HAS_SWS_THREADS}>:FFMPEG_HAS_SWS_THREADS>
            CURRENT_RCLCPP_VERSION=${computed_rclcpp_version}
+           CURRENT_IMAGE_TRANSPORT_VERSION=${computed_image_transport_version}
 )
 # Named explicitly rather than through ament_target_dependencies(), which was
 # removed in Lyrical. Message packages are linked through their _TARGETS
@@ -238,6 +248,8 @@ if(BUILD_TESTING)
     set(unit_tests
         test_video_codec
         test_event_loop
+        test_stream_clock
+        test_time_handling
         test_frame_data
         test_stream_decoder
         test_stream_encoder
@@ -245,8 +257,9 @@ if(BUILD_TESTING)
         test_host_override
         test_graph_monitor
     )
-    # Serves a real RTSP session over the loopback interface
-    list(APPEND unit_tests test_rtsp_loopback)
+    # Serve a real RTSP session; the transport tests additionally drive the
+    # image_transport plugins through pluginlib.
+    list(APPEND unit_tests test_rtsp_loopback test_sim_time)
 
     # colcon runs the test binaries in parallel and video coding is not cheap,
     # so the timeout is generous enough that a loaded build server does not

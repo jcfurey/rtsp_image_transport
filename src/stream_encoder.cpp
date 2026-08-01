@@ -25,6 +25,8 @@
 
 #include <sensor_msgs/image_encodings.hpp>
 
+#include <algorithm>
+#include <cmath>
 #include <format>
 
 extern "C"
@@ -44,6 +46,10 @@ namespace rtsp_image_transport
 
 namespace
 {
+
+/* Anything longer than this between two images is treated as a discontinuity
+   rather than as real elapsed time. */
+constexpr double MAX_FRAME_GAP_SECONDS = 5.0;
 
 void set_codec_option(std::shared_ptr<AVCodecContext> ctx, const std::string& option, const std::string& value,
                       bool silent = false, const rclcpp::Logger& logger = rclcpp::get_logger("ffmpeg"))
@@ -437,7 +443,7 @@ std::size_t StreamEncoder::encodeVideo(const sensor_msgs::msg::Image& image)
         }
 #endif
         pkt_.reset(av_packet_alloc(), free_packet);
-        first_ts_ = image.header.stamp;
+        last_ts_ = rclcpp::Time(image.header.stamp);
         last_pts_ = -1;
         packets_.clear();
         last_pixel_format_ = AV_PIX_FMT_NONE;
@@ -483,12 +489,32 @@ std::size_t StreamEncoder::encodeVideo(const sensor_msgs::msg::Image& image)
         encoder_input = hw_frm_.get();
     }
 #endif
-    rclcpp::Duration d = rclcpp::Time(image.header.stamp) - first_ts_;
-    std::int64_t pts = static_cast<std::int64_t>(300 * d.seconds());
-    if (pts <= last_pts_)
-        pts = last_pts_ + 1;
+    /* The presentation time stamp advances by the gap since the previous image
+       rather than by the distance from the first one. Deriving it from a fixed
+       origin breaks as soon as the ROS clock jumps backwards, which is exactly
+       what a looping bag or a simulation reset does: every following frame ends
+       up clamped to one tick after its predecessor, and the encoder concludes
+       the stream runs at 300 fps. */
+    const rclcpp::Time stamp(image.header.stamp);
+    std::int64_t pts;
+    if (last_pts_ < 0)
+    {
+        pts = 0;
+    }
+    else
+    {
+        const double gap = (stamp - last_ts_).seconds();
+        /* A gap that is negative, or long enough to be a discontinuity rather
+           than a dropped frame, falls back to one nominal frame interval. */
+        const double nominal = ctx_->framerate.num > 0
+                                   ? static_cast<double>(ctx_->framerate.den) / ctx_->framerate.num
+                                   : 1.0 / 30.0;
+        const double step = (gap <= 0.0 || gap > MAX_FRAME_GAP_SECONDS) ? nominal : gap;
+        pts = last_pts_ + std::max<std::int64_t>(1, static_cast<std::int64_t>(std::llround(300 * step)));
+    }
     encoder_input->pts = pts;
     last_pts_ = pts;
+    last_ts_ = stamp;
     if ((result = avcodec_send_frame(ctx_.get(), encoder_input)) != 0)
     {
         char errbuf[80];
@@ -536,6 +562,11 @@ VideoCodec StreamEncoder::codec() const noexcept
 AVCodecContext* StreamEncoder::context() noexcept
 {
     return ctx_.get();
+}
+
+std::int64_t StreamEncoder::lastPresentationTimestamp() const noexcept
+{
+    return last_pts_;
 }
 
 }  // namespace rtsp_image_transport

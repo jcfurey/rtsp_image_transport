@@ -162,6 +162,105 @@ frames at 1 s, and everything at 2 s, so the pipeline catches up instead of
 drifting further behind.
 
 
+Quality of Service
+==================
+
+The transport topic ``<base topic>/rtsp`` carries a latched URL, not image
+data, so the plugins pin three policies on it regardless of what is requested:
+``RELIABLE``, ``TRANSIENT_LOCAL`` and ``KEEP_LAST`` with depth 1. A subscriber
+that joins after the publisher started would otherwise never learn the stream
+URL. Every other policy — deadline, lifespan, liveliness — is passed through
+untouched.
+
+Because those three are fixed, a peer that insists on ``BEST_EFFORT`` or
+``VOLATILE`` is incompatible and simply receives nothing. Both plugins now
+report that instead of leaving you with a silent black screen::
+
+  [/camera0] the RTSP URL publisher offers an incompatible QoS policy (3);
+             this transport needs RELIABLE and TRANSIENT_LOCAL, so no video will arrive
+
+The QoS of the *image* topic your subscriber callback is fed from is yours to
+choose as usual; it is unrelated to the URL topic.
+
+ROS Time and Simulated Time
+===========================
+
+RTSP timing is wall clock timing: RTP and RTCP carry the sender's real time,
+and ROS time is something else entirely under ``use_sim_time``. The plugins
+translate between the two rather than assuming they are the same.
+
+Subscriber
+----------
+
+``timestamp_source`` (int, default ``2``)
+    Where the stamp on a decoded image comes from.
+
+    ``0`` — the sender's clock, recovered from RTCP. Best when the camera is
+    NTP synchronised, since it is the actual capture time.
+
+    ``1`` — the node clock when the frame arrives. Always in the node's own
+    time base, at the cost of network jitter.
+
+    ``2`` (automatic) — sender clock on a node running on wall clock time,
+    time of reception when simulated time is in use.
+
+The default matters: with ``use_sim_time`` the rest of the system works in
+simulated time, and images stamped with a camera's wall clock would be years
+away from it. Every TF lookup and message filter downstream would reject them.
+
+Publisher
+---------
+
+Image stamps are mapped onto a strictly increasing wall clock timeline before
+they reach RTP, so simulated time starting near zero no longer produces RTCP
+sender reports dated 1970. When the ROS clock jumps — a bag looping, a
+simulation reset — the timeline is re-anchored and the stream carries on::
+
+  [/camera0] image time stamps jumped, re-anchoring the RTP timeline
+
+Frame pacing is taken from the gap between consecutive images rather than from
+a fixed origin, so a clock that jumps backwards does not convince the encoder
+that the stream suddenly runs at 300 fps.
+
+Reconnect back-off and the session timeout deliberately use wall clock timers:
+a network retry should not stall because a simulation is paused.
+
+Recording and Playback
+======================
+
+Recording ``<base topic>/rtsp`` captures the stream URL, not the video, and
+replaying it points the subscriber at a server that is no longer there. To put
+the actual images in a bag, decode them first::
+
+  ros2 run image_transport republish rtsp raw \
+      --ros-args --remap in/rtsp:=/camera/image/rtsp --remap out:=/camera/image/raw
+  ros2 bag record /camera/image/raw
+
+The raw topic then plays back like any other, and the ROS time handling above
+is what makes that work in a system running on ``--clock``.
+
+If you do end up replaying a recorded URL topic, set
+``-p in.rtsp.reconnect_policy:=0`` so the subscriber does not spend the session
+retrying a stream that no longer exists.
+
+Supported image_transport versions
+==================================
+
+This transport works with ``image_transport`` up to and including 6.3, which
+covers ROS 2 Jazzy and Kilted.
+
+From 6.4 onwards (Lyrical, Rolling) ``image_transport`` calls plugins through a
+new entry point that receives a fixed set of node interfaces. That set does not
+include the clock interface this transport needs to honour simulated time, the
+waitables interface it uses to hand decoding to the executor, or the graph
+interface the publisher watches for departing subscribers, so the plugins
+cannot be ported to it as they stand. On those versions the topics are still
+created but no video is served, and both plugins say so::
+
+  [/camera0] the rtsp transport is not supported with image_transport 6.4: its
+             plugin API no longer provides the clock, waitables and graph
+             interfaces this transport needs.
+
 Building
 ========
 
@@ -208,8 +307,9 @@ by image processing algorithms. The lossy compression introduces artifacts
 which may not be visible to the human eye but interfere with many algorithms
 nevertheless.
 
-You cannot use `rosbag2`_ to record data from ``rtsp_image_transport``; you will
-just end up with a bunch of useless URL string messages.
+You cannot use `rosbag2`_ to record data from ``rtsp_image_transport``
+directly; you will just end up with a bunch of useless URL string messages.
+See `Recording and Playback`_ for the way around that.
 
 Supported Formats
 =================

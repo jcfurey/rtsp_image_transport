@@ -21,8 +21,10 @@
 #ifndef RTSP_IMAGE_TRANSPORT_PUBLISHER_PLUGIN_H_
 #define RTSP_IMAGE_TRANSPORT_PUBLISHER_PLUGIN_H_
 
+#include "init.h"
 #include "graph_monitor.h"
 #include "rtsp_image_transport_export.h"
+#include "stream_clock.h"
 
 #include <image_transport/simple_publisher_plugin.hpp>
 #include <rclcpp/graph_listener.hpp>
@@ -48,6 +50,12 @@ public:
 protected:
     void advertiseImpl(rclcpp::Node* node, const std::string& base_topic, rmw_qos_profile_t custom_qos,
                        rclcpp::PublisherOptions options) override;
+#if CURRENT_IMAGE_TRANSPORT_VERSION >= FKIE_VERSION_TUPLE(6, 4, 0)
+    /* See publisher_plugin.cpp: this entry point exists only to explain why the
+       transport does not work on these image_transport versions. */
+    void advertiseImpl(image_transport::RequiredInterfaces node_interfaces, const std::string& base_topic,
+                       rclcpp::QoS custom_qos, rclcpp::PublisherOptions options) override;
+#endif
     void publish(const sensor_msgs::msg::Image& image, const PublisherT& publisher) const override;
 
 private:
@@ -64,6 +72,11 @@ private:
     std::shared_ptr<StreamServer> server_;
     std::shared_ptr<GraphMonitor> graph_monitor_;
     mutable std::unique_ptr<StreamEncoder> encoder_;
+    /* Maps ROS image stamps onto the wall clock timeline RTP and RTCP expect.
+       Deliberately a system clock rather than the node clock, which may be
+       simulated. */
+    rclcpp::Clock::SharedPtr system_clock_, steady_clock_;
+    mutable StreamClock stream_clock_;
     mutable std::mutex mutex_;
     mutable bool update_url_, failed_;
 };
