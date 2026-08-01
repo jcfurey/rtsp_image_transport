@@ -146,55 +146,28 @@ AVPixelFormat toAVPixelFormat(const sensor_msgs::msg::Image& image)
     return AV_PIX_FMT_NONE;
 }
 
+/* Finds the next Annex B start code at or after `offset`. The four byte form is
+   reported in preference to the three byte one, so the leading zero is consumed
+   with the start code instead of being left at the end of the previous NAL
+   unit. */
 bool scanForStartCode(const unsigned char* data, std::size_t length, std::size_t offset, std::size_t& start_code_pos,
                       std::size_t& start_code_length)
 {
-    if (length < 4)
-        return false;
-    std::size_t i = offset, last = length - 4;
-    while (i < last)
+    for (std::size_t i = offset; i + 2 < length; ++i)
     {
+        if (data[i] != 0x00 || data[i + 1] != 0x00)
+            continue;
         if (data[i + 2] == 0x01)
         {
-            if (data[i] == 0x00 && data[i + 1] == 0x00)
-            {
-                start_code_pos = i;
-                start_code_length = 3;
-                return true;
-            }
-            else
-            {
-                i += 3;
-            }
+            start_code_pos = i;
+            start_code_length = 3;
+            return true;
         }
-        else if (data[i + 3] == 0x01)
+        if (data[i + 2] == 0x00 && i + 3 < length && data[i + 3] == 0x01)
         {
-            if (data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x00)
-            {
-                start_code_pos = i;
-                start_code_length = 4;
-                return true;
-            }
-            else
-            {
-                i += 4;
-            }
-        }
-        else if (data[i + 3] != 0x00)
-        {
-            i += 4;
-        }
-        else if (data[i + 2] != 0x00)
-        {
-            i += 3;
-        }
-        else if (data[i + 1] != 0x00)
-        {
-            i += 2;
-        }
-        else
-        {
-            i += 1;
+            start_code_pos = i;
+            start_code_length = 4;
+            return true;
         }
     }
     return false;
@@ -354,11 +327,22 @@ void StreamEncoder::setupEncoder(const AVCodec* encoder, bool silent)
     if (codec_ == VideoCodec::VP8 || codec_ == VideoCodec::VP9)
     {
         if (strstr(encoder->name, "vpx"))
+        {
             set_codec_option(ctx_, "deadline", "realtime", silent, logger_);
+            /* libvpx looks ahead 25 frames by default for VP9, which holds back
+               the first packet by most of a second at 30 Hz. */
+            set_codec_option(ctx_, "lag-in-frames", 0, silent, logger_);
+        }
     }
     if (codec_ == VideoCodec::AV1)
     {
+        /* Each AV1 encoder spells its speed control differently, and all of
+           them default to buffering a lookahead window we cannot afford. */
         set_codec_option(ctx_, "speed", 10, silent, logger_);
+        set_codec_option(ctx_, "usage", "realtime", silent, logger_);
+        set_codec_option(ctx_, "cpu-used", 8, silent, logger_);
+        set_codec_option(ctx_, "lag-in-frames", 0, silent, logger_);
+        set_codec_option(ctx_, "low_latency", 1, silent, logger_);
     }
     if (codec_ == VideoCodec::MPEG4)
     {

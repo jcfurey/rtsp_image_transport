@@ -94,6 +94,11 @@ Parameters
     ``videotoolbox`` or ``d3d11va``. An unusable value is reported along with
     the list your FFmpeg build supports.
 
+``hw_device_path`` (string, default empty)
+    Which adapter to use when the machine has more than one. For VAAPI and
+    Quick Sync this is a DRM render node such as ``/dev/dri/renderD128``; for
+    CUDA it is a device index. Empty lets FFmpeg pick.
+
 ``decoder`` (string, default empty)
     Pins one FFmpeg decoder by name, e.g. ``hevc_cuvid`` or ``h264_qsv``.
     Mostly useful for debugging: unlike the automatic selection, a pinned
@@ -109,6 +114,31 @@ Supported codecs are listed under `Supported Formats`_. Availability of a
 hardware path for any given one depends on your GPU and FFmpeg build; the
 subscriber only offers combinations that FFmpeg reports as supported, so an
 unavailable one costs nothing at runtime.
+
+Intel integrated graphics
+-------------------------
+
+Intel iGPUs are reached either through VAAPI or through Quick Sync, and the
+stock Ubuntu FFmpeg build supports both for H.264, H.265, VP8, VP9, AV1,
+MPEG-2, MPEG-4 and MJPEG. Install the driver and, for Quick Sync, the runtime::
+
+  sudo apt install intel-media-va-driver-non-free libmfx-gen1.2
+
+``vainfo`` should then list the profiles your GPU can decode. Nothing else is
+needed: ``hw_device:=auto`` finds the render node on its own, and VAAPI is
+tried before Quick Sync because it needs no extra runtime.
+
+On Linux, Quick Sync is layered on VAAPI, so the subscriber derives the Quick
+Sync device from the VAAPI one it already has rather than opening the GPU a
+second time. If a machine has both an Intel iGPU and a discrete card, point
+``hw_device_path`` at the render node you want::
+
+  -p in.rtsp.hw_device:=vaapi -p in.rtsp.hw_device_path:=/dev/dri/renderD128
+
+Note that a container needs the render node passed through
+(``docker run --device /dev/dri``) and the user must be in the ``render``
+group; otherwise the device probe fails and decoding quietly stays in
+software, which the log will say.
 
 Latency
 =======
@@ -128,6 +158,24 @@ before decoding them: non-intra frames once the queue spans 0.5 s, non-key
 frames at 1 s, and everything at 2 s, so the pipeline catches up instead of
 drifting further behind.
 
+
+Tests
+=====
+
+The package ships a GoogleTest suite covering codec selection, the decoder
+(every supported codec, hardware selection and fallback, time stamps, frame
+dropping), the encoder, an encode/decode round trip, the Live555 event loop,
+the graph monitor, and a loopback integration test that serves a real RTSP
+session on localhost and decodes what comes back::
+
+  colcon build --packages-select rtsp_image_transport --cmake-args -DBUILD_TESTING=ON
+  colcon test --packages-select rtsp_image_transport
+  colcon test-result --all
+
+Tests skip themselves when the FFmpeg build lacks a needed encoder, and the
+hardware decoding tests adapt to whatever the machine actually has, so the
+suite passes on a headless build server and exercises the GPU paths where one
+is present.
 
 Limitations
 ===========

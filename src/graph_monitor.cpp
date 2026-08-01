@@ -42,12 +42,23 @@ void GraphMonitor::eventLoop()
     using namespace std::chrono_literals;
     while (!shutdown_flag_.load())
     {
-        node_graph_->wait_for_graph_change(event_, 10s);
-        if (event_->check_and_clear() && !shutdown_flag_.load())
+        /* This thread is detached, so an escaping exception would terminate the
+           process. rclcpp throws here once the context is shut down, which
+           happens routinely while a publisher is still advertised. */
+        try
         {
-            std::lock_guard<std::mutex> lock{mutex_};
-            for (GraphMonitorListener* listener : listeners_)
-                listener->onGraphChange();
+            node_graph_->wait_for_graph_change(event_, 10s);
+            if (event_->check_and_clear() && !shutdown_flag_.load())
+            {
+                std::lock_guard<std::mutex> lock{mutex_};
+                for (GraphMonitorListener* listener : listeners_)
+                    listener->onGraphChange();
+            }
+        }
+        catch (const std::exception&)
+        {
+            /* Nothing left to watch */
+            break;
         }
     }
     /* Hand the last reference over to a local variable so that instance() can

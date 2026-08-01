@@ -21,6 +21,7 @@
 #ifndef RTSP_IMAGE_TRANSPORT_STREAM_SERVER_H_
 #define RTSP_IMAGE_TRANSPORT_STREAM_SERVER_H_
 
+#include "event_loop.h"
 #include "frame_data.h"
 #include "frame_injector.h"
 #include "video_codec.h"
@@ -77,7 +78,6 @@ private:
     rclcpp::Logger logger_;
     VideoCodec codec_;
     std::string topic_name_;
-    EventLoopWatchVariable quit_flag_;
     unsigned udp_packet_size_;
     std::string url_;
     /* The order of the following member variables is important,
@@ -85,9 +85,7 @@ private:
        destroyed in this particular order. */
     mutable std::mutex streams_mutex_;
     StreamMapping streams_;
-    std::thread event_loop_thread_;
-    std::shared_ptr<TaskScheduler> scheduler_;
-    std::shared_ptr<UsageEnvironment> env_;
+    std::shared_ptr<EventLoop> loop_;
     std::shared_ptr<Groupsock> rtp_mcast_, rtcp_mcast_;
     RTSPServer* rtsp_;
     ServerMediaSession* sms_;

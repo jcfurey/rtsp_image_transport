@@ -77,6 +77,10 @@ public:
            decoding, anything else names an FFmpeg hardware device type such as
            "cuda", "vaapi", "qsv", "vdpau" or "vulkan". */
         std::string hw_device = "auto";
+        /* Which adapter to use when a machine has more than one: a DRM render
+           node such as "/dev/dri/renderD128" for VAAPI and QSV, or a device
+           index for CUDA. Empty lets FFmpeg choose. */
+        std::string hw_device_path;
         /* Forces a specific FFmpeg decoder (e.g. "hevc_cuvid") when not empty */
         std::string decoder;
     };
@@ -94,7 +98,7 @@ public:
 
     /* Hardware device types this build of FFmpeg can instantiate right now.
        Probed once and cached; intended for diagnostics. */
-    static std::vector<std::string> availableHwDevices();
+    static std::vector<std::string> availableHwDevices(const std::string& hw_device_path = std::string());
 
 private:
     static AVPixelFormat selectPixelFormat(AVCodecContext* ctx, const AVPixelFormat* formats);
