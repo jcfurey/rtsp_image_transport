@@ -73,10 +73,13 @@ Which one it settled on is logged when decoding starts::
 
   [/camera0] start decoding H.265 with hevc + cuda from rtsp://...
 
-The device list is probed once per process and logged when the subscriber comes
-up, so an installation problem is visible without turning on debug output::
+Devices are probed once per process, only when hardware decoding is actually
+wanted, and the result is shared by every stream. If none of them work the
+subscriber says so and lists what the machine does have, so a missing driver
+does not turn into a silent performance cliff::
 
-  [/camera0] hardware video decoding available via: cuda, vaapi
+  [/camera0] no hardware decoder available, decoding in software
+             (hardware devices on this machine: vaapi)
 
 Decoded frames are copied out of GPU memory into the ROS image message; the
 colour conversion that follows is multi-threaded (see `Latency`_ below).
@@ -158,6 +161,22 @@ before decoding them: non-intra frames once the queue spans 0.5 s, non-key
 frames at 1 s, and everything at 2 s, so the pipeline catches up instead of
 drifting further behind.
 
+
+Building
+========
+
+The package uses `ament_cmake_auto`_, so the dependencies are declared once in
+``package.xml``. Besides those it needs `live555_vendor`_ and the FFmpeg
+development libraries::
+
+  sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+  colcon build --packages-select rtsp_image_transport
+
+The two helper nodes install to ``lib/rtsp_image_transport``, so they can be
+started with ``ros2 run``::
+
+  ros2 run rtsp_image_transport publish_rtsp_stream rtsp://<url> \
+      --ros-args --remap image:=<image topic>
 
 Tests
 =====
@@ -253,3 +272,7 @@ The RTSP payload names recognised by the subscriber are ``H264``, ``H265``,
 .. _FFmpeg: https://ffmpeg.org/
 
 .. _rosbag2: https://index.ros.org/p/rosbag2/
+
+.. _ament_cmake_auto: https://index.ros.org/p/ament_cmake_auto/
+
+.. _live555_vendor: https://github.com/fkie/live555_vendor

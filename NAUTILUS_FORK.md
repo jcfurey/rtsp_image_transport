@@ -63,6 +63,37 @@ Decode-only support for MPEG-2 (`MPV`) and H.263 (`H263`, `H263-1998`,
 `H263-2000`) was added alongside, since those RTSP payload names still turn up
 on older cameras.
 
+## Build system
+
+Converted to `ament_cmake_auto`. package.xml is now the single place the ROS
+dependencies are listed; the executables and test binaries pick them up
+automatically, and `ament_auto_package()` handles installation and export.
+Two things still need naming explicitly: `live555_vendor` exports its CMake
+package as `live555`, and ffmpeg comes from pkg-config.
+
+The plugin module is deliberately *not* an `ament_auto_add_library` target.
+CMake refuses to link a MODULE library into anything, so registering it would
+break every ament_auto target declared after it, including the tests, and
+exporting a pluginlib module as a linkable library would be wrong anyway.
+
+Two portability problems fell out of the conversion, both of which also affect
+the unmodified upstream package:
+
+- `ros2 run rtsp_image_transport publish_rtsp_stream` never worked, because
+  the executables were installed to `bin/` while `ros2 run` looks in
+  `lib/<package>`. Both the README and the program's own usage message tell
+  you to use `ros2 run`. The ament_auto default install location fixes it.
+- Kilted and later no longer provide the `sensor_msgs::sensor_msgs` style
+  alias, so upstream does not configure there at all. Message packages are now
+  linked through `${sensor_msgs_TARGETS}`, and `ament_target_dependencies()` is
+  avoided because Lyrical removed it.
+
+Builds and passes the full test suite on Jazzy, Kilted and Lyrical. Rolling
+still fails, on upstream code this fork does not touch: `image_transport`
+changed `advertiseImpl`/`subscribeImpl` to take `rclcpp::QoS` instead of
+`rmw_qos_profile_t`, which needs a version-conditional signature in both
+plugins.
+
 ## Tests
 
 `test/` holds a GoogleTest suite (83 cases) run with `colcon test`. It covers

@@ -7,7 +7,7 @@
     <license>Apache-2.0</license>
     <author email="timo.roehling@fkie.fraunhofer.de">Timo Röhling</author>
     <maintainer email="timo.roehling@fkie.fraunhofer.de">Timo Röhling</maintainer>
-    <buildtool_depend>ament_cmake</buildtool_depend>
+    <buildtool_depend>ament_cmake_auto</buildtool_depend>
     <depend>ffmpeg</depend>
     <depend>image_transport</depend>
     <depend>live555_vendor</depend>
