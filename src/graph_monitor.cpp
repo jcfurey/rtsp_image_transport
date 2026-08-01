@@ -21,10 +21,13 @@
 
 #include "graph_monitor.h"
 
+#include <functional>
+
 namespace rtsp_image_transport
 {
 
 std::mutex GraphMonitor::mutex_;
+std::condition_variable GraphMonitor::instance_released_;
 GraphMonitor::SharedPtr GraphMonitor::instance_;
 
 GraphMonitor::GraphMonitor(rclcpp::Node* node)
@@ -47,7 +50,16 @@ void GraphMonitor::eventLoop()
                 listener->onGraphChange();
         }
     }
-    instance_.reset();
+    /* Hand the last reference over to a local variable so that instance() can
+       see the singleton slot become free while this object is still alive. */
+    SharedPtr self;
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        self.swap(instance_);
+    }
+    instance_released_.notify_all();
+    /* `self` may destroy *this* when it goes out of scope; do not touch any
+       member from here on. */
 }
 
 void GraphMonitor::addListener(GraphMonitorListener* listener)
@@ -77,19 +89,16 @@ void GraphMonitor::removeListener(GraphMonitorListener* listener)
 
 GraphMonitor::SharedPtr GraphMonitor::instance(rclcpp::Node* node, GraphMonitorListener* listener)
 {
-    using namespace std::chrono_literals;
-    std::lock_guard<std::mutex> lock{mutex_};
-    if (instance_)
+    std::unique_lock<std::mutex> lock{mutex_};
+    if (instance_ && !instance_->shutdown_flag_.load())
     {
-        if (!instance_->shutdown_flag_.load())
-        {
-            if (listener != nullptr)
-                instance_->listeners_.insert(listener);
-            return instance_;
-        }
-        while (instance_)
-            std::this_thread::yield();
+        if (listener != nullptr)
+            instance_->listeners_.insert(listener);
+        return instance_;
     }
+    /* A previous monitor is shutting down; wait until its thread has released
+       the singleton before a new one is started. */
+    instance_released_.wait(lock, []() { return !instance_; });
     instance_.reset(new GraphMonitor(node));
     if (listener != nullptr)
         instance_->listeners_.insert(listener);

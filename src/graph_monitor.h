@@ -23,6 +23,8 @@
 
 #include <rclcpp/node.hpp>
 
+#include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -57,6 +59,7 @@ private:
     std::thread thread_;
 
     static std::mutex mutex_;
+    static std::condition_variable instance_released_;
     static SharedPtr instance_;
 };
 

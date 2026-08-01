@@ -28,6 +28,7 @@
 #include <liveMedia.hh>
 #include <rclcpp/logger.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <functional>
@@ -100,7 +101,8 @@ private:
 
     std::string topic_name_, url_;
     rclcpp::Logger logger_;
-    VideoCodec codec_;
+    /* Written from the Live555 event loop thread, read by the plugin thread */
+    std::atomic<VideoCodec> codec_;
     std::size_t video_subsession_;
     EventLoopWatchVariable quit_flag_;
     bool retried_on_454_error_;

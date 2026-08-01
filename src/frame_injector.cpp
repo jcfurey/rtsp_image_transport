@@ -20,6 +20,8 @@
  ****************************************************************************/
 #include "frame_injector.h"
 
+#include <algorithm>
+
 namespace rtsp_image_transport
 {
 

@@ -30,6 +30,7 @@
 #include <std_msgs/msg/string.hpp>
 
 #include <deque>
+#include <functional>
 #include <mutex>
 
 class MediaSubsession;
@@ -85,6 +86,7 @@ private:
     rclcpp::Duration old_lag_;
     rclcpp::WallTimer<rclcpp::VoidCallbackType>::SharedPtr cooldown_timer_;
     rclcpp::Waitable::SharedPtr scheduled_cb_;
+    std::function<void()> notify_frame_;
     Callback callback_;
     std::shared_ptr<StreamClient> client_;
     std::shared_ptr<StreamDecoder> decoder_;

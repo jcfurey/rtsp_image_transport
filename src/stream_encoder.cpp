@@ -149,6 +149,8 @@ AVPixelFormat toAVPixelFormat(const sensor_msgs::msg::Image& image)
 bool scanForStartCode(const unsigned char* data, std::size_t length, std::size_t offset, std::size_t& start_code_pos,
                       std::size_t& start_code_length)
 {
+    if (length < 4)
+        return false;
     std::size_t i = offset, last = length - 4;
     while (i < last)
     {
@@ -203,7 +205,14 @@ std::size_t splitNALs(FrameContainer& output, const unsigned char* data, std::si
 {
     std::size_t nal_start, sc_len, nal_end = 0, count = 0;
     if (!scanForStartCode(data, length, 0, nal_start, sc_len))
-        return 0;
+    {
+        /* No Annex B framing: hand the packet over unchanged rather than
+           silently dropping it */
+        if (length == 0)
+            return 0;
+        output.push_back(std::make_shared<FrameData>(data, length, stamp));
+        return 1;
+    }
     nal_start += sc_len;
     while (scanForStartCode(data, length, nal_start, nal_end, sc_len))
     {
@@ -476,6 +485,9 @@ std::size_t StreamEncoder::encodeVideo(const sensor_msgs::msg::Image& image)
                                   AVPixelFormat(sw_frm_->format), SWS_FAST_BILINEAR, nullptr, nullptr, nullptr),
                    sws_freeContext);
         last_pixel_format_ = av_format;
+        if (!sws_)
+            throw EncodingError(std::format("cannot convert {} images to the pixel format of the encoder",
+                                            image.encoding));
     }
     sws_scale(sws_.get(), input_data, input_linesize, 0, image.height, sw_frm_->data, sw_frm_->linesize);
 

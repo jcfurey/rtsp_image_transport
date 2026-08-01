@@ -67,6 +67,33 @@ int main()
     FFMPEG_HAS_HWFRAME_SUPPORT
 )
 
+# Multi-threaded colour space conversion. Only sws_scale_frame() distributes the
+# work over the worker threads, and neither it nor the manual context setup is
+# available in every supported libswscale release.
+check_cxx_source_compiles(
+    [==[
+extern "C"
+{
+#include <libavutil/buffer.h>
+#include <libavutil/frame.h>
+#include <libavutil/opt.h>
+#include <libswscale/swscale.h>
+}
+
+int main()
+{
+    SwsContext* c = sws_alloc_context();
+    av_opt_set_int(c, "threads", 2, 0);
+    if (sws_init_context(c, nullptr, nullptr) < 0)
+        return 1;
+    AVFrame* f = av_frame_alloc();
+    f->buf[0] = av_buffer_create(nullptr, 0, nullptr, nullptr, 0);
+    return sws_scale_frame(c, f, f);
+}
+]==]
+    FFMPEG_HAS_SWS_THREADS
+)
+
 # Older versions of live555 had a bug that prevented the proper inclusion of the
 # H.265 classes
 set(CMAKE_REQUIRED_LIBRARIES "live555::liveMedia")
@@ -143,6 +170,7 @@ target_compile_definitions(
             $<$<BOOL:${LIVE555_HAS_VPX_SUPPORT}>:LIVE555_HAS_VPX_SUPPORT>
             $<$<BOOL:${LIVE555_HAS_AV1_SUPPORT}>:LIVE555_HAS_AV1_SUPPORT>
             $<$<BOOL:${FFMPEG_HAS_HWFRAME_SUPPORT}>:FFMPEG_HAS_HWFRAME_SUPPORT>
+            $<$<BOOL:${FFMPEG_HAS_SWS_THREADS}>:FFMPEG_HAS_SWS_THREADS>
             CURRENT_RCLCPP_VERSION=${computed_rclcpp_version}
 )
 set_target_properties(

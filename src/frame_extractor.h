@@ -25,9 +25,9 @@
 
 #include <liveMedia.hh>
 
-#include <array>
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 namespace rtsp_image_transport
 {
@@ -57,8 +57,11 @@ private:
     std::weak_ptr<StreamClient> stream_client_;
     MediaSubsession* subsession_;
     VideoCodec codec_;
-    std::array<unsigned char, 131072> buffer_;
+    /* Grows on demand: a 4K key frame easily exceeds the initial size, and a
+       truncated NAL unit is worthless to the decoder. */
+    std::vector<unsigned char> buffer_;
     std::size_t buffer_length_;
+    bool warned_at_limit_;
 };
 
 }  // namespace rtsp_image_transport

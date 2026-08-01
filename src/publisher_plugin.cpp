@@ -156,6 +156,7 @@ void PublisherPlugin::updateParameters()
     rclcpp::node_interfaces::NodeParametersInterface::SharedPtr np = node_param_.lock();
     if (!np)
         return;
+    std::lock_guard<std::mutex> lock{mutex_};
     Config new_config;
     std::string codec_str = np->get_parameter(param_base_name_ + ".codec").as_string();
     std::string codec_str_canon;
@@ -170,6 +171,18 @@ void PublisherPlugin::updateParameters()
     }
     auto codec_iter = CODEC_NAMES.find(codec_str_canon);
     new_config.codec = codec_iter != CODEC_NAMES.end() ? codec_iter->second : VideoCodec::Unknown;
+    if (new_config.codec == VideoCodec::Unknown)
+    {
+        std::string known;
+        for (const auto& entry : CODEC_NAMES)
+        {
+            if (!known.empty())
+                known += ", ";
+            known += entry.first;
+        }
+        RCLCPP_ERROR(logger_, "[%s] unknown codec \"%s\"; supported values are: %s", topic_name_.c_str(),
+                     codec_str.c_str(), known.c_str());
+    }
     new_config.target_bitrate = np->get_parameter(param_base_name_ + ".target_bitrate").as_int();
     new_config.expected_framerate = np->get_parameter(param_base_name_ + ".expected_framerate").as_int();
     new_config.use_hw_encoder = np->get_parameter(param_base_name_ + ".use_hw_encoder").as_bool();
@@ -178,8 +191,11 @@ void PublisherPlugin::updateParameters()
     new_config.use_ip_multicast = np->get_parameter(param_base_name_ + ".use_ip_multicast").as_bool();
 
     int changelevel = 0;
-    if ((!server_ && !failed_) || config_->udp_port != new_config.udp_port
-        || config_->udp_packet_size != config_->udp_packet_size)
+    /* A previous setup failure is retried on every parameter update, so a
+       transient problem (e.g. a UDP port that was still in use) does not
+       disable the publisher until the node is restarted. */
+    if (!server_ || failed_ || config_->udp_port != new_config.udp_port
+        || config_->udp_packet_size != new_config.udp_packet_size)
         changelevel |= LVL_SERVER;
     if (config_->codec != new_config.codec || config_->use_ip_multicast != new_config.use_ip_multicast)
         changelevel |= LVL_SESSION;
@@ -188,16 +204,17 @@ void PublisherPlugin::updateParameters()
         || config_->use_hw_encoder != new_config.use_hw_encoder)
         changelevel |= LVL_CODEC;
 
-    std::lock_guard<std::mutex> lock{mutex_};
     *config_ = new_config;
+    failed_ = false;
     try
     {
         if (changelevel >= LVL_SERVER)
         {
+            encoder_.reset();
             server_.reset();
             server_ = StreamServer::create(topic_name_, config_->udp_port, config_->udp_packet_size - 42, logger_);
         }
-        if (changelevel >= LVL_SESSION)
+        if (server_ && changelevel >= LVL_SESSION)
         {
             if (changelevel < LVL_SERVER)
                 server_->stop();
