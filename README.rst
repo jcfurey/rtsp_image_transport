@@ -34,11 +34,44 @@ zero-based index over supported video subsessions in SDP order and defaults to
 input named ``in``, select the second video subsession with
 ``-p in.rtsp.video_subsession:=1``.
 
+You do not have to guess the index. Whenever the subscriber connects, it logs
+every video subsession the server offers, together with codec and (if the SDP
+announces them) resolution and frame rate::
+
+  [/camera0] RTSP stream offers 3 video subsession(s):
+      #0 H.265 1920x1080 @30Hz, #1 H.264 1024x600, #2 H.264 640x360
+
+Only the selected subsession is set up, so no RTP sockets are allocated and no
+bandwidth is consumed for the streams you are not watching. If the requested
+index does not exist, or the server refuses it, the subscriber warns and falls
+back to the remaining subsessions in SDP order instead of failing outright.
+
+Changing ``video_subsession`` at runtime reconnects the client to the newly
+selected stream.
+
 The fork also handles H.265 SDP initialization correctly by prepending the
 separate ``sprop-vps``, ``sprop-sps``, and ``sprop-pps`` parameter sets defined
 by RFC 7798. Upstream treated H.265 like H.264 and looked only for the combined
 ``sprop-parameter-sets`` attribute, leaving some HEVC decoders without the
 configuration needed to decode the first keyframe.
+
+Latency
+=======
+
+The subscriber decodes with minimal buffering by default. The ``low_latency``
+parameter controls this: it makes the decoder emit each frame as soon as it is
+complete rather than holding it in the reordering buffer, and it keeps FFmpeg
+from using frame-level multithreading, which delays output by roughly one frame
+per worker thread.
+
+Set ``-p in.rtsp.low_latency:=false`` if your source encodes B-frames and you
+see frames arriving out of order; you trade a few frames of latency for correct
+presentation order. Live IP camera streams almost never need this.
+
+When the decoder cannot keep up, the subscriber progressively drops frames
+before decoding them: non-intra frames once the queue spans 0.5 s, non-key
+frames at 1 s, and everything at 2 s, so the pipeline catches up instead of
+drifting further behind.
 
 
 Limitations

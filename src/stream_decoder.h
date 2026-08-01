@@ -52,7 +52,7 @@ public:
         Key,
         None
     };
-    StreamDecoder(VideoCodec codec, bool use_hw_decoder = true,
+    StreamDecoder(VideoCodec codec, bool use_hw_decoder = true, bool low_latency = true,
                   const rclcpp::Logger& logger = rclcpp::get_logger("StreamDecoder"));
     VideoCodec codec() const noexcept;
     std::size_t decodeVideo(const FrameDataPtr& data);
@@ -62,15 +62,16 @@ public:
 
 private:
     void setupDecoder(const AVCodec* decoder);
+    void convertToBGR(sensor_msgs::msg::Image& img);
 
     rclcpp::Logger logger_;
     VideoCodec codec_;
-    bool initialized_;
+    bool initialized_, low_latency_, sws_threaded_;
     int width_, height_;
     AVPixelFormat last_pixel_format_;
     std::shared_ptr<AVCodecContext> ctx_;
     std::shared_ptr<AVPacket> pkt_;
-    std::shared_ptr<AVFrame> frm_;
+    std::shared_ptr<AVFrame> frm_, bgr_frm_;
     std::shared_ptr<SwsContext> sws_;
     std::deque<sensor_msgs::msg::Image::UniquePtr> frames_;
 };

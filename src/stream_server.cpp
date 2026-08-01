@@ -26,6 +26,9 @@
 #include <arpa/inet.h>
 #include <rclcpp/logging.hpp>
 
+#include <format>
+#include <random>
+
 namespace rtsp_image_transport
 {
 
@@ -34,9 +37,27 @@ namespace
 
 constexpr unsigned ESTIMATED_BITRATE = 500;
 
+/* Live555 only notices events posted from other threads when its select() call
+   returns, which it forces at this interval. The default of 10 ms would add up
+   to that much latency to every frame handed over by the ROS publisher thread. */
+constexpr unsigned SCHEDULER_GRANULARITY_US = 1000;
+
+/* Key frames of high resolution streams are considerably larger than the
+   Live555 default, and anything that does not fit is silently truncated. */
+constexpr unsigned MAX_OUT_PACKET_BUFFER_SIZE = 524288;
+
 uint16_t sockToPort(const in_addr& addr)
 {
     return 16384 + (ntohl(addr.s_addr) & 0x7ffe);
+}
+
+/* Start of the port range Live555 probes for the RTP/RTCP pair of a unicast
+   subsession. Randomized so that independently started publishers do not all
+   collide on the same port first. */
+portNumBits randomEphemeralPortBase()
+{
+    thread_local std::mt19937 rng{std::random_device{}()};
+    return static_cast<portNumBits>(49152 + 2 * (rng() % 8192));
 }
 
 bool isSupported(VideoCodec codec)
@@ -258,8 +279,9 @@ std::shared_ptr<StreamServer> StreamServer::create(const std::string& topic_name
 StreamServer::StreamServer(const std::string& topic_name, unsigned udp_port, unsigned udp_packet_size,
                            const rclcpp::Logger& logger)
     : logger_(logger), codec_(VideoCodec::Unknown), topic_name_(topic_name), quit_flag_(0),
-      udp_packet_size_(udp_packet_size), scheduler_(BasicTaskScheduler::createNew()),
-      env_(BasicUsageEnvironment::createNew(*scheduler_), reclaim_env), rtsp_(nullptr), sms_(nullptr), sink_(nullptr)
+      udp_packet_size_(udp_packet_size), scheduler_(BasicTaskScheduler::createNew(SCHEDULER_GRANULARITY_US)),
+      env_(BasicUsageEnvironment::createNew(*scheduler_), reclaim_env), rtsp_(nullptr), sms_(nullptr), sink_(nullptr),
+      mcast_sink_(nullptr), mcast_rtcp_(nullptr), mcast_source_(nullptr)
 {
     rtsp_ = RTSPServer::createNew(*env_, udp_port);
     if (!rtsp_)
@@ -271,7 +293,7 @@ StreamServer::StreamServer(const std::string& topic_name, unsigned udp_port, uns
 void StreamServer::start(VideoCodec codec, bool use_multicast)
 {
     RTCPInstance* rtcp = nullptr;
-    OutPacketBuffer::increaseMaxSizeTo(131072);
+    OutPacketBuffer::increaseMaxSizeTo(MAX_OUT_PACKET_BUFFER_SIZE);
     stop();
     if (!isSupported(codec))
         throw StreamingError(std::format("{} is not supported on your system", videoCodecName(codec)));
@@ -311,6 +333,11 @@ void StreamServer::start(VideoCodec codec, bool use_multicast)
         FramedSource* source = createDiscreteFramer(codec_, *env_, injector);
         if (!source)
             throw StreamingError(std::format("cannot instantiate FramedSource for {}", videoCodecName(codec_)));
+        /* Unlike the unicast case, Live555 does not take ownership of these
+           objects, so stop() has to close them explicitly. */
+        mcast_sink_ = sink_;
+        mcast_rtcp_ = rtcp;
+        mcast_source_ = source;
         newStreamSource(source, injector);
         sink_->startPlaying(*source, afterPlaying, this);
     }
@@ -319,7 +346,7 @@ void StreamServer::start(VideoCodec codec, bool use_multicast)
         sms_ = ServerMediaSession::createNew(*env_, "", "rtsp_image_transport", topic_name_.c_str(),
                                              /*multicast*/ False);
         sms_->addSubsession(
-            UnicastServerMediaSubsession::createNew(*env_, shared_from_this(), 49152 + 2 * (random() % 8192), False));
+            UnicastServerMediaSubsession::createNew(*env_, shared_from_this(), randomEphemeralPortBase(), False));
         rtsp_->addServerMediaSession(sms_);
     }
     std::shared_ptr<char> tmp(rtsp_->rtspURL(sms_, ros_interface_socket()), [](char* p) { delete[] p; });
@@ -333,8 +360,14 @@ void StreamServer::stop()
     if (!url_.empty())
         RCLCPP_DEBUG(logger_, "[%s] finished RTSP session at %s", topic_name_.c_str(), url_.c_str());
     ServerMediaSession* old_sms = sms_;
+    VideoRTPSink* old_mcast_sink = mcast_sink_;
+    RTCPInstance* old_mcast_rtcp = mcast_rtcp_;
+    FramedSource* old_mcast_source = mcast_source_;
     sms_ = nullptr;
     sink_ = nullptr;
+    mcast_sink_ = nullptr;
+    mcast_rtcp_ = nullptr;
+    mcast_source_ = nullptr;
     for (auto& stream : streams_)
     {
         if (stream.second)
@@ -348,6 +381,16 @@ void StreamServer::stop()
     {
         rtsp_->deleteServerMediaSession(old_sms);
     }
+    /* The multicast RTP objects are ours; the framer closes the FrameInjector
+       feeding it. */
+    if (old_mcast_sink)
+        old_mcast_sink->stopPlaying();
+    if (old_mcast_source)
+        Medium::close(old_mcast_source);
+    if (old_mcast_rtcp)
+        Medium::close(old_mcast_rtcp);
+    if (old_mcast_sink)
+        Medium::close(old_mcast_sink);
 }
 
 StreamServer::~StreamServer()

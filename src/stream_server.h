@@ -92,6 +92,11 @@ private:
     RTSPServer* rtsp_;
     ServerMediaSession* sms_;
     VideoRTPSink* sink_;
+    /* Owned by this class in IP multicast mode, where Live555 does not clean up
+       after the media session on its own */
+    VideoRTPSink* mcast_sink_;
+    RTCPInstance* mcast_rtcp_;
+    FramedSource* mcast_source_;
 };
 
 }  // namespace rtsp_image_transport

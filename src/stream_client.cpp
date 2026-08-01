@@ -25,6 +25,10 @@
 
 #include <rclcpp/logging.hpp>
 
+#include <format>
+#include <string>
+#include <vector>
+
 namespace rtsp_image_transport
 {
 
@@ -62,7 +66,7 @@ private:
                   int verbosity, char const* appName, portNumBits tunnelOverHTTPPortNum, int socketNumToServer) noexcept
         : RTSPClient(env, url, verbosity, appName, tunnelOverHTTPPortNum, socketNumToServer),
           stream_client_(stream_client), session_(nullptr), subsession_(nullptr), has_video_(false),
-          session_active_(false), video_subsession_index_(0), timeout_task_(nullptr), received_packets_(0)
+          session_active_(false), try_pos_(0), timeout_task_(nullptr), received_packets_(0)
     {
     }
 
@@ -70,6 +74,7 @@ private:
     static void continueAfterSETUP(RTSPClient* client, int resultCode, char* resultMsg) noexcept;
     static void continueAfterPLAY(RTSPClient* client, int resultCode, char* resultMsg) noexcept;
     static void continueAfterTEARDOWN(RTSPClient* client, int resultCode, char* resultMsg) noexcept;
+    static bool collectVideoSubsessions(Live555Client* c, const std::shared_ptr<StreamClient>& sc) noexcept;
     static void setupNextSubsession(Live555Client* c) noexcept;
     static void subsessionAfterPlaying(void* obj) noexcept;
     static void checkTimeout(void* obj) noexcept;
@@ -79,8 +84,12 @@ private:
     std::shared_ptr<MediaSession> session_;
     MediaSubsession* subsession_;
     bool has_video_, session_active_;
-    std::size_t video_subsession_index_;
-    std::unique_ptr<MediaSubsessionIterator> iter_;
+    /* All video subsessions of the current session in SDP order, and the order
+       in which they are tried: the configured one first, then the others as
+       fallbacks. */
+    std::vector<MediaSubsession*> candidates_;
+    std::vector<std::size_t> try_order_;
+    std::size_t try_pos_;
     std::chrono::milliseconds timeout_;
     TaskToken timeout_task_;
     std::size_t received_packets_;
@@ -115,6 +124,10 @@ void Live555Client::teardown() noexcept
 {
     std::lock_guard<std::mutex> lock{session_mutex_};
     session_active_ = false;
+    subsession_ = nullptr;
+    candidates_.clear();
+    try_order_.clear();
+    try_pos_ = 0;
     if (session_)
     {
         bool hadActiveSessions = false;
@@ -154,12 +167,11 @@ void Live555Client::continueAfterDESCRIBE(RTSPClient* client, int resultCode, ch
                      resultCode);
         if (resultCode != 0)
         {
-            sc->sessionFailed(resultCode, resultString);
+            sc->sessionFailed(resultCode, resultString ? resultString : env.getResultMsg());
             return;
         }
         RCLCPP_DEBUG(sc->logger(), "[%s] received SDP parameters:\n%s", sc->topicName().c_str(), sdpInfo.get());
         c->has_video_ = false;
-        c->video_subsession_index_ = 0;
         MediaSession* session = MediaSession::createNew(env, sdpInfo.get());
         if (!session)
         {
@@ -173,9 +185,65 @@ void Live555Client::continueAfterDESCRIBE(RTSPClient* client, int resultCode, ch
             sc->sessionFailed(415, "no media subsession");
             return;
         }
-        c->iter_ = std::make_unique<MediaSubsessionIterator>(*c->session_);
+        if (!collectVideoSubsessions(c, sc))
+        {
+            c->teardown();
+            sc->sessionFailed(415, "no supported video subsession");
+            return;
+        }
         setupNextSubsession(c);
     }
+}
+
+/* Enumerates all video subsessions the server offers and determines the order
+   in which they are tried. Returns false if the stream carries no video this
+   client can decode. */
+bool Live555Client::collectVideoSubsessions(Live555Client* c, const std::shared_ptr<StreamClient>& sc) noexcept
+{
+    c->candidates_.clear();
+    c->try_order_.clear();
+    c->try_pos_ = 0;
+
+    std::string summary;
+    MediaSubsessionIterator iter{*c->session_};
+    while (MediaSubsession* subsession = iter.next())
+    {
+        const char* codec_name = subsession->codecName();
+        VideoCodec codec = codec_name ? fromRTSPCodecName(codec_name) : VideoCodec::Unknown;
+        if (codec == VideoCodec::Unknown)
+        {
+            RCLCPP_DEBUG(sc->logger(), "[%s] ignoring RTSP media subsession with unsupported codec %s",
+                         sc->topicName().c_str(), codec_name ? codec_name : "(none)");
+            continue;
+        }
+        if (!summary.empty())
+            summary += ", ";
+        summary += std::format("#{} {}", c->candidates_.size(), videoCodecName(codec));
+        if (subsession->videoWidth() > 0 && subsession->videoHeight() > 0)
+            summary += std::format(" {}x{}", subsession->videoWidth(), subsession->videoHeight());
+        if (subsession->videoFPS() > 0)
+            summary += std::format(" @{}Hz", subsession->videoFPS());
+        c->candidates_.push_back(subsession);
+    }
+    if (c->candidates_.empty())
+        return false;
+
+    RCLCPP_INFO(sc->logger(), "[%s] RTSP stream offers %zu video subsession(s): %s", sc->topicName().c_str(),
+                c->candidates_.size(), summary.c_str());
+    std::size_t selected = sc->videoSubsession();
+    if (selected >= c->candidates_.size())
+    {
+        RCLCPP_WARN(sc->logger(), "[%s] video_subsession %zu does not exist, falling back to subsession 0",
+                    sc->topicName().c_str(), selected);
+        selected = 0;
+    }
+    c->try_order_.push_back(selected);
+    for (std::size_t i = 0; i < c->candidates_.size(); ++i)
+    {
+        if (i != selected)
+            c->try_order_.push_back(i);
+    }
+    return true;
 }
 
 void Live555Client::continueAfterSETUP(RTSPClient* client, int resultCode, char* resultString) noexcept
@@ -206,7 +274,7 @@ void Live555Client::continueAfterSETUP(RTSPClient* client, int resultCode, char*
                     rtcp->setByeHandler(subsessionAfterPlaying, c->subsession_);
                 }
                 c->has_video_ = true;
-                sc->codec_ = codec;
+                sc->codec_.store(codec, std::memory_order_relaxed);
             }
             catch (const std::exception& e)
             {
@@ -219,7 +287,15 @@ void Live555Client::continueAfterSETUP(RTSPClient* client, int resultCode, char*
             RCLCPP_WARN(sc->logger(), "[%s] failed to setup RTSP media subsession: %s", sc->topicName().c_str(),
                         env.getResultMsg());
         }
-        setupNextSubsession(c);
+        if (!c->has_video_)
+        {
+            /* Fall back to the next video subsession the server offers */
+            setupNextSubsession(c);
+            return;
+        }
+        sc->sessionReady();
+        RCLCPP_DEBUG(sc->logger(), "[%s] sending PLAY command", sc->topicName().c_str());
+        c->sendPlayCommand(*c->session_, continueAfterPLAY);
     }
 }
 
@@ -245,7 +321,7 @@ void Live555Client::continueAfterPLAY(RTSPClient* client, int resultCode, char* 
         else
         {
             c->teardown();
-            sc->sessionFailed(resultCode, resultString);
+            sc->sessionFailed(resultCode, resultString ? resultString : c->envir().getResultMsg());
         }
     }
 }
@@ -254,58 +330,30 @@ void Live555Client::setupNextSubsession(Live555Client* c) noexcept
 {
     UsageEnvironment& env = c->envir();
     std::shared_ptr<StreamClient> sc = c->streamClient();
-    if (sc)
+    if (!sc)
+        return;
+    /* Only the subsession that is actually going to be played is initiated, so
+       no RTP/RTCP sockets are allocated for the streams we are not interested
+       in. */
+    while (c->try_pos_ < c->try_order_.size())
     {
-        c->subsession_ = c->iter_->next();
-        if (c->subsession_)
+        const std::size_t index = c->try_order_[c->try_pos_++];
+        c->subsession_ = c->candidates_[index];
+        VideoCodec codec = fromRTSPCodecName(c->subsession_->codecName());
+        if (c->subsession_->initiate())
         {
-            std::string codecName = c->subsession_->codecName();
-            VideoCodec codec = fromRTSPCodecName(codecName);
-            if (codec == VideoCodec::Unknown)
-            {
-                RCLCPP_WARN(sc->logger(), "[%s] ignoring RTSP media subsession with unsupported codec %s",
-                            sc->topicName().c_str(), codecName.c_str());
-                setupNextSubsession(c);
-                return;
-            }
-
-            const std::size_t index = c->video_subsession_index_++;
-            const std::size_t selected = sc->videoSubsession();
-            if (index != selected)
-            {
-                RCLCPP_INFO(sc->logger(), "[%s] skipping RTSP video subsession %zu with %s video (selected %zu)",
-                            sc->topicName().c_str(), index, videoCodecName(codec).c_str(), selected);
-                setupNextSubsession(c);
-                return;
-            }
-
-            if (c->subsession_->initiate())
-            {
-                RCLCPP_DEBUG(sc->logger(), "[%s] initiated RTSP video subsession %zu with %s stream",
-                             sc->topicName().c_str(), index, codecName.c_str());
-                RCLCPP_INFO(sc->logger(), "[%s] selected RTSP video subsession %zu with %s video",
-                            sc->topicName().c_str(), index, videoCodecName(codec).c_str());
-                c->sendSetupCommand(*c->subsession_, continueAfterSETUP);
-            }
-            else
-            {
-                RCLCPP_WARN(sc->logger(), "[%s] failed to initiate RTSP video subsession %zu: %s",
-                            sc->topicName().c_str(), index, env.getResultMsg());
-                setupNextSubsession(c);
-            }
+            RCLCPP_INFO(sc->logger(), "[%s] selected RTSP video subsession %zu with %s video",
+                        sc->topicName().c_str(), index, videoCodecName(codec).c_str());
+            RCLCPP_DEBUG(sc->logger(), "[%s] sending SETUP command for media subsession", sc->topicName().c_str());
+            c->sendSetupCommand(*c->subsession_, continueAfterSETUP);
             return;
         }
-        c->iter_.reset();
-        if (!c->has_video_)
-        {
-            c->teardown();
-            sc->sessionFailed(415, "no playable media subsession");
-            return;
-        }
-        sc->sessionReady();
-        RCLCPP_DEBUG(sc->logger(), "[%s] sending PLAY command", sc->topicName().c_str());
-        c->sendPlayCommand(*c->session_, continueAfterPLAY);
+        RCLCPP_WARN(sc->logger(), "[%s] failed to initiate RTSP video subsession %zu: %s", sc->topicName().c_str(),
+                    index, env.getResultMsg());
     }
+    c->subsession_ = nullptr;
+    c->teardown();
+    sc->sessionFailed(415, "no playable video subsession");
 }
 
 void Live555Client::subsessionAfterPlaying(void* obj) noexcept
@@ -378,8 +426,8 @@ std::shared_ptr<StreamClient> StreamClient::create(const std::string& topic_name
 }
 
 StreamClient::StreamClient(const std::string& topic_name, const std::string& url, const rclcpp::Logger& logger) noexcept
-    : topic_name_(topic_name), url_(url), logger_(logger), codec_(VideoCodec::Unknown), video_subsession_(0), quit_flag_(0),
-      retried_on_454_error_(false), timeout_(0), scheduler_(BasicTaskScheduler::createNew()),
+    : topic_name_(topic_name), url_(url), logger_(logger), codec_(VideoCodec::Unknown), video_subsession_(0),
+      quit_flag_(0), retried_on_454_error_(false), timeout_(0), scheduler_(BasicTaskScheduler::createNew()),
       env_(BasicUsageEnvironment::createNew(*scheduler_), reclaim_env),
       event_loop_thread_([this]() { this->env_->taskScheduler().doEventLoop(&this->quit_flag_); }), client_(nullptr)
 {
@@ -394,7 +442,7 @@ StreamClient::~StreamClient()
 
 VideoCodec StreamClient::codec() const noexcept
 {
-    return codec_;
+    return codec_.load(std::memory_order_relaxed);
 }
 
 std::string StreamClient::topicName() const noexcept
@@ -426,13 +474,21 @@ std::string StreamClient::url() const noexcept
 
 void StreamClient::connect()
 {
-    std::lock_guard<std::mutex> lock{client_mutex_};
-    if (client_)
-        throw StreamingError("client is connected already");
-    client_ = Live555Client::createNew(shared_from_this(), *env_, url_.c_str(), 0, logger_.get_name());
-    client_->setSessionTimeout(timeout_);
+    Live555Client* client;
+    {
+        std::lock_guard<std::mutex> lock{client_mutex_};
+        if (client_)
+            throw StreamingError("client is connected already");
+        client_ = Live555Client::createNew(shared_from_this(), *env_, url_.c_str(), 0, logger_.get_name());
+        client_->setSessionTimeout(timeout_);
+        client = client_;
+    }
     RCLCPP_DEBUG(logger_, "[%s] connecting to %s", topic_name_.c_str(), url_.c_str());
-    client_->initiateSetup();
+    /* Live555 reports errors it detects right away (an unparsable URL, a host
+       that cannot be resolved) by invoking the response handler from inside
+       this call. The handler ends up in disconnect() or connect() again, so the
+       mutex must not be held here. */
+    client->initiateSetup();
 }
 
 void StreamClient::disconnect()

@@ -124,6 +124,7 @@ using namespace std::chrono_literals;
 struct RTSP_IMAGE_TRANSPORT_NO_EXPORT SubscriberPlugin::Config
 {
     bool use_hw_decoder = true;
+    bool low_latency = true;
     int video_subsession = 0;
     ReconnectPolicy reconnect_policy = ReconnectOnTimeout;
     std::chrono::milliseconds timeout = 2s;
@@ -166,7 +167,11 @@ void SubscriberPlugin::subscribeImpl(rclcpp::Node* node, const std::string& base
     SuperClass::subscribeImpl(node, base_topic, callback, custom_qos, options);
     logger_ = node->get_logger();
     clock_ = node->get_clock();
-    scheduled_cb_ = std::make_shared<ScheduledCB>(std::bind(&SubscriberPlugin::processFrame, this));
+    ScheduledCB::SharedPtr scheduled_cb =
+        std::make_shared<ScheduledCB>(std::bind(&SubscriberPlugin::processFrame, this));
+    scheduled_cb_ = scheduled_cb;
+    /* Cached so the hot receive path does not need a dynamic_cast per NAL unit */
+    notify_frame_ = [scheduled_cb]() { scheduled_cb->trigger(); };
     scheduled_cb_group_ = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     node->get_node_waitables_interface()->add_waitable(scheduled_cb_, scheduled_cb_group_);
     topic_name_ = base_topic;
@@ -231,7 +236,7 @@ void SubscriberPlugin::subsessionStarted(VideoCodec codec, MediaSubsession* subs
 {
     old_lag_ = rclcpp::Duration(0, 0);
     RCLCPP_DEBUG(logger_, "[%s] setting up decoder for %s", topic_name_.c_str(), videoCodecName(codec).c_str());
-    decoder_ = std::make_shared<StreamDecoder>(codec, config_->use_hw_decoder, logger_);
+    decoder_ = std::make_shared<StreamDecoder>(codec, config_->use_hw_decoder, config_->low_latency, logger_);
     RCLCPP_INFO(logger_, "[%s] start decoding (%s) from %s", topic_name_.c_str(), decoder_->context()->codec->name,
                 client_->url().c_str());
 }
@@ -240,7 +245,8 @@ void SubscriberPlugin::receiveDataStream(VideoCodec codec, MediaSubsession* subs
 {
     RCLCPP_DEBUG_THROTTLE(logger_, *clock_, 30000, "[%s] receiving video frames from RTSP stream", topic_name_.c_str());
     pushFrame(data);
-    dynamic_cast<ScheduledCB&>(*scheduled_cb_).trigger();
+    if (notify_frame_)
+        notify_frame_();
 }
 
 void SubscriberPlugin::setupParameters(rclcpp::Node* node)
@@ -250,6 +256,10 @@ void SubscriberPlugin::setupParameters(rclcpp::Node* node)
         node->declare_parameter<bool>(
             param_base_name_ + ".use_hw_decoder", config_->use_hw_decoder,
             ParameterDescriptor().set__description("use NVDEC hardware acceleration if possible"));
+    if (!node->has_parameter(param_base_name_ + ".low_latency"))
+        node->declare_parameter<bool>(param_base_name_ + ".low_latency", config_->low_latency,
+                                      ParameterDescriptor().set__description(
+                                          "decode with minimal buffering; disable for streams with B-frames"));
     if (!node->has_parameter(param_base_name_ + ".video_subsession"))
         node->declare_parameter<int>(
             param_base_name_ + ".video_subsession", config_->video_subsession,
@@ -295,6 +305,7 @@ void SubscriberPlugin::updateParameters()
         return;
     Config new_config;
     new_config.use_hw_decoder = np->get_parameter(param_base_name_ + ".use_hw_decoder").as_bool();
+    new_config.low_latency = np->get_parameter(param_base_name_ + ".low_latency").as_bool();
     new_config.video_subsession =
         static_cast<int>(np->get_parameter(param_base_name_ + ".video_subsession").as_int());
     new_config.reconnect_policy =
@@ -307,7 +318,7 @@ void SubscriberPlugin::updateParameters()
         1000 * np->get_parameter(param_base_name_ + ".reconnect_maxwait").as_double()));
 
     int changelevel = 0;
-    if (new_config.use_hw_decoder != config_->use_hw_decoder)
+    if (new_config.use_hw_decoder != config_->use_hw_decoder || new_config.low_latency != config_->low_latency)
         changelevel |= LVL_CODEC;
     if (new_config.video_subsession != config_->video_subsession)
         changelevel |= LVL_CONNECTION;
@@ -326,9 +337,10 @@ void SubscriberPlugin::updateParameters()
                 reconnect();
                 return;
             }
-            if (changelevel >= LVL_CODEC)
+            if ((changelevel & LVL_CODEC) && decoder_)
             {
-                decoder_ = std::make_shared<StreamDecoder>(client_->codec(), config_->use_hw_decoder, logger_);
+                decoder_ = std::make_shared<StreamDecoder>(client_->codec(), config_->use_hw_decoder,
+                                                           config_->low_latency, logger_);
                 RCLCPP_INFO(logger_, "[%s] start decoding (%s) from %s", topic_name_.c_str(),
                             decoder_->context()->codec->name, client_->url().c_str());
             }
@@ -375,7 +387,7 @@ void SubscriberPlugin::processFrame()
                 }
                 decoder->setDecodeFrames(StreamDecoder::DecodeFrames::Key);
             }
-            if (lag >= 500ms)
+            else if (lag >= 500ms)
             {
                 if (old_lag_ < 500ms)
                 {
@@ -423,7 +435,8 @@ void SubscriberPlugin::sessionStarted()
 
 void SubscriberPlugin::sessionTimeout()
 {
-    RCLCPP_ERROR(logger_, "[%s] session timeout for stream at %s", topic_name_.c_str(), client_->url().c_str());
+    RCLCPP_ERROR(logger_, "[%s] session timeout for stream at %s", topic_name_.c_str(),
+                 client_ ? client_->url().c_str() : "(unknown)");
     if (config_->reconnect_policy >= ReconnectOnTimeout)
     {
         reconnect();
@@ -432,8 +445,8 @@ void SubscriberPlugin::sessionTimeout()
 
 void SubscriberPlugin::sessionFailed(int code, const std::string& message)
 {
-    RCLCPP_ERROR(logger_, "[%s] %s failed. %s (%d)", topic_name_.c_str(), client_->url().c_str(), message.c_str(),
-                 code);
+    RCLCPP_ERROR(logger_, "[%s] %s failed. %s (%d)", topic_name_.c_str(),
+                 client_ ? client_->url().c_str() : "(unknown)", message.c_str(), code);
     if (config_->reconnect_policy >= ReconnectOnFailure)
     {
         reconnect();
@@ -451,6 +464,8 @@ void SubscriberPlugin::sessionFinished()
 
 void SubscriberPlugin::reconnect()
 {
+    if (!client_)
+        return;
     client_->disconnect();
     client_->setVideoSubsession(static_cast<std::size_t>(config_->video_subsession));
     clearQueuedFrames();
@@ -474,7 +489,18 @@ void SubscriberPlugin::cooldownTimerCallback()
 {
     cooldown_timer_.reset();  // just in case
     clearQueuedFrames();
-    client_->connect();
+    if (!client_)
+        return;
+    try
+    {
+        client_->connect();
+    }
+    catch (const std::exception& e)
+    {
+        RCLCPP_ERROR(logger_, "[%s] %s", topic_name_.c_str(), e.what());
+        if (config_->reconnect_policy >= ReconnectOnFailure)
+            reconnect();
+    }
 }
 
 void SubscriberPlugin::pushFrame(const FrameDataPtr& frame)

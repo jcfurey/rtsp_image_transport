@@ -26,6 +26,7 @@
 
 #include <rclcpp/logging.hpp>
 
+#include <algorithm>
 #include <format>
 #include <memory>
 
@@ -36,6 +37,11 @@ namespace
 {
 
 const unsigned char MPEG_START_CODE[] = {0x00, 0x00, 0x00, 0x01};
+
+/* Enough for 1080p key frames at sane bitrates; grown on demand for larger
+   frames up to the maximum. */
+constexpr std::size_t INITIAL_FRAME_BUFFER_SIZE = 262144;
+constexpr std::size_t MAXIMUM_FRAME_BUFFER_SIZE = 16777216;
 
 }
 
@@ -48,7 +54,8 @@ FrameExtractor* FrameExtractor::createNew(const std::weak_ptr<StreamClient>& str
 FrameExtractor::FrameExtractor(const std::weak_ptr<StreamClient>& stream_client, UsageEnvironment& env,
                                MediaSubsession* subsession)
     : MediaSink(env), stream_client_(stream_client), subsession_(subsession),
-      codec_(fromRTSPCodecName(subsession_->codecName())), buffer_length_(0)
+      codec_(fromRTSPCodecName(subsession_->codecName())), buffer_(INITIAL_FRAME_BUFFER_SIZE), buffer_length_(0),
+      warned_at_limit_(false)
 {
     if (codec_ == VideoCodec::Unknown)
         throw StreamingError(std::format("unsupported video codec {}", subsession->codecName()));
@@ -113,9 +120,28 @@ void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes
     std::shared_ptr<StreamClient> sc = stream_client_.lock();
     if (sc)
     {
-        if (numTruncatedBytes)
+        if (numTruncatedBytes > 0)
         {
-            RCLCPP_WARN(sc->logger_, "FrameExtractor buffer is %u bytes too small", numTruncatedBytes);
+            /* The NAL unit did not fit. Enlarge the buffer so that the following
+               frames do fit, and drop the truncated data instead of feeding a
+               mutilated NAL unit to the decoder. */
+            std::size_t required = buffer_length_ + frameSize + numTruncatedBytes;
+            if (buffer_.size() < MAXIMUM_FRAME_BUFFER_SIZE)
+            {
+                std::size_t new_size = std::min(MAXIMUM_FRAME_BUFFER_SIZE, std::max(2 * buffer_.size(), required));
+                RCLCPP_INFO(sc->logger_, "[%s] frame buffer too small by %u bytes, growing it to %zu bytes",
+                            sc->topicName().c_str(), numTruncatedBytes, new_size);
+                buffer_.resize(new_size);
+            }
+            else if (!warned_at_limit_)
+            {
+                warned_at_limit_ = true;
+                RCLCPP_WARN(sc->logger_, "[%s] dropping video frames larger than the maximum buffer size of %zu bytes",
+                            sc->topicName().c_str(), MAXIMUM_FRAME_BUFFER_SIZE);
+            }
+            buffer_length_ = 0;
+            continuePlaying();
+            return;
         }
         buffer_length_ += frameSize;
         rclcpp::Time ts(presentationTime.tv_sec, 1000ull * presentationTime.tv_usec);
