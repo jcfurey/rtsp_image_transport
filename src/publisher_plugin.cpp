@@ -25,8 +25,21 @@
 #include "stream_server.h"
 #include "video_codec.h"
 
+#include <rclcpp/clock.hpp>
+
 namespace rtsp_image_transport
 {
+
+/* From image_transport 6.4 the plugin entry points take node interfaces rather
+   than a node, and the old ones are never called. This transport cannot be
+   ported to them yet: RequiredInterfaces carries neither the clock interface
+   the subscriber needs to honour simulated time, nor the waitables interface it
+   uses to hand decoding to the executor, nor the graph interface the publisher
+   watches for departing subscribers. Overriding the new entry point at least
+   turns a silent black screen into something the log explains. */
+#define RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES \
+    (CURRENT_IMAGE_TRANSPORT_VERSION >= FKIE_VERSION_TUPLE(6, 4, 0))
+
 
 namespace
 {
@@ -62,7 +75,8 @@ using SuperClass = image_transport::SimplePublisherPlugin<std_msgs::msg::String>
 
 PublisherPlugin::PublisherPlugin()
     : SuperClass(), logger_(rclcpp::get_logger("rtsp_image_transport")), config_(std::make_unique<Config>()),
-      update_url_(false), failed_(false)
+      system_clock_(std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME)),
+      steady_clock_(std::make_shared<rclcpp::Clock>(RCL_STEADY_TIME)), update_url_(false), failed_(false)
 {
     global_initialize();
 }
@@ -85,10 +99,24 @@ std::string PublisherPlugin::getTransportName() const
 void PublisherPlugin::advertiseImpl(rclcpp::Node* node, const std::string& base_topic, rmw_qos_profile_t custom_qos,
                                     rclcpp::PublisherOptions options)
 {
+    /* The transport topic carries a latched URL rather than image data, so a
+       late joining subscriber has to be able to fetch the current value. That
+       fixes reliability, durability and history; every other policy the caller
+       asked for is left untouched. */
     custom_qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
     custom_qos.history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
     custom_qos.depth = 1;
     custom_qos.durability = RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
+    /* An incompatible subscriber otherwise just never receives the URL, with
+       nothing in the log to explain it. */
+    options.event_callbacks.incompatible_qos_callback =
+        [this](rclcpp::QOSOfferedIncompatibleQoSInfo& info)
+    {
+        RCLCPP_ERROR(logger_,
+                     "[%s] a subscriber requests an incompatible QoS policy (%d); this transport publishes the "
+                     "stream URL as RELIABLE and TRANSIENT_LOCAL, so that subscriber will not receive it",
+                     topic_name_.c_str(), static_cast<int>(info.last_policy_kind));
+    };
     SuperClass::advertiseImpl(node, base_topic, custom_qos, options);
     graph_monitor_ = GraphMonitor::instance(node, this);
     logger_ = node->get_logger();
@@ -107,6 +135,22 @@ void PublisherPlugin::advertiseImpl(rclcpp::Node* node, const std::string& base_
                                                               { this->updateParameters(); });
     updateParameters();
 }
+
+#if RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
+void PublisherPlugin::advertiseImpl(image_transport::RequiredInterfaces node_interfaces,
+                                    const std::string& base_topic, rclcpp::QoS custom_qos,
+                                    rclcpp::PublisherOptions options)
+{
+    rclcpp::Logger logger = node_interfaces.get_node_logging_interface()->get_logger();
+    RCLCPP_ERROR(logger,
+                 "[%s] the rtsp transport is not supported with image_transport %d.%d: its plugin API no longer "
+                 "provides the clock, waitables and graph interfaces this transport needs. The topic will exist "
+                 "but no video will be served. Use image_transport 6.3 or earlier, or the raw transport.",
+                 base_topic.c_str(), CURRENT_IMAGE_TRANSPORT_VERSION >> 16,
+                 (CURRENT_IMAGE_TRANSPORT_VERSION >> 8) & 0xff);
+    SuperClass::advertiseImpl(node_interfaces, base_topic, custom_qos, options);
+}
+#endif
 
 void PublisherPlugin::setupParameters(rclcpp::Node* node)
 {
@@ -273,6 +317,7 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
         if (!encoder_)
         {
             encoder_ = std::make_unique<StreamEncoder>(config_->codec, config_->use_hw_encoder, logger_);
+            stream_clock_.reset();
             encoder_->setBitrate(config_->target_bitrate);
             encoder_->setFramerate(config_->expected_framerate);
             encoder_->setPackageSizeHint(server_->maxPacketSize() - 24);
@@ -281,12 +326,24 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
                         config_->expected_framerate, server_->url().c_str());
         }
         if (image.header.stamp.sec == 0 && image.header.stamp.nanosec == 0)
-            RCLCPP_WARN(logger_, "[%s] image header time stamp is not set, expect broken RTSP stream",
-                        topic_name_.c_str());
+            RCLCPP_WARN_THROTTLE(logger_, *steady_clock_, 10000,
+                                 "[%s] image header time stamp is not set, expect broken RTSP stream",
+                                 topic_name_.c_str());
         if (encoder_->encodeVideo(image) > 0)
         {
+            /* RTP and RTCP need wall clock presentation times. ROS time is not
+               that: under simulation it starts near zero, and a looping bag
+               sends it backwards. */
+            const rclcpp::Time wall_now = system_clock_->now();
+            const std::uint64_t reanchors_before = stream_clock_.reanchorCount();
             while (FrameDataPtr data = encoder_->nextPacket())
+            {
+                data->setStamp(stream_clock_.toWallClock(data->stamp(), wall_now));
                 server_->sendFrame(data);
+            }
+            if (stream_clock_.reanchorCount() != reanchors_before)
+                RCLCPP_INFO(logger_, "[%s] image time stamps jumped, re-anchoring the RTP timeline",
+                            topic_name_.c_str());
         }
     }
     catch (const std::exception& e)

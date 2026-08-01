@@ -22,6 +22,7 @@
 
 #include "video_codec.h"
 
+#include <rclcpp/time.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/image.hpp>
 

@@ -21,6 +21,7 @@
 #ifndef RTSP_IMAGE_TRANSPORT_SUBSCRIBER_PLUGIN_H_
 #define RTSP_IMAGE_TRANSPORT_SUBSCRIBER_PLUGIN_H_
 
+#include "init.h"
 #include "frame_data.h"
 #include "rtsp_image_transport_export.h"
 #include "video_codec.h"
@@ -52,6 +53,13 @@ public:
 protected:
     void subscribeImpl(rclcpp::Node* node, const std::string& base_topic, const Callback& callback,
                        rmw_qos_profile_t custom_qos, rclcpp::SubscriptionOptions options) override;
+#if CURRENT_IMAGE_TRANSPORT_VERSION >= FKIE_VERSION_TUPLE(6, 4, 0)
+    /* See subscriber_plugin.cpp: this entry point exists only to explain why the
+       transport does not work on these image_transport versions. */
+    void subscribeImpl(image_transport::RequiredInterfaces node_interfaces, const std::string& base_topic,
+                       const Callback& callback, rclcpp::QoS custom_qos,
+                       rclcpp::SubscriptionOptions options) override;
+#endif
     void internalCallback(const std_msgs::msg::String::ConstSharedPtr& message, const Callback& callback) override;
 
 private:
@@ -62,6 +70,7 @@ private:
     void sessionFinished();
     void sessionTimeout();
     void processFrame();
+    bool useReceiveTimestamps() const;
     void reportMissingHwDecoder();
     void reconnect();
     void cooldownTimerCallback();

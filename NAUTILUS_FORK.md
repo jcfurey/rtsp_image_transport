@@ -63,6 +63,50 @@ Decode-only support for MPEG-2 (`MPV`) and H.263 (`H263`, `H263-1998`,
 `H263-2000`) was added alongside, since those RTSP payload names still turn up
 on older cameras.
 
+## QoS, ROS time and bags
+
+- The URL topic keeps its required RELIABLE / TRANSIENT_LOCAL / KEEP_LAST(1)
+  policies, but an incompatible peer is now reported instead of silently
+  producing no video. Everything else the caller asks for is passed through.
+- New subscriber parameter `timestamp_source` (sender / receive / auto).
+  Automatic is the default and switches to receive time when `use_sim_time` is
+  active, because a camera's wall clock stamp is meaningless in a simulated
+  time base and every downstream TF lookup and message filter would reject it.
+- The publisher maps ROS image stamps onto a strictly increasing wall clock
+  timeline before they reach RTP, re-anchoring when the clock jumps. Simulated
+  time starting near zero no longer produces RTCP sender reports dated 1970,
+  and a looping bag no longer sends RTP time stamps backwards.
+- The encoder paces frames by the gap between them rather than from a fixed
+  origin. A bag loop used to clamp every subsequent frame to one tick after its
+  predecessor, so the encoder concluded the stream ran at 300 fps and its rate
+  control collapsed.
+- README documents how to get video into a bag at all (`image_transport
+  republish rtsp raw`, then record the raw topic), since recording the URL
+  topic captures nothing useful.
+
+## image_transport 6.4 and later
+
+Testing the plugins end to end for the first time turned up that they are
+**silently inert on Lyrical and Rolling**, in this fork and upstream alike.
+image_transport 6.4 replaced the plugin entry points with ones taking node
+interfaces and no longer calls the old ones, so `advertiseImpl` and
+`subscribeImpl` never run: the topics appear, no RTSP server is created, no
+parameters are declared, and nothing explains why.
+
+Porting is blocked upstream rather than merely tedious. `RequiredInterfaces` is
+`NodeInterfaces<Base, Parameters, Logging, Timers, Topics>`, which lacks the
+clock interface the subscriber needs for simulated time, the waitables
+interface it uses to hand decoding to the executor, and the graph interface the
+publisher watches for departing subscribers. `TimeSource::attachNode` also
+wants graph and services interfaces that never arrive. Closing the gap means
+either widening `RequiredInterfaces` upstream or reimplementing clock and graph
+tracking from raw topics, with the threading and sim-time consequences that
+implies.
+
+For now both plugins override the new entry point purely to log what happened,
+so the failure is loud rather than silent, and the end-to-end tests skip with
+the same explanation on those versions.
+
 ## Build system
 
 Converted to `ament_cmake_auto`. package.xml is now the single place the ROS
@@ -89,14 +133,13 @@ the unmodified upstream package:
   avoided because Lyrical removed it.
 
 Builds and passes the full test suite on Jazzy, Kilted and Lyrical. Rolling
-still fails, on upstream code this fork does not touch: `image_transport`
-changed `advertiseImpl`/`subscribeImpl` to take `rclcpp::QoS` instead of
-`rmw_qos_profile_t`, which needs a version-conditional signature in both
-plugins.
+still fails to compile, for the same upstream reason described under
+"image_transport 6.4 and later": the plugin entry points changed shape, and on
+Rolling the old ones are gone rather than merely uncalled.
 
 ## Tests
 
-`test/` holds a GoogleTest suite (83 cases) run with `colcon test`. It covers
+`test/` holds a GoogleTest suite (104 cases) run with `colcon test`. It covers
 codec name mapping, `FrameData`, the decoder across every supported codec plus
 hardware selection and fallback, the encoder, an encode/decode round trip, the
 Live555 event loop, the graph monitor, and a loopback integration test that
