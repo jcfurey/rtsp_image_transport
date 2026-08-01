@@ -251,7 +251,7 @@ void SubscriberPlugin::reportMissingHwDecoder()
     if (!config_->decoder.use_hw_decoder || config_->decoder.hw_device == "none")
         return;
     std::string available;
-    for (const std::string& name : StreamDecoder::availableHwDevices())
+    for (const std::string& name : StreamDecoder::availableHwDevices(config_->decoder.hw_device_path))
     {
         if (!available.empty())
             available += ", ";
@@ -283,6 +283,13 @@ void SubscriberPlugin::setupParameters(rclcpp::Node* node)
             ParameterDescriptor().set__description(
                 "hardware device for video decoding: auto, none, or a specific FFmpeg device "
                 "(cuda, vaapi, qsv, vdpau, drm, vulkan, videotoolbox, d3d11va)"));
+    if (!node->has_parameter(param_base_name_ + ".hw_device_path"))
+        node->declare_parameter<std::string>(
+            param_base_name_ + ".hw_device_path", config_->decoder.hw_device_path,
+            ParameterDescriptor().set__description(
+                "which GPU to decode on when the machine has several: a DRM render node such as "
+                "/dev/dri/renderD128 for VAAPI and Quick Sync, or a device index for CUDA "
+                "(empty = let FFmpeg choose)"));
     if (!node->has_parameter(param_base_name_ + ".decoder"))
         node->declare_parameter<std::string>(
             param_base_name_ + ".decoder", config_->decoder.decoder,
@@ -338,6 +345,7 @@ void SubscriberPlugin::updateParameters()
     Config new_config;
     new_config.decoder.use_hw_decoder = np->get_parameter(param_base_name_ + ".use_hw_decoder").as_bool();
     new_config.decoder.hw_device = np->get_parameter(param_base_name_ + ".hw_device").as_string();
+    new_config.decoder.hw_device_path = np->get_parameter(param_base_name_ + ".hw_device_path").as_string();
     new_config.decoder.decoder = np->get_parameter(param_base_name_ + ".decoder").as_string();
     new_config.decoder.low_latency = np->get_parameter(param_base_name_ + ".low_latency").as_bool();
     new_config.video_subsession =
@@ -355,6 +363,7 @@ void SubscriberPlugin::updateParameters()
     if (new_config.decoder.use_hw_decoder != config_->decoder.use_hw_decoder
         || new_config.decoder.low_latency != config_->decoder.low_latency
         || new_config.decoder.hw_device != config_->decoder.hw_device
+        || new_config.decoder.hw_device_path != config_->decoder.hw_device_path
         || new_config.decoder.decoder != config_->decoder.decoder)
         changelevel |= LVL_CODEC;
     if (new_config.video_subsession != config_->video_subsession)

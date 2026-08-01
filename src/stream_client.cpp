@@ -32,17 +32,6 @@
 namespace rtsp_image_transport
 {
 
-namespace
-{
-
-void reclaim_env(UsageEnvironment* env)
-{
-    if (env)
-        env->reclaim();
-}
-
-}  // namespace
-
 class Live555Client : public RTSPClient
 {
 public:
@@ -427,17 +416,16 @@ std::shared_ptr<StreamClient> StreamClient::create(const std::string& topic_name
 
 StreamClient::StreamClient(const std::string& topic_name, const std::string& url, const rclcpp::Logger& logger) noexcept
     : topic_name_(topic_name), url_(url), logger_(logger), codec_(VideoCodec::Unknown), video_subsession_(0),
-      quit_flag_(0), retried_on_454_error_(false), timeout_(0), scheduler_(BasicTaskScheduler::createNew()),
-      env_(BasicUsageEnvironment::createNew(*scheduler_), reclaim_env),
-      event_loop_thread_([this]() { this->env_->taskScheduler().doEventLoop(&this->quit_flag_); }), client_(nullptr)
+      retried_on_454_error_(false), timeout_(0), loop_(EventLoop::create()), client_(nullptr)
 {
 }
 
 StreamClient::~StreamClient()
 {
     disconnect();
-    quit_flag_ = 1;
-    event_loop_thread_.join();
+    /* May run on the Live555 thread itself when a callback held the last
+       reference; stop() knows not to wait for itself in that case. */
+    loop_->stop();
 }
 
 VideoCodec StreamClient::codec() const noexcept
@@ -479,7 +467,7 @@ void StreamClient::connect()
         std::lock_guard<std::mutex> lock{client_mutex_};
         if (client_)
             throw StreamingError("client is connected already");
-        client_ = Live555Client::createNew(shared_from_this(), *env_, url_.c_str(), 0, logger_.get_name());
+        client_ = Live555Client::createNew(shared_from_this(), loop_->env(), url_.c_str(), 0, logger_.get_name());
         client_->setSessionTimeout(timeout_);
         client = client_;
     }

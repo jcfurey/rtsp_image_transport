@@ -172,37 +172,54 @@ std::string hwDeviceName(AVHWDeviceType type)
 
 /* Hardware device contexts are shared process wide: opening one per stream
    would create a separate GPU context per camera. The map also caches negative
-   results so that an unavailable device is probed only once. */
-std::shared_ptr<AVBufferRef> sharedHwDevice(AVHWDeviceType type, const rclcpp::Logger& logger)
+   results so that an unavailable device is probed only once. Keyed by device
+   path as well, so that machines with more than one GPU can address each. */
+std::shared_ptr<AVBufferRef> sharedHwDevice(AVHWDeviceType type, const std::string& device_path,
+                                            const rclcpp::Logger& logger)
 {
-    static std::mutex mutex;
-    static std::map<AVHWDeviceType, AVBufferRef*> cache;
+    /* Recursive because creating a QSV device asks for a VAAPI device below */
+    static std::recursive_mutex mutex;
+    static std::map<std::pair<AVHWDeviceType, std::string>, AVBufferRef*> cache;
 
-    std::lock_guard<std::mutex> lock{mutex};
-    auto entry = cache.find(type);
+    std::lock_guard<std::recursive_mutex> lock{mutex};
+    const std::pair<AVHWDeviceType, std::string> key{type, device_path};
+    auto entry = cache.find(key);
     if (entry == cache.end())
     {
         AVBufferRef* device = nullptr;
-        int result;
+        int result = AVERROR(ENOSYS);
+        const char* path = device_path.empty() ? nullptr : device_path.c_str();
         {
             /* A missing GPU is an expected outcome here, not something to
                report to the user as an FFmpeg error. */
             TemporaryAvLogLevel quiet(AV_LOG_PANIC);
-            result = av_hwdevice_ctx_create(&device, type, nullptr, nullptr, 0);
+            /* On Linux, Quick Sync runs on top of VAAPI. Deriving the QSV
+               device from a VAAPI one reuses the context we may already have
+               open instead of opening the render node a second time, and keeps
+               both on the same adapter when a machine has several. */
+            if (type == AV_HWDEVICE_TYPE_QSV)
+            {
+                std::shared_ptr<AVBufferRef> vaapi = sharedHwDevice(AV_HWDEVICE_TYPE_VAAPI, device_path, logger);
+                if (vaapi)
+                    result = av_hwdevice_ctx_create_derived(&device, type, vaapi.get(), 0);
+            }
+            if (!device)
+                result = av_hwdevice_ctx_create(&device, type, path, nullptr, 0);
         }
-        if (result < 0)
+        if (result < 0 || !device)
         {
             char errbuf[80];
-            RCLCPP_DEBUG(logger, "%s hardware device is unavailable: %s", hwDeviceName(type).c_str(),
+            RCLCPP_DEBUG(logger, "%s hardware device%s%s is unavailable: %s", hwDeviceName(type).c_str(),
+                         path ? " " : "", path ? path : "",
                          av_make_error_string(errbuf, sizeof(errbuf), result));
             device = nullptr;
         }
         else
         {
-            RCLCPP_INFO(logger, "opened %s device for hardware accelerated video decoding",
-                        hwDeviceName(type).c_str());
+            RCLCPP_INFO(logger, "opened %s device%s%s for hardware accelerated video decoding",
+                        hwDeviceName(type).c_str(), path ? " " : "", path ? path : "");
         }
-        entry = cache.emplace(type, device).first;
+        entry = cache.emplace(key, device).first;
     }
     if (!entry->second)
         return std::shared_ptr<AVBufferRef>();
@@ -251,13 +268,13 @@ AVHWDeviceType standaloneDeviceRequirement(const std::string& decoder_name)
 
 }  // namespace
 
-std::vector<std::string> StreamDecoder::availableHwDevices()
+std::vector<std::string> StreamDecoder::availableHwDevices(const std::string& hw_device_path)
 {
     rclcpp::Logger logger = rclcpp::get_logger("StreamDecoder");
     std::vector<std::string> available;
     for (AVHWDeviceType type : HW_DEVICE_PREFERENCE)
     {
-        if (sharedHwDevice(type, logger))
+        if (sharedHwDevice(type, hw_device_path, logger))
             available.push_back(hwDeviceName(type));
     }
     return available;
@@ -377,7 +394,7 @@ std::vector<DecoderCandidate> StreamDecoder::buildCandidates() const
             {
                 if (std::find(devices.begin(), devices.end(), required) == devices.end())
                     continue;
-                if (!sharedHwDevice(required, logger_))
+                if (!sharedHwDevice(required, options_.hw_device_path, logger_))
                     continue;
             }
             else if (options_.hw_device != "auto")
@@ -445,7 +462,7 @@ void StreamDecoder::openCandidate(const DecoderCandidate& candidate)
 
     if (candidate.hw_device_type != AV_HWDEVICE_TYPE_NONE)
     {
-        hw_device_ = sharedHwDevice(candidate.hw_device_type, logger_);
+        hw_device_ = sharedHwDevice(candidate.hw_device_type, options_.hw_device_path, logger_);
         if (!hw_device_)
             throw StreamingError(
                 std::format("{} device is not available", hwDeviceName(candidate.hw_device_type)));

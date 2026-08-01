@@ -63,6 +63,23 @@ Decode-only support for MPEG-2 (`MPV`) and H.263 (`H263`, `H263-1998`,
 `H263-2000`) was added alongside, since those RTSP payload names still turn up
 on older cameras.
 
+## Tests
+
+`test/` holds a GoogleTest suite (83 cases) run with `colcon test`. It covers
+codec name mapping, `FrameData`, the decoder across every supported codec plus
+hardware selection and fallback, the encoder, an encode/decode round trip, the
+Live555 event loop, the graph monitor, and a loopback integration test that
+runs a real RTSP session over localhost. Cases skip themselves when an encoder
+or a GPU is absent, so the same suite is meaningful on a headless builder and
+on a machine with an iGPU.
+
+Building the sources into a static `rtsp_image_transport_core` library made
+this possible: the plugins stay in the loadable module, everything else can be
+linked into a test binary.
+
+Verified on ROS 2 Jazzy and Lyrical in the official `ros:*-ros-base` images.
+Three of the bugs listed below were found by these tests, not by reading.
+
 ## Latency and throughput work
 
 - The subscriber's frame-dropping ladder never escalated past "discard
@@ -83,6 +100,30 @@ on older cameras.
   thread waits before it is sent.
 - The client stops iterating subsessions once one is playing, so PLAY is sent
   a round trip earlier.
+
+## Bugs the test suite found
+
+- `scanForStartCode` skipped a three byte Annex B start code whenever the
+  preceding byte was not zero, because the scan advanced four bytes past it.
+  Two NAL units were then merged into one packet and handed to Live555, which
+  packetises it as a single malformed NAL. Any multi-slice stream is affected,
+  which is what the `slice-max-size` hint produces for x264. Rewritten and
+  checked against a brute force reference over 200k random buffers.
+- Destroying a `StreamClient` or `StreamServer` could terminate the process.
+  Live555 callbacks resurrect a `shared_ptr` to their owner, so when the last
+  external reference is dropped concurrently the owner is destroyed on the
+  Live555 thread, and its destructor joined that thread from inside itself
+  ("Resource deadlock avoided"). The scheduler and its thread now live in a
+  shared `EventLoop` that the thread keeps alive itself, so nothing is ever
+  joined. Reproduced on Lyrical.
+- `GraphMonitor`'s detached thread let exceptions escape. `wait_for_graph_change`
+  throws once the context is shut down, which happens routinely while a
+  publisher is still advertised, and an exception leaving a detached thread
+  terminates the process.
+- libvpx looks ahead 25 frames by default for VP9, so nothing reached the wire
+  for most of a second. `lag-in-frames` is now zero for VP8/VP9, and the AV1
+  encoders get their real low latency options instead of a `speed` setting
+  libaom does not have.
 
 ## Bug fixes on top of upstream
 

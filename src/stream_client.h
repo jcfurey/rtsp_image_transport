@@ -21,6 +21,7 @@
 #ifndef RTSP_IMAGE_TRANSPORT_STREAM_CLIENT_H_
 #define RTSP_IMAGE_TRANSPORT_STREAM_CLIENT_H_
 
+#include "event_loop.h"
 #include "frame_data.h"
 #include "video_codec.h"
 
@@ -104,7 +105,6 @@ private:
     /* Written from the Live555 event loop thread, read by the plugin thread */
     std::atomic<VideoCodec> codec_;
     std::size_t video_subsession_;
-    EventLoopWatchVariable quit_flag_;
     bool retried_on_454_error_;
     std::chrono::milliseconds timeout_;
     mutable std::mutex client_mutex_;
@@ -117,12 +117,9 @@ private:
     SessionFinishedHandler session_finished_handler_;
     SessionTimeoutHandler session_timeout_handler_;
     ReceiveStreamDataHandler receive_stream_data_handler_;
-    /* The order of the following member variables is important,
-       because they are interdependent and need to be constructed/
-       destroyed in this particular order. */
-    std::shared_ptr<TaskScheduler> scheduler_;
-    std::shared_ptr<UsageEnvironment> env_;
-    std::thread event_loop_thread_;
+    /* Outlives this object when a Live555 callback happens to hold the last
+       reference to it; see EventLoop. */
+    std::shared_ptr<EventLoop> loop_;
     Live555Client* client_;
 };
 

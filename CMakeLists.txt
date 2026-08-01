@@ -144,44 +144,62 @@ math(
 )
 
 # Targets
+
+# Everything except the two image_transport plugins lives in a static core
+# library, so that the unit tests can link against it. The plugins themselves
+# are only reachable through pluginlib and stay in the loadable module.
 add_library(
-    ${PROJECT_NAME} MODULE
+    ${PROJECT_NAME}_core STATIC
+    src/event_loop.cpp
     src/frame_data.cpp
     src/frame_extractor.cpp
     src/frame_injector.cpp
     src/graph_monitor.cpp
     src/host_override.cpp
     src/init.cpp
-    src/publisher_plugin.cpp
     src/stream_client.cpp
     src/stream_decoder.cpp
     src/stream_encoder.cpp
     src/stream_server.cpp
-    src/subscriber_plugin.cpp
     src/video_codec.cpp
 )
-generate_export_header(${PROJECT_NAME})
-
-target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_20)
-target_compile_definitions(
-    ${PROJECT_NAME}
-    PRIVATE $<$<BOOL:${LIVE555_HAS_H265_SUPPORT}>:LIVE555_HAS_H265_SUPPORT>
-            $<$<BOOL:${LIVE555_HAS_VPX_SUPPORT}>:LIVE555_HAS_VPX_SUPPORT>
-            $<$<BOOL:${LIVE555_HAS_AV1_SUPPORT}>:LIVE555_HAS_AV1_SUPPORT>
-            $<$<BOOL:${FFMPEG_HAS_HWFRAME_SUPPORT}>:FFMPEG_HAS_HWFRAME_SUPPORT>
-            $<$<BOOL:${FFMPEG_HAS_SWS_THREADS}>:FFMPEG_HAS_SWS_THREADS>
-            CURRENT_RCLCPP_VERSION=${computed_rclcpp_version}
+set_target_properties(
+    ${PROJECT_NAME}_core
+    PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET "hidden"
+               VISIBILITY_INLINES_HIDDEN ON
 )
+target_include_directories(
+    ${PROJECT_NAME}_core PUBLIC ${CMAKE_CURRENT_BINARY_DIR}
+                                ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_features(${PROJECT_NAME}_core PUBLIC cxx_std_20)
+target_compile_definitions(
+    ${PROJECT_NAME}_core
+    PUBLIC $<$<BOOL:${LIVE555_HAS_H265_SUPPORT}>:LIVE555_HAS_H265_SUPPORT>
+           $<$<BOOL:${LIVE555_HAS_VPX_SUPPORT}>:LIVE555_HAS_VPX_SUPPORT>
+           $<$<BOOL:${LIVE555_HAS_AV1_SUPPORT}>:LIVE555_HAS_AV1_SUPPORT>
+           $<$<BOOL:${FFMPEG_HAS_HWFRAME_SUPPORT}>:FFMPEG_HAS_HWFRAME_SUPPORT>
+           $<$<BOOL:${FFMPEG_HAS_SWS_THREADS}>:FFMPEG_HAS_SWS_THREADS>
+           CURRENT_RCLCPP_VERSION=${computed_rclcpp_version}
+)
+target_link_libraries(
+    ${PROJECT_NAME}_core PUBLIC live555::liveMedia PkgConfig::ffmpeg
+                                rclcpp::rclcpp sensor_msgs::sensor_msgs
+                                std_msgs::std_msgs
+)
+
+add_library(
+    ${PROJECT_NAME} MODULE src/publisher_plugin.cpp src/subscriber_plugin.cpp
+)
+generate_export_header(${PROJECT_NAME})
 set_target_properties(
     ${PROJECT_NAME} PROPERTIES CXX_VISIBILITY_PRESET "hidden"
                                VISIBILITY_INLINES_HIDDEN ON
 )
 target_link_libraries(
-    ${PROJECT_NAME}
-    PRIVATE image_transport::image_transport live555::liveMedia
-            PkgConfig::ffmpeg pluginlib::pluginlib rclcpp::rclcpp
-            sensor_msgs::sensor_msgs std_msgs::std_msgs
+    ${PROJECT_NAME} PRIVATE ${PROJECT_NAME}_core
+                            image_transport::image_transport
+                            pluginlib::pluginlib
 )
 
 add_executable(publish_rtsp_stream src/publish_rtsp_stream.cpp)
@@ -211,6 +229,38 @@ install(
 )
 
 install(FILES plugin.xml DESTINATION share/${PROJECT_NAME})
+
+# Tests
+if(BUILD_TESTING)
+    find_package(ament_cmake_gtest REQUIRED)
+
+    set(unit_tests
+        test_video_codec
+        test_event_loop
+        test_frame_data
+        test_stream_decoder
+        test_stream_encoder
+        test_roundtrip
+        test_host_override
+        test_graph_monitor
+    )
+    # colcon runs the test binaries in parallel, and video encoding is not cheap;
+    # the generous timeout keeps a loaded build server from reporting a slow run
+    # as a failure.
+    foreach(test_name IN LISTS unit_tests)
+        ament_add_gtest(${test_name} test/${test_name}.cpp TIMEOUT 180)
+        if(TARGET ${test_name})
+            target_link_libraries(${test_name} ${PROJECT_NAME}_core)
+        endif()
+    endforeach()
+
+    # Streams video through a real loopback RTSP session, so it needs a little
+    # more room than the default 60 s.
+    ament_add_gtest(test_rtsp_loopback test/test_rtsp_loopback.cpp TIMEOUT 180)
+    if(TARGET test_rtsp_loopback)
+        target_link_libraries(test_rtsp_loopback ${PROJECT_NAME}_core)
+    endif()
+endif()
 
 # Ament package handling
 pluginlib_export_plugin_description_file(image_transport plugin.xml)
