@@ -29,11 +29,14 @@ include(GenerateExportHeader)
 include(CheckCXXSourceCompiles)
 
 # Dependencies
-find_package(ament_cmake REQUIRED)
-find_package(image_transport REQUIRED)
-find_package(rclcpp REQUIRED)
-find_package(sensor_msgs REQUIRED)
-find_package(std_msgs REQUIRED)
+#
+# ament_auto derives the ROS dependencies from package.xml, so the list lives
+# in exactly one place. The two non-ament dependencies still need naming here:
+# live555_vendor exports its CMake package as "live555", and ffmpeg is a plain
+# system library found through pkg-config.
+find_package(ament_cmake_auto REQUIRED)
+ament_auto_find_build_dependencies()
+
 find_package(live555 REQUIRED)
 find_package(PkgConfig REQUIRED)
 
@@ -146,8 +149,9 @@ math(
 # Targets
 
 # Everything except the two image_transport plugins lives in a static core
-# library, so that the unit tests can link against it. The plugins themselves
-# are only reachable through pluginlib and stay in the loadable module.
+# library, so that the unit tests can link against it. It stays a plain target
+# rather than an ament_auto one, because it is an implementation detail that
+# should not end up in this package's exported interface.
 add_library(
     ${PROJECT_NAME}_core STATIC
     src/event_loop.cpp
@@ -182,12 +186,34 @@ target_compile_definitions(
            $<$<BOOL:${FFMPEG_HAS_SWS_THREADS}>:FFMPEG_HAS_SWS_THREADS>
            CURRENT_RCLCPP_VERSION=${computed_rclcpp_version}
 )
+# Named explicitly rather than through ament_target_dependencies(), which was
+# removed in Lyrical. Message packages are linked through their _TARGETS
+# variable: the sensor_msgs::sensor_msgs style alias no longer exists in Kilted
+# and later.
 target_link_libraries(
     ${PROJECT_NAME}_core PUBLIC live555::liveMedia PkgConfig::ffmpeg
-                                rclcpp::rclcpp sensor_msgs::sensor_msgs
-                                std_msgs::std_msgs
+                                rclcpp::rclcpp ${sensor_msgs_TARGETS}
+                                ${std_msgs_TARGETS}
 )
 
+# Added before the plugin module so that ament_auto does not try to link the
+# module into them.
+ament_auto_add_executable(publish_rtsp_stream src/publish_rtsp_stream.cpp)
+target_compile_definitions(
+    publish_rtsp_stream PRIVATE "ROS_PACKAGE_NAME=\"${PROJECT_NAME}\""
+)
+
+ament_auto_add_executable(
+    rtsp_camera_proxy src/host_override.cpp src/rtsp_camera_proxy.cpp
+)
+target_compile_features(rtsp_camera_proxy PRIVATE cxx_std_20)
+target_link_libraries(rtsp_camera_proxy live555::liveMedia)
+
+# The image_transport plugins, loaded through pluginlib and never linked
+# against directly. Deliberately not an ament_auto target: CMake refuses to
+# link a MODULE library into anything, so registering it would break every
+# ament_auto target declared after it, and exporting it as a linkable library
+# would be wrong in any case.
 add_library(
     ${PROJECT_NAME} MODULE src/publisher_plugin.cpp src/subscriber_plugin.cpp
 )
@@ -202,37 +228,12 @@ target_link_libraries(
                             pluginlib::pluginlib
 )
 
-add_executable(publish_rtsp_stream src/publish_rtsp_stream.cpp)
-target_compile_definitions(
-    publish_rtsp_stream PRIVATE "ROS_PACKAGE_NAME=\"${PROJECT_NAME}\""
-)
-target_link_libraries(
-    publish_rtsp_stream PRIVATE rclcpp::rclcpp sensor_msgs::sensor_msgs
-                                std_msgs::std_msgs
-)
-
-add_executable(
-    rtsp_camera_proxy src/host_override.cpp src/rtsp_camera_proxy.cpp
-)
-target_compile_features(rtsp_camera_proxy PRIVATE cxx_std_20)
-target_link_libraries(
-    rtsp_camera_proxy PRIVATE live555::liveMedia rclcpp::rclcpp
-                              sensor_msgs::sensor_msgs std_msgs::std_msgs
-)
-
-# Installation
-install(
-    TARGETS publish_rtsp_stream rtsp_camera_proxy ${PROJECT_NAME}
-    ARCHIVE DESTINATION lib
-    LIBRARY DESTINATION lib
-    RUNTIME DESTINATION bin
-)
-
+install(TARGETS ${PROJECT_NAME} LIBRARY DESTINATION lib)
 install(FILES plugin.xml DESTINATION share/${PROJECT_NAME})
 
 # Tests
 if(BUILD_TESTING)
-    find_package(ament_cmake_gtest REQUIRED)
+    ament_auto_find_test_dependencies()
 
     set(unit_tests
         test_video_codec
@@ -244,24 +245,23 @@ if(BUILD_TESTING)
         test_host_override
         test_graph_monitor
     )
-    # colcon runs the test binaries in parallel, and video encoding is not cheap;
-    # the generous timeout keeps a loaded build server from reporting a slow run
-    # as a failure.
+    # Serves a real RTSP session over the loopback interface
+    list(APPEND unit_tests test_rtsp_loopback)
+
+    # colcon runs the test binaries in parallel and video coding is not cheap,
+    # so the timeout is generous enough that a loaded build server does not
+    # report a slow run as a failure. ament_auto_add_gtest() links this
+    # package's dependencies with the plain target_link_libraries() signature,
+    # so the core has to be added plainly too.
     foreach(test_name IN LISTS unit_tests)
-        ament_add_gtest(${test_name} test/${test_name}.cpp TIMEOUT 180)
+        ament_auto_add_gtest(${test_name} test/${test_name}.cpp TIMEOUT 180)
         if(TARGET ${test_name})
             target_link_libraries(${test_name} ${PROJECT_NAME}_core)
         endif()
     endforeach()
-
-    # Streams video through a real loopback RTSP session, so it needs a little
-    # more room than the default 60 s.
-    ament_add_gtest(test_rtsp_loopback test/test_rtsp_loopback.cpp TIMEOUT 180)
-    if(TARGET test_rtsp_loopback)
-        target_link_libraries(test_rtsp_loopback ${PROJECT_NAME}_core)
-    endif()
 endif()
 
-# Ament package handling
+# Ament package handling. ament_auto_package() installs the executables to
+# lib/${PROJECT_NAME}, which is where ros2 run looks for them.
 pluginlib_export_plugin_description_file(image_transport plugin.xml)
-ament_package()
+ament_auto_package()
