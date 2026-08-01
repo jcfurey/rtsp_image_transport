@@ -27,6 +27,42 @@ and removes the otherwise unnecessary `cv_bridge`/OpenCV dependency. This keeps
 the transport independent of the CUDA-enabled OpenCV build in the Nautilus
 runtime image.
 
+## Hardware decoding
+
+Upstream listed a couple of standalone hardware decoders (`h264_cuvid`,
+`h264_qsv`, ...) and picked the first one FFmpeg happened to know about. There
+was no hwaccel device path at all, so VAAPI — the standard on Intel and AMD
+Linux — was never used, and a hardware decoder that returned frames in device
+memory would have crashed the colour conversion.
+
+The subscriber now builds an ordered list of ways to decode the stream and uses
+the first that works:
+
+1. native decoder + hardware device context (CUDA/NVDEC, VAAPI, QSV, VDPAU,
+   Vulkan, VideoToolbox, D3D11VA), derived from `avcodec_get_hw_config()` so
+   only combinations FFmpeg actually supports are offered;
+2. standalone hardware decoders, including `*_rkmpp` and `*_v4l2m2m` for ARM
+   SoCs;
+3. software.
+
+Device contexts are created once per process and shared, so N cameras use one
+GPU context rather than N. Frames that come back in device memory are pulled
+into system memory with `av_hwframe_transfer_data()` before conversion. If a
+hardware decoder opens but then fails to decode, the subscriber logs a warning
+and continues with the next candidate instead of dropping the stream.
+
+Two traps found while testing this: `h264_qsv` opens successfully on a machine
+with no Quick Sync and only fails on the first packet, and `hw_device:=none`
+still reached the standalone hardware decoders. Both are handled — the
+standalone decoders are now gated on their vendor device being creatable.
+
+New subscriber parameters `hw_device` (auto/none/cuda/vaapi/qsv/...) and
+`decoder` (pin one FFmpeg decoder by name). `use_hw_decoder` keeps its meaning.
+
+Decode-only support for MPEG-2 (`MPV`) and H.263 (`H263`, `H263-1998`,
+`H263-2000`) was added alongside, since those RTSP payload names still turn up
+on older cameras.
+
 ## Latency and throughput work
 
 - The subscriber's frame-dropping ladder never escalated past "discard

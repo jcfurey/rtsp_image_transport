@@ -62,6 +62,7 @@ private:
     void sessionFinished();
     void sessionTimeout();
     void processFrame();
+    void reportMissingHwDecoder();
     void reconnect();
     void cooldownTimerCallback();
     void pushFrame(const FrameDataPtr& frame);

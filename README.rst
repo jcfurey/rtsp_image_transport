@@ -55,6 +55,61 @@ by RFC 7798. Upstream treated H.265 like H.264 and looked only for the combined
 ``sprop-parameter-sets`` attribute, leaving some HEVC decoders without the
 configuration needed to decode the first keyframe.
 
+Hardware Accelerated Decoding
+=============================
+
+The subscriber decodes on the GPU whenever it can. At connect time it works
+through the ways this machine could decode the stream and uses the first that
+works:
+
+1. the native FFmpeg decoder driven by a hardware device (NVDEC/CUDA, VAAPI,
+   Quick Sync, VDPAU, Vulkan, VideoToolbox, D3D11VA), which is preferred
+   because all streams then share a single GPU context;
+2. a standalone hardware decoder (``h264_cuvid``, ``hevc_qsv``, ``*_rkmpp``,
+   ``*_v4l2m2m``);
+3. the software decoder.
+
+Which one it settled on is logged when decoding starts::
+
+  [/camera0] start decoding H.265 with hevc + cuda from rtsp://...
+
+The device list is probed once per process and logged when the subscriber comes
+up, so an installation problem is visible without turning on debug output::
+
+  [/camera0] hardware video decoding available via: cuda, vaapi
+
+Decoded frames are copied out of GPU memory into the ROS image message; the
+colour conversion that follows is multi-threaded (see `Latency`_ below).
+
+Parameters
+----------
+
+``use_hw_decoder`` (bool, default ``true``)
+    Master switch. Set to ``false`` to decode in software.
+
+``hw_device`` (string, default ``auto``)
+    ``auto`` tries every device in the order above. ``none`` is equivalent to
+    ``use_hw_decoder:=false``. Any other value pins a specific FFmpeg device
+    type: ``cuda``, ``vaapi``, ``qsv``, ``vdpau``, ``drm``, ``vulkan``,
+    ``videotoolbox`` or ``d3d11va``. An unusable value is reported along with
+    the list your FFmpeg build supports.
+
+``decoder`` (string, default empty)
+    Pins one FFmpeg decoder by name, e.g. ``hevc_cuvid`` or ``h264_qsv``.
+    Mostly useful for debugging: unlike the automatic selection, a pinned
+    decoder is *not* silently replaced if it fails.
+
+If a hardware decoder opens successfully but then fails to decode — an
+unsupported profile, a busy or reset GPU — the subscriber logs a warning and
+continues with the next option rather than dropping the stream::
+
+  [/camera0] failed to send bitstream packet to decoder: ...; falling back to hevc (software)
+
+Supported codecs are listed under `Supported Formats`_. Availability of a
+hardware path for any given one depends on your GPU and FFmpeg build; the
+subscriber only offers combinations that FFmpeg reports as supported, so an
+unavailable one costs nothing at runtime.
+
 Latency
 =======
 
@@ -101,22 +156,37 @@ compatible hardware:
 +------------+----------+----------+-----------+----------+----------+
 |            | Software | NVIDIA   | QSV [2]_  | VAAPI    | OMX      |
 +============+==========+==========+===========+==========+==========+
-| H.264      | Yes      | Yes      | Yes       | Encoding | Encoding |
+| H.264      | Yes      | Yes      | Yes       | Yes      | Encoding |
 +------------+----------+----------+-----------+----------+----------+
-| H.265      | Yes      | Yes      | Yes       | Encoding | No       |
+| H.265      | Yes      | Yes      | Yes       | Yes      | No       |
 +------------+----------+----------+-----------+----------+----------+
 | MPEG-4     | Yes      | Decoding | No        | Encoding | No       |
 +------------+----------+----------+-----------+----------+----------+
-| VP8        | Yes      | Decoding | Decoding  | Encoding | No       |
+| MPEG-2 [1]_| Decoding | Decoding | Decoding  | Decoding | No       |
 +------------+----------+----------+-----------+----------+----------+
-| VP9        | Yes      | Decoding | Yes       | Encoding | No       |
+| H.263 [1]_ | Decoding | No       | No        | No       | No       |
 +------------+----------+----------+-----------+----------+----------+
-| MJPEG [1]_ | Decoding | Decoding | Decoding  | No       | No       |
+| VP8        | Yes      | Decoding | Decoding  | Yes      | No       |
++------------+----------+----------+-----------+----------+----------+
+| VP9        | Yes      | Decoding | Yes       | Yes      | No       |
++------------+----------+----------+-----------+----------+----------+
+| AV1        | Yes      | Decoding | Yes       | Yes      | No       |
++------------+----------+----------+-----------+----------+----------+
+| MJPEG [1]_ | Decoding | Decoding | Decoding  | Decoding | No       |
 +------------+----------+----------+-----------+----------+----------+
 
-.. [1] ``rtsp_image_transport`` cannot create Motion JPEG (MJPEG) streams,
-    only receive them for backwards compatibility with some ancient IP
-    cameras. If you really want to have independently compressed JPEG
+Hardware decoding is also available through V4L2 stateful decoders
+(``*_v4l2m2m``) and Rockchip MPP (``*_rkmpp``) where your FFmpeg build provides
+them, which covers most ARM SoCs. The subscriber selects among whatever is
+actually present; see `Hardware Accelerated Decoding`_.
+
+The RTSP payload names recognised by the subscriber are ``H264``, ``H265``,
+``MP4V-ES``, ``MPV`` (MPEG-1/2 elementary stream, :RFC:`2250`), ``H263``,
+``H263-1998``, ``H263-2000``, ``VP8``, ``VP9``, ``AV1`` and ``JPEG``.
+
+.. [1] ``rtsp_image_transport`` cannot create Motion JPEG (MJPEG), MPEG-2 or
+    H.263 streams, only receive them for backwards compatibility with older
+    IP cameras. If you really want to have independently compressed JPEG
     frames for your video stream, you can use the
     `compressed_image_transport`_ with JPEG compression instead.
 

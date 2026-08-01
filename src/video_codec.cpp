@@ -41,6 +41,10 @@ std::string videoCodecName(VideoCodec codec)
             return "AV1";
         case VideoCodec::MJPEG:
             return "Motion JPEG";
+        case VideoCodec::MPEG2:
+            return "MPEG-2";
+        case VideoCodec::H263:
+            return "H.263";
         default:
             return "unsupported codec";
     }
@@ -62,6 +66,13 @@ VideoCodec fromRTSPCodecName(const std::string& name)
         return VideoCodec::MJPEG;
     if (name == "AV1")
         return VideoCodec::AV1;
+    /* RFC 4629 names the payload H263-2000; H263-1998 and H263 are the older
+       RFC 2429 and RFC 2190 spellings still used by some IP cameras. */
+    if (name == "H263" || name == "H263-1998" || name == "H263-2000")
+        return VideoCodec::H263;
+    /* RFC 2250 elementary MPEG-1/MPEG-2 video stream */
+    if (name == "MPV")
+        return VideoCodec::MPEG2;
     return VideoCodec::Unknown;
 }
 
