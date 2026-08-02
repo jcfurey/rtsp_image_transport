@@ -26,6 +26,8 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -63,20 +65,33 @@ public:
     /* Asks the loop to finish and waits for it to do so. Returns immediately
        when called from the loop thread, where waiting could never succeed. */
     void stop() noexcept;
+    /* Runs fn on the loop thread and waits for it to finish; an exception fn
+       throws propagates to the caller. Runs inline when called from the loop
+       thread itself (waiting could never succeed there) or once the loop has
+       stopped (nothing dispatches concurrently then). Built on triggerEvent,
+       the one Live555 entry point that is safe from foreign threads —
+       everything else (sending commands, closing Media, task scheduling)
+       must happen on this thread. */
+    void post(const std::function<void()>& fn);
 
 private:
+    struct PostedTask;
     explicit EventLoop(unsigned scheduler_granularity_us);
     void run();
+    static void dispatchPosted(void* data);
+    void drainPosted() noexcept;
 
     /* The order matters: the environment has to be reclaimed before the
        scheduler it refers to is destroyed. */
     std::shared_ptr<TaskScheduler> scheduler_;
     std::shared_ptr<UsageEnvironment> env_;
     EventLoopWatchVariable quit_flag_;
+    EventTriggerId post_trigger_;
     mutable std::mutex mutex_;
     std::condition_variable finished_;
     bool running_;
     std::thread::id thread_id_;
+    std::deque<std::shared_ptr<PostedTask>> posted_;
 };
 
 }  // namespace rtsp_image_transport

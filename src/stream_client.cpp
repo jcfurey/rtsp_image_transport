@@ -49,13 +49,18 @@ public:
     void setSessionTimeout(const std::chrono::milliseconds& timeout) noexcept;
     void initiateSetup() noexcept;
     void teardown() noexcept;
+    /* (Re)starts the watchdog clock. Called at handshake start and after
+       every completed handshake step, so each of DESCRIBE/SETUP/PLAY gets a
+       full timeout period rather than the whole handshake sharing one. */
+    void rearmTimeout() noexcept;
 
 private:
     Live555Client(const std::weak_ptr<StreamClient>& stream_client, UsageEnvironment& env, char const* url,
                   int verbosity, char const* appName, portNumBits tunnelOverHTTPPortNum, int socketNumToServer) noexcept
         : RTSPClient(env, url, verbosity, appName, tunnelOverHTTPPortNum, socketNumToServer),
           stream_client_(stream_client), session_(nullptr), subsession_(nullptr), has_video_(false),
-          session_active_(false), try_pos_(0), timeout_task_(nullptr), received_packets_(0)
+          session_active_(false), handshake_started_(false), try_pos_(0), timeout_task_(nullptr),
+          received_packets_(0)
     {
     }
 
@@ -72,7 +77,7 @@ private:
     std::mutex session_mutex_;
     std::shared_ptr<MediaSession> session_;
     MediaSubsession* subsession_;
-    bool has_video_, session_active_;
+    bool has_video_, session_active_, handshake_started_;
     /* All video subsessions of the current session in SDP order, and the order
        in which they are tried: the configured one first, then the others as
        fallbacks. */
@@ -90,8 +95,30 @@ void Live555Client::initiateSetup() noexcept
     if (sc)
     {
         RCLCPP_DEBUG(sc->logger(), "[%s] sending DESCRIBE command for RTSP stream", sc->topicName().c_str());
+        /* Supervise the handshake, not just the established session:
+           RTSPClient has no response timeout of its own, and the data
+           watchdog used to arm only after PLAY — a server that accepted TCP
+           but never answered DESCRIBE wedged the session forever, with the
+           reconnect policy never consulted. */
+        {
+            std::lock_guard<std::mutex> lock{session_mutex_};
+            handshake_started_ = true;
+        }
+        rearmTimeout();
         sendDescribeCommand(Live555Client::continueAfterDESCRIBE);
     }
+}
+
+void Live555Client::rearmTimeout() noexcept
+{
+    std::lock_guard<std::mutex> lock{session_mutex_};
+    if (timeout_task_)
+    {
+        envir().taskScheduler().unscheduleDelayedTask(timeout_task_);
+        timeout_task_ = nullptr;
+    }
+    if (timeout_.count() > 0)
+        timeout_task_ = envir().taskScheduler().scheduleDelayedTask(1000 * timeout_.count(), checkTimeout, this);
 }
 
 void Live555Client::setSessionTimeout(const std::chrono::milliseconds& timeout) noexcept
@@ -103,7 +130,7 @@ void Live555Client::setSessionTimeout(const std::chrono::milliseconds& timeout) 
         envir().taskScheduler().unscheduleDelayedTask(timeout_task_);
         timeout_task_ = nullptr;
     }
-    if (timeout_.count() > 0 && session_active_)
+    if (timeout_.count() > 0 && (session_active_ || handshake_started_))
     {
         timeout_task_ = envir().taskScheduler().scheduleDelayedTask(1000 * timeout_.count(), checkTimeout, this);
     }
@@ -113,6 +140,7 @@ void Live555Client::teardown() noexcept
 {
     std::lock_guard<std::mutex> lock{session_mutex_};
     session_active_ = false;
+    handshake_started_ = false;
     subsession_ = nullptr;
     candidates_.clear();
     try_order_.clear();
@@ -160,6 +188,7 @@ void Live555Client::continueAfterDESCRIBE(RTSPClient* client, int resultCode, ch
             return;
         }
         RCLCPP_DEBUG(sc->logger(), "[%s] received SDP parameters:\n%s", sc->topicName().c_str(), sdpInfo.get());
+        c->rearmTimeout();
         c->has_video_ = false;
         MediaSession* session = MediaSession::createNew(env, sdpInfo.get());
         if (!session)
@@ -284,6 +313,7 @@ void Live555Client::continueAfterSETUP(RTSPClient* client, int resultCode, char*
         }
         sc->sessionReady();
         RCLCPP_DEBUG(sc->logger(), "[%s] sending PLAY command", sc->topicName().c_str());
+        c->rearmTimeout();
         c->sendPlayCommand(*c->session_, continueAfterPLAY);
     }
 }
@@ -301,6 +331,13 @@ void Live555Client::continueAfterPLAY(RTSPClient* client, int resultCode, char* 
         {
             std::unique_lock<std::mutex> lock{c->session_mutex_};
             c->session_active_ = true;
+            /* Replace, not stack: the handshake watchdog may still be
+               pending — two live tasks would double-fire checkTimeout. */
+            if (c->timeout_task_)
+            {
+                c->envir().taskScheduler().unscheduleDelayedTask(c->timeout_task_);
+                c->timeout_task_ = nullptr;
+            }
             if (c->timeout_.count() > 0)
                 c->timeout_task_ =
                     c->envir().taskScheduler().scheduleDelayedTask(1000 * c->timeout_.count(), checkTimeout, c);
@@ -383,6 +420,17 @@ void Live555Client::checkTimeout(void* obj) noexcept
     if (sc)
     {
         std::unique_lock<std::mutex> lock{c->session_mutex_};
+        if (!c->session_active_)
+        {
+            /* Handshake watchdog fired: a full timeout period without a
+               DESCRIBE/SETUP/PLAY step completing (each completed step
+               re-arms). Report a session failure — not a timeout — so the
+               reconnect path applies its exponential backoff. */
+            lock.unlock();
+            c->teardown();
+            sc->sessionFailed(408, "RTSP session setup timed out");
+            return;
+        }
         std::size_t new_received_packets = 0;
         if (c->session_)
         {
@@ -422,10 +470,14 @@ StreamClient::StreamClient(const std::string& topic_name, const std::string& url
 
 StreamClient::~StreamClient()
 {
-    disconnect();
-    /* May run on the Live555 thread itself when a callback held the last
-       reference; stop() knows not to wait for itself in that case. */
+    /* Stop the dispatcher FIRST: teardown deletes the RTSPClient and its
+       FrameExtractor sink, and a still-running loop may be inside
+       deliverFrame on those very objects. With the loop stopped — or when
+       this destructor already runs on the loop thread, where stop() returns
+       immediately and the loop is us — the close below cannot race a
+       handler. */
     loop_->stop();
+    disconnect();
 }
 
 VideoCodec StreamClient::codec() const noexcept
@@ -462,33 +514,42 @@ std::string StreamClient::url() const noexcept
 
 void StreamClient::connect()
 {
-    Live555Client* client;
-    {
-        std::lock_guard<std::mutex> lock{client_mutex_};
-        if (client_)
-            throw StreamingError("client is connected already");
-        client_ = Live555Client::createNew(shared_from_this(), loop_->env(), url_.c_str(), 0, logger_.get_name());
-        client_->setSessionTimeout(timeout_);
-        client = client_;
-    }
-    RCLCPP_DEBUG(logger_, "[%s] connecting to %s", topic_name_.c_str(), url_.c_str());
-    /* Live555 reports errors it detects right away (an unparsable URL, a host
-       that cannot be resolved) by invoking the response handler from inside
-       this call. The handler ends up in disconnect() or connect() again, so the
-       mutex must not be held here. */
-    client->initiateSetup();
+    /* All Live555 object manipulation happens on the loop thread: RTSPClient
+       registers with the task scheduler, whose socket/timer state a
+       concurrently running loop mutates without locks. post() runs this
+       inline when already on the loop thread (the 454 workaround path) and
+       propagates the StreamingError to foreign callers. */
+    loop_->post([this] {
+        Live555Client* client;
+        {
+            std::lock_guard<std::mutex> lock{client_mutex_};
+            if (client_)
+                throw StreamingError("client is connected already");
+            client_ = Live555Client::createNew(shared_from_this(), loop_->env(), url_.c_str(), 0, logger_.get_name());
+            client_->setSessionTimeout(timeout_);
+            client = client_;
+        }
+        RCLCPP_DEBUG(logger_, "[%s] connecting to %s", topic_name_.c_str(), url_.c_str());
+        /* Live555 reports errors it detects right away (an unparsable URL, a
+           host that cannot be resolved) by invoking the response handler from
+           inside this call. The handler ends up in disconnect() or connect()
+           again, so the mutex must not be held here. */
+        client->initiateSetup();
+    });
 }
 
 void StreamClient::disconnect()
 {
-    std::lock_guard<std::mutex> lock{client_mutex_};
-    if (client_)
-    {
-        RCLCPP_DEBUG(logger_, "[%s] disconnecting from %s", topic_name_.c_str(), url_.c_str());
-        client_->teardown();
-        Medium::close(client_);
-        client_ = nullptr;
-    }
+    loop_->post([this] {
+        std::lock_guard<std::mutex> lock{client_mutex_};
+        if (client_)
+        {
+            RCLCPP_DEBUG(logger_, "[%s] disconnecting from %s", topic_name_.c_str(), url_.c_str());
+            client_->teardown();
+            Medium::close(client_);
+            client_ = nullptr;
+        }
+    });
 }
 
 void StreamClient::sessionFailed(int code, const std::string& message)
@@ -553,10 +614,14 @@ void StreamClient::receiveStreamData(VideoCodec codec, MediaSubsession* subsessi
 
 void StreamClient::setSessionTimeout(const std::chrono::milliseconds& timeout) noexcept
 {
-    std::lock_guard<std::mutex> lock{client_mutex_};
-    timeout_ = timeout;
-    if (client_)
-        client_->setSessionTimeout(timeout_);
+    /* Reaches into the task scheduler ((un)scheduleDelayedTask), which is
+       loop-thread-only. */
+    loop_->post([this, timeout] {
+        std::lock_guard<std::mutex> lock{client_mutex_};
+        timeout_ = timeout;
+        if (client_)
+            client_->setSessionTimeout(timeout_);
+    });
 }
 
 void StreamClient::setSubsessionStartedHandler(SubsessionStartedHandler handler) noexcept

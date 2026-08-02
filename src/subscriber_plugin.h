@@ -95,6 +95,10 @@ private:
     rclcpp::CallbackGroup::SharedPtr cooldown_cb_group_, scheduled_cb_group_;
     rclcpp::Duration old_lag_;
     rclcpp::WallTimer<rclcpp::VoidCallbackType>::SharedPtr cooldown_timer_;
+    /* Guards cooldown_, cooldown_timer_, cooldown_cb_group_: reconnect
+       bookkeeping is driven from ROS executor threads and from the Live555
+       handler thread (session failed/timeout), which used to race. */
+    mutable std::mutex cooldown_mutex_;
     rclcpp::Waitable::SharedPtr scheduled_cb_;
     std::function<void()> notify_frame_;
     Callback callback_;
