@@ -20,8 +20,16 @@
  ****************************************************************************/
 #include "event_loop.h"
 
+#include <future>
+
 namespace rtsp_image_transport
 {
+
+struct EventLoop::PostedTask
+{
+    std::function<void()> fn;
+    std::promise<void> done;
+};
 
 namespace
 {
@@ -55,7 +63,8 @@ std::shared_ptr<EventLoop> EventLoop::create(unsigned scheduler_granularity_us)
 
 EventLoop::EventLoop(unsigned scheduler_granularity_us)
     : scheduler_(BasicTaskScheduler::createNew(scheduler_granularity_us)),
-      env_(BasicUsageEnvironment::createNew(*scheduler_), reclaim_env), quit_flag_(0), running_(true)
+      env_(BasicUsageEnvironment::createNew(*scheduler_), reclaim_env), quit_flag_(0),
+      post_trigger_(scheduler_->createEventTrigger(dispatchPosted)), running_(true)
 {
 }
 
@@ -69,9 +78,67 @@ EventLoop::~EventLoop()
 void EventLoop::run()
 {
     env_->taskScheduler().doEventLoop(&quit_flag_);
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        running_ = false;
+    }
+    /* Tasks posted before the loop noticed the quit flag would otherwise
+       leave their callers waiting forever. Drained here, after running_ went
+       false under the mutex, so no new task can slip in between. */
+    drainPosted();
     std::lock_guard<std::mutex> lock{mutex_};
-    running_ = false;
     finished_.notify_all();
+}
+
+void EventLoop::dispatchPosted(void* data)
+{
+    static_cast<EventLoop*>(data)->drainPosted();
+}
+
+void EventLoop::drainPosted() noexcept
+{
+    for (;;)
+    {
+        std::shared_ptr<PostedTask> task;
+        {
+            std::lock_guard<std::mutex> lock{mutex_};
+            if (posted_.empty())
+                return;
+            task = posted_.front();
+            posted_.pop_front();
+        }
+        try
+        {
+            task->fn();
+            task->done.set_value();
+        }
+        catch (...)
+        {
+            task->done.set_exception(std::current_exception());
+        }
+    }
+}
+
+void EventLoop::post(const std::function<void()>& fn)
+{
+    std::shared_ptr<PostedTask> task;
+    {
+        std::unique_lock<std::mutex> lock{mutex_};
+        if (!running_ || thread_id_ == std::this_thread::get_id())
+        {
+            lock.unlock();
+            fn();
+            return;
+        }
+        task = std::make_shared<PostedTask>();
+        task->fn = fn;
+        posted_.push_back(task);
+    }
+    std::future<void> done = task->done.get_future();
+    /* triggerEvent may coalesce with a concurrent post; drainPosted empties
+       the whole queue per dispatch, so coalescing loses nothing. */
+    scheduler_->triggerEvent(post_trigger_, this);
+    done.get();
 }
 
 UsageEnvironment& EventLoop::env() noexcept

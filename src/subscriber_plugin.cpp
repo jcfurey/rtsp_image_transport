@@ -169,10 +169,15 @@ SubscriberPlugin::SubscriberPlugin()
 
 void SubscriberPlugin::shutdown()
 {
-    cooldown_cb_group_.reset();
-    cooldown_timer_.reset();
-    if (client_)
-        client_->disconnect();
+    {
+        std::lock_guard<std::mutex> lock{cooldown_mutex_};
+        cooldown_cb_group_.reset();
+        cooldown_timer_.reset();
+    }
+    /* Destroy, don't just disconnect: ~StreamClient stops the Live555 loop
+       BEFORE tearing objects down, whereas a plain disconnect() from this
+       executor thread raced the loop's in-flight frame delivery. */
+    client_.reset();
     decoder_.reset();
     clearQueuedFrames();
     SuperClass::shutdown();
@@ -272,9 +277,12 @@ void SubscriberPlugin::internalCallback(const std_msgs::msg::String::ConstShared
     failed_ = false;
     old_lag_ = 0s;
     callback_ = callback;
-    cooldown_ = config_->reconnect_minwait;
-    cooldown_cb_group_.reset();
-    cooldown_timer_.reset();
+    {
+        std::lock_guard<std::mutex> lock{cooldown_mutex_};
+        cooldown_ = config_->reconnect_minwait;
+        cooldown_cb_group_.reset();
+        cooldown_timer_.reset();
+    }
     client_.reset();
     try
     {
@@ -461,7 +469,10 @@ void SubscriberPlugin::updateParameters()
     *config_ = new_config;
     try
     {
-        cooldown_ = config_->reconnect_minwait;
+        {
+            std::lock_guard<std::mutex> lock{cooldown_mutex_};
+            cooldown_ = config_->reconnect_minwait;
+        }
         if (config_->reconnect_maxwait < config_->reconnect_minwait)
             config_->reconnect_maxwait = config_->reconnect_minwait;
         if (client_)
@@ -565,6 +576,7 @@ void SubscriberPlugin::processFrame()
 
 void SubscriberPlugin::sessionStarted()
 {
+    std::lock_guard<std::mutex> lock{cooldown_mutex_};
     cooldown_ = config_->reconnect_minwait;
     cooldown_timer_.reset();
 }
@@ -609,6 +621,10 @@ void SubscriberPlugin::reconnect()
     rclcpp::node_interfaces::NodeTimersInterface::SharedPtr nt = node_timers_.lock();
     if (nb && nt)
     {
+        /* Runs on ROS executor threads AND the Live555 handler thread (via
+           the session failed/timeout handlers) — the cooldown state needs
+           the lock. */
+        std::lock_guard<std::mutex> lock{cooldown_mutex_};
         RCLCPP_INFO(logger_, "[%s] new connection attempt in %0.3lf seconds", topic_name_.c_str(),
                     1e-3 * cooldown_.count());
         cooldown_cb_group_ = nb->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -623,7 +639,10 @@ void SubscriberPlugin::reconnect()
 
 void SubscriberPlugin::cooldownTimerCallback()
 {
-    cooldown_timer_.reset();  // just in case
+    {
+        std::lock_guard<std::mutex> lock{cooldown_mutex_};
+        cooldown_timer_.reset();  // just in case
+    }
     clearQueuedFrames();
     if (!client_)
         return;
