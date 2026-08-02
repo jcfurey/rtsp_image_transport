@@ -289,6 +289,85 @@ TEST(RtspLoopback, ReceivedStreamDecodesBackToImages)
     EXPECT_GE(images, 3u) << "received stream did not decode into images";
 }
 
+TEST(RtspLoopback, H265SessionDecodesBackToImages)
+{
+    /* The deployed camera0 stream is HEVC, and the H.265 receive path —
+       including the FrameExtractor's RFC 7798 sprop-vps/sps/pps SDP init —
+       previously had zero session-level coverage: every session test was
+       H264-only and the H265 decoder tests bypassed live555 entirely. */
+    if (!haveEncoderFor(VideoCodec::H265))
+        GTEST_SKIP() << "no H.265 encoder in this FFmpeg build";
+    const unsigned width = 320, height = 240;
+    std::unique_ptr<LoopbackServer> server;
+    try
+    {
+        server = std::make_unique<LoopbackServer>(VideoCodec::H265, width, height);
+    }
+    catch (const std::exception& e)
+    {
+        GTEST_SKIP() << "live555 build lacks H.265 server support: " << e.what();
+    }
+
+    ClientObserver observer;
+    std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", server->url());
+    observer.attach(client);
+    /* Replace the observer's subsession handler with one that ALSO captures
+       the SDP sprop attributes, so the log shows whether this run exercised
+       the sprop init path or the in-band fallback. */
+    std::string sprop_vps, sprop_sps, sprop_pps;
+    client->setSubsessionStartedHandler(
+        [&](VideoCodec codec, MediaSubsession* subsession)
+        {
+            std::lock_guard<std::mutex> lock{observer.mutex_};
+            observer.codec_ = codec;
+            if (subsession)
+            {
+                sprop_vps = subsession->attrVal_str("sprop-vps");
+                sprop_sps = subsession->attrVal_str("sprop-sps");
+                sprop_pps = subsession->attrVal_str("sprop-pps");
+            }
+            observer.cv_.notify_all();
+        });
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_TRUE(observer.waitForNals(60)) << "not enough video data arrived";
+    EXPECT_EQ(observer.codec_, VideoCodec::H265);
+    EXPECT_EQ(client->codec(), VideoCodec::H265);
+    if (sprop_vps.empty() || sprop_sps.empty() || sprop_pps.empty())
+        std::cerr << "[   NOTE   ] SDP carried no sprop parameter sets; this "
+                     "run covered the in-band fallback, not the sprop init\n";
+
+    std::vector<FrameDataPtr> nals;
+    {
+        std::lock_guard<std::mutex> lock{observer.mutex_};
+        nals = observer.nals_;
+    }
+    client->disconnect();
+
+    StreamDecoder::Options options;
+    options.use_hw_decoder = false;
+    options.hw_device = "none";
+    StreamDecoder decoder(VideoCodec::H265, options);
+    std::size_t images = 0;
+    for (const FrameDataPtr& nal : nals)
+    {
+        try
+        {
+            decoder.decodeVideo(nal);
+        }
+        catch (const DecodingError&)
+        {
+            continue;  // a partial first access unit is expected
+        }
+        while (sensor_msgs::msg::Image::UniquePtr img = decoder.nextFrame())
+        {
+            EXPECT_EQ(img->width, width);
+            EXPECT_EQ(img->height, height);
+            images++;
+        }
+    }
+    EXPECT_GE(images, 3u) << "received H.265 stream did not decode into images";
+}
+
 TEST(RtspLoopback, ClientReportsAvailableVideoSubsessions)
 {
     if (!haveEncoderFor(VideoCodec::H264))
