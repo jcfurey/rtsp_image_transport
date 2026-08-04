@@ -1,7 +1,7 @@
 # Nautilus fork notes
 
 Remote: [`jcfurey/rtsp_image_transport`](https://github.com/jcfurey/rtsp_image_transport),
-branch `ros2`.
+branch `cam_wip`.
 
 This change is based on upstream commit
 `d815a176b0634cda8d5f4290f33173b82fab7a6c`. Nautilus adds a zero-based
@@ -86,26 +86,25 @@ on older cameras.
 
 ## image_transport 6.4 and later
 
-Testing the plugins end to end for the first time turned up that they are
-**silently inert on Lyrical and Rolling**, in this fork and upstream alike.
 image_transport 6.4 replaced the plugin entry points with ones taking node
-interfaces and no longer calls the old ones, so `advertiseImpl` and
-`subscribeImpl` never run: the topics appear, no RTSP server is created, no
-parameters are declared, and nothing explains why.
-
-Porting is blocked upstream rather than merely tedious. `RequiredInterfaces` is
+interfaces and no longer calls the old ones. `RequiredInterfaces` is
 `NodeInterfaces<Base, Parameters, Logging, Timers, Topics>`, which lacks the
-clock interface the subscriber needs for simulated time, the waitables
-interface it uses to hand decoding to the executor, and the graph interface the
-publisher watches for departing subscribers. `TimeSource::attachNode` also
-wants graph and services interfaces that never arrive. Closing the gap means
-either widening `RequiredInterfaces` upstream or reimplementing clock and graph
-tracking from raw topics, with the threading and sim-time consequences that
-implies.
+clock, waitables, and graph interfaces used by the original plugins.
 
-For now both plugins override the new entry point purely to log what happened,
-so the failure is loud rather than silent, and the end-to-end tests skip with
-the same explanation on those versions.
+The subscriber now supports this API. It drains the decoder queue with a 2 ms
+wall timer registered through the provided base/timers interfaces instead of a
+custom waitable, and it declares and monitors parameters directly through the
+parameters interface. Because the node clock is not provided, this path uses a
+system clock for receive timestamps; callers on 6.4+ should explicitly select
+`timestamp_source:=1` when receiver timestamps are wanted. The FLIR A700 launch
+does this by default.
+
+The image_transport publisher plugin remains unavailable on 6.4+ because its
+subscriber-graph monitoring cannot be recreated from the provided interfaces.
+This does not affect camera reception through `publish_rtsp_stream`, which
+publishes the RTSP URL directly and is the pattern used by the Deep Trekker and
+FLIR adapters. End-to-end tests that require the publisher plugin still skip on
+these versions.
 
 ## Build system
 
@@ -132,10 +131,8 @@ the unmodified upstream package:
   linked through `${sensor_msgs_TARGETS}`, and `ament_target_dependencies()` is
   avoided because Lyrical removed it.
 
-Builds and passes the full test suite on Jazzy, Kilted and Lyrical. Rolling
-still fails to compile, for the same upstream reason described under
-"image_transport 6.4 and later": the plugin entry points changed shape, and on
-Rolling the old ones are gone rather than merely uncalled.
+Builds on Lyrical with the node-interface subscriber path used by the FLIR
+adapter. The legacy entry points remain for image_transport 6.3 and earlier.
 
 ## Tests
 

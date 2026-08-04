@@ -25,6 +25,23 @@ project(
     LANGUAGES CXX
 )
 
+# ament executes package.xml helpers with the interpreter selected by CMake.
+# cam-ripper has an unrelated ~/.local Python 3.11 ahead of the ROS Lyrical
+# system interpreter, but that environment does not contain catkin_pkg. Honour
+# an explicit caller override; otherwise select the Ubuntu system Python that
+# owns the ROS Python modules.
+if(NOT Python3_EXECUTABLE)
+    find_program(
+        ROS_SYSTEM_PYTHON
+        NAMES python3
+        PATHS /usr/bin
+        NO_DEFAULT_PATH
+        REQUIRED
+    )
+    set(Python3_EXECUTABLE "${ROS_SYSTEM_PYTHON}" CACHE FILEPATH "Python interpreter used by ROS" FORCE)
+endif()
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
 include(GenerateExportHeader)
 include(CheckCXXSourceCompiles)
 

@@ -36,12 +36,10 @@ using namespace std::chrono_literals;
 using namespace rtsp_image_transport::test;
 
 /* image_transport 6.4 replaced the plugin entry points with ones that take node
-   interfaces, and no longer calls the old ones. This transport cannot be ported
-   to them yet, because RequiredInterfaces provides neither the clock interface
-   the subscriber needs for simulated time, nor the waitables interface it uses
-   to hand decoding to the executor, nor the graph interface the publisher
-   watches. The plugins report this at runtime; the tests below would otherwise
-   just fail with no explanation. */
+   interfaces. The subscriber supports that API, but RequiredInterfaces still
+   lacks the graph interface needed by the RTSP publisher plugin. These tests
+   exercise a complete publisher/subscriber transport hop, so they remain
+   unavailable until the publisher can monitor its subscriber graph. */
 #define TRANSPORT_IS_SUPPORTED (CURRENT_IMAGE_TRANSPORT_VERSION < FKIE_VERSION_TUPLE(6, 4, 0))
 #define SKIP_IF_TRANSPORT_UNSUPPORTED()                                                             \
     do                                                                                              \
@@ -49,8 +47,8 @@ using namespace rtsp_image_transport::test;
         if (!TRANSPORT_IS_SUPPORTED)                                                                \
             GTEST_SKIP() << "image_transport " << (CURRENT_IMAGE_TRANSPORT_VERSION >> 16) << "."     \
                          << ((CURRENT_IMAGE_TRANSPORT_VERSION >> 8) & 0xff)                          \
-                         << " uses the node-interface plugin API, which this transport does not "    \
-                            "support yet; the plugins log an error and serve nothing";               \
+                         << " uses the node-interface plugin API, whose interfaces are insufficient " \
+                            "for the RTSP publisher plugin used by this round-trip test";             \
     } while (0)
 
 namespace
