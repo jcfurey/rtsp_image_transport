@@ -33,18 +33,24 @@ namespace rtsp_image_transport
 {
 
 /* From image_transport 6.4 the plugin entry points take node interfaces rather
-   than a node, and the old ones are never called. This transport cannot be
-   ported to them yet: RequiredInterfaces carries neither the clock interface
-   the subscriber needs to honour simulated time, nor the waitables interface it
-   uses to hand decoding to the executor, nor the graph interface the publisher
-   watches for departing subscribers. Overriding the new entry point at least
-   turns a silent black screen into something the log explains. */
+   than a node, and the old ones are never called. RequiredInterfaces does not
+   include the clock or waitables interfaces. The newer implementation therefore
+   uses a short wall timer to process queued frames on the executor and falls
+   back to a system clock for receive timestamps. */
 #define RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES \
     (CURRENT_IMAGE_TRANSPORT_VERSION >= FKIE_VERSION_TUPLE(6, 4, 0))
 
 
 namespace
 {
+
+void declareParameter(
+    const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& parameters, const std::string& name,
+    const rclcpp::ParameterValue& value, const rcl_interfaces::msg::ParameterDescriptor& descriptor)
+{
+    if (!parameters->has_parameter(name))
+        parameters->declare_parameter(name, value, descriptor);
+}
 
 class ScheduledCB : public rclcpp::Waitable
 {
@@ -169,6 +175,10 @@ SubscriberPlugin::SubscriberPlugin()
 
 void SubscriberPlugin::shutdown()
 {
+    frame_timer_.reset();
+    scheduled_cb_group_.reset();
+    scheduled_cb_.reset();
+    notify_frame_ = {};
     {
         std::lock_guard<std::mutex> lock{cooldown_mutex_};
         cooldown_cb_group_.reset();
@@ -248,9 +258,9 @@ void SubscriberPlugin::subscribeImpl(rclcpp::Node* node, const std::string& base
     if (!param_base_name_.empty())
         param_base_name_.push_back('.');
     param_base_name_ += getTransportName();
-    setupParameters(node);
-    param_cb_handle_ = node->add_post_set_parameters_callback([this](const std::vector<rclcpp::Parameter>&)
-                                                              { this->updateParameters(); });
+    setupParameters(node_param_.lock());
+    param_cb_handle_ = node_param_.lock()->add_post_set_parameters_callback(
+        [this](const std::vector<rclcpp::Parameter>&) { this->updateParameters(); });
     updateParameters();
 }
 
@@ -259,15 +269,48 @@ void SubscriberPlugin::subscribeImpl(image_transport::RequiredInterfaces node_in
                                      const std::string& base_topic, const Callback& callback,
                                      rclcpp::QoS custom_qos, rclcpp::SubscriptionOptions options)
 {
-    rclcpp::Logger logger = node_interfaces.get_node_logging_interface()->get_logger();
-    RCLCPP_ERROR(logger,
-                 "[%s] the rtsp transport is not supported with image_transport %d.%d: its plugin API no longer "
-                 "provides the clock, waitables and graph interfaces this transport needs. The topic will be "
-                 "subscribed but no images will be decoded. Use image_transport 6.3 or earlier, or the raw "
-                 "transport.",
-                 base_topic.c_str(), CURRENT_IMAGE_TRANSPORT_VERSION >> 16,
-                 (CURRENT_IMAGE_TRANSPORT_VERSION >> 8) & 0xff);
+    custom_qos.reliable().keep_last(1).transient_local();
+    options.event_callbacks.incompatible_qos_callback =
+        [this](rclcpp::QOSRequestedIncompatibleQoSInfo& info)
+    {
+        RCLCPP_ERROR(logger_,
+                     "[%s] the RTSP URL publisher offers an incompatible QoS policy (%d); this transport needs "
+                     "RELIABLE and TRANSIENT_LOCAL, so no video will arrive",
+                     topic_name_.c_str(), static_cast<int>(info.last_policy_kind));
+    };
     SuperClass::subscribeImpl(node_interfaces, base_topic, callback, custom_qos, options);
+
+    auto node_base = node_interfaces.get_node_base_interface();
+    auto node_timers = node_interfaces.get_node_timers_interface();
+    auto node_parameters = node_interfaces.get_node_parameters_interface();
+    logger_ = node_interfaces.get_node_logging_interface()->get_logger();
+    clock_ = std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME);
+    topic_name_ = base_topic;
+    node_base_ = node_base;
+    node_timers_ = node_timers;
+    node_param_ = node_parameters;
+    failed_ = false;
+
+    std::size_t len = std::string(node_base->get_namespace()).length();
+    param_base_name_ = base_topic.substr(len);
+    std::replace(param_base_name_.begin(), param_base_name_.end(), '/', '.');
+    if (!param_base_name_.empty() && param_base_name_[0] == '.')
+        param_base_name_ = param_base_name_.substr(1);
+    if (!param_base_name_.empty())
+        param_base_name_.push_back('.');
+    param_base_name_ += getTransportName();
+
+    setupParameters(node_parameters);
+    param_cb_handle_ = node_parameters->add_post_set_parameters_callback(
+        [this](const std::vector<rclcpp::Parameter>&) { this->updateParameters(); });
+    updateParameters();
+
+    scheduled_cb_group_ = node_base->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    frame_timer_ = std::make_shared<rclcpp::WallTimer<rclcpp::VoidCallbackType>>(
+        2ms, std::bind(&SubscriberPlugin::processFrame, this), node_base->get_context());
+    node_timers->add_timer(frame_timer_, scheduled_cb_group_);
+    RCLCPP_INFO(logger_, "[%s] using image_transport node-interface API with executor timer frame delivery",
+                topic_name_.c_str());
 }
 #endif
 
@@ -358,75 +401,72 @@ void SubscriberPlugin::receiveDataStream(VideoCodec codec, MediaSubsession* subs
         notify_frame_();
 }
 
-void SubscriberPlugin::setupParameters(rclcpp::Node* node)
+void SubscriberPlugin::setupParameters(
+    const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& node_parameters)
 {
     using rcl_interfaces::msg::ParameterDescriptor;
-    if (!node->has_parameter(param_base_name_ + ".use_hw_decoder"))
-        node->declare_parameter<bool>(
-            param_base_name_ + ".use_hw_decoder", config_->decoder.use_hw_decoder,
-            ParameterDescriptor().set__description("use GPU accelerated video decoding if possible"));
-    if (!node->has_parameter(param_base_name_ + ".hw_device"))
-        node->declare_parameter<std::string>(
-            param_base_name_ + ".hw_device", config_->decoder.hw_device,
-            ParameterDescriptor().set__description(
-                "hardware device for video decoding: auto, none, or a specific FFmpeg device "
-                "(cuda, vaapi, qsv, vdpau, drm, vulkan, videotoolbox, d3d11va)"));
-    if (!node->has_parameter(param_base_name_ + ".hw_device_path"))
-        node->declare_parameter<std::string>(
-            param_base_name_ + ".hw_device_path", config_->decoder.hw_device_path,
-            ParameterDescriptor().set__description(
-                "which GPU to decode on when the machine has several: a DRM render node such as "
-                "/dev/dri/renderD128 for VAAPI and Quick Sync, or a device index for CUDA "
-                "(empty = let FFmpeg choose)"));
-    if (!node->has_parameter(param_base_name_ + ".decoder"))
-        node->declare_parameter<std::string>(
-            param_base_name_ + ".decoder", config_->decoder.decoder,
-            ParameterDescriptor().set__description(
-                "force a specific FFmpeg decoder, e.g. hevc_cuvid or h264_qsv (empty = choose automatically)"));
-    if (!node->has_parameter(param_base_name_ + ".low_latency"))
-        node->declare_parameter<bool>(param_base_name_ + ".low_latency", config_->decoder.low_latency,
-                                      ParameterDescriptor().set__description(
-                                          "decode with minimal buffering; disable for streams with B-frames"));
-    if (!node->has_parameter(param_base_name_ + ".timestamp_source"))
-        node->declare_parameter<int>(
-            param_base_name_ + ".timestamp_source", config_->timestamp_source,
-            ParameterDescriptor()
-                .set__description("image time stamp source (0 = sender clock via RTCP, 1 = time of reception, "
-                                  "2 = automatic: sender clock unless simulated time is in use)")
-                .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(2)}));
-    if (!node->has_parameter(param_base_name_ + ".video_subsession"))
-        node->declare_parameter<int>(
-            param_base_name_ + ".video_subsession", config_->video_subsession,
-            ParameterDescriptor()
-                .set__description("zero-based supported video subsession to decode")
-                .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(31)}));
-    if (!node->has_parameter(param_base_name_ + ".reconnect_policy"))
-        node->declare_parameter<int>(
-            param_base_name_ + ".reconnect_policy", config_->reconnect_policy,
-            ParameterDescriptor()
-                .set__description("client reconnect policy (0 = never, 1 = on timeout, 2 = on failure, 3 = always)")
-                .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(3)}));
-    if (!node->has_parameter(param_base_name_ + ".timeout"))
-        node->declare_parameter<double>(
-            param_base_name_ + ".timeout", 1e-3 * config_->timeout.count(),
-            ParameterDescriptor()
-                .set__description("client session timeout [s] (0 = unlimited)")
-                .set__floating_point_range(
-                    {rcl_interfaces::msg::FloatingPointRange().set__from_value(0).set__to_value(60)}));
-    if (!node->has_parameter(param_base_name_ + ".reconnect_minwait"))
-        node->declare_parameter<double>(
-            param_base_name_ + ".reconnect_minwait", 1e-3 * config_->reconnect_minwait.count(),
-            ParameterDescriptor()
-                .set__description("minimum delay between connection attempts [s]")
-                .set__floating_point_range(
-                    {rcl_interfaces::msg::FloatingPointRange().set__from_value(0).set__to_value(60)}));
-    if (!node->has_parameter(param_base_name_ + ".reconnect_maxwait"))
-        node->declare_parameter<double>(
-            param_base_name_ + ".reconnect_maxwait", 1e-3 * config_->reconnect_maxwait.count(),
-            ParameterDescriptor()
-                .set__description("maximum delay between connection attempts [s]")
-                .set__floating_point_range(
-                    {rcl_interfaces::msg::FloatingPointRange().set__from_value(0).set__to_value(600)}));
+    declareParameter(
+        node_parameters, param_base_name_ + ".use_hw_decoder",
+        rclcpp::ParameterValue(config_->decoder.use_hw_decoder),
+        ParameterDescriptor().set__description("use GPU accelerated video decoding if possible"));
+    declareParameter(
+        node_parameters, param_base_name_ + ".hw_device", rclcpp::ParameterValue(config_->decoder.hw_device),
+        ParameterDescriptor().set__description(
+            "hardware device for video decoding: auto, none, or a specific FFmpeg device "
+            "(cuda, vaapi, qsv, vdpau, drm, vulkan, videotoolbox, d3d11va)"));
+    declareParameter(
+        node_parameters, param_base_name_ + ".hw_device_path",
+        rclcpp::ParameterValue(config_->decoder.hw_device_path),
+        ParameterDescriptor().set__description(
+            "which GPU to decode on when the machine has several: a DRM render node such as "
+            "/dev/dri/renderD128 for VAAPI and Quick Sync, or a device index for CUDA "
+            "(empty = let FFmpeg choose)"));
+    declareParameter(
+        node_parameters, param_base_name_ + ".decoder", rclcpp::ParameterValue(config_->decoder.decoder),
+        ParameterDescriptor().set__description(
+            "force a specific FFmpeg decoder, e.g. hevc_cuvid or h264_qsv (empty = choose automatically)"));
+    declareParameter(
+        node_parameters, param_base_name_ + ".low_latency", rclcpp::ParameterValue(config_->decoder.low_latency),
+        ParameterDescriptor().set__description("decode with minimal buffering; disable for streams with B-frames"));
+    declareParameter(
+        node_parameters, param_base_name_ + ".timestamp_source",
+        rclcpp::ParameterValue(static_cast<int>(config_->timestamp_source)),
+        ParameterDescriptor()
+            .set__description("image time stamp source (0 = sender clock via RTCP, 1 = time of reception, "
+                              "2 = automatic: sender clock unless simulated time is in use)")
+            .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(2)}));
+    declareParameter(
+        node_parameters, param_base_name_ + ".video_subsession",
+        rclcpp::ParameterValue(config_->video_subsession),
+        ParameterDescriptor()
+            .set__description("zero-based supported video subsession to decode")
+            .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(31)}));
+    declareParameter(
+        node_parameters, param_base_name_ + ".reconnect_policy",
+        rclcpp::ParameterValue(static_cast<int>(config_->reconnect_policy)),
+        ParameterDescriptor()
+            .set__description("client reconnect policy (0 = never, 1 = on timeout, 2 = on failure, 3 = always)")
+            .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(3)}));
+    declareParameter(
+        node_parameters, param_base_name_ + ".timeout", rclcpp::ParameterValue(1e-3 * config_->timeout.count()),
+        ParameterDescriptor()
+            .set__description("client session timeout [s] (0 = unlimited)")
+            .set__floating_point_range(
+                {rcl_interfaces::msg::FloatingPointRange().set__from_value(0).set__to_value(60)}));
+    declareParameter(
+        node_parameters, param_base_name_ + ".reconnect_minwait",
+        rclcpp::ParameterValue(1e-3 * config_->reconnect_minwait.count()),
+        ParameterDescriptor()
+            .set__description("minimum delay between connection attempts [s]")
+            .set__floating_point_range(
+                {rcl_interfaces::msg::FloatingPointRange().set__from_value(0).set__to_value(60)}));
+    declareParameter(
+        node_parameters, param_base_name_ + ".reconnect_maxwait",
+        rclcpp::ParameterValue(1e-3 * config_->reconnect_maxwait.count()),
+        ParameterDescriptor()
+            .set__description("maximum delay between connection attempts [s]")
+            .set__floating_point_range(
+                {rcl_interfaces::msg::FloatingPointRange().set__from_value(0).set__to_value(600)}));
 }
 
 void SubscriberPlugin::updateParameters()

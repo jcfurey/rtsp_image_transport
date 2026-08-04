@@ -54,8 +54,9 @@ protected:
     void subscribeImpl(rclcpp::Node* node, const std::string& base_topic, const Callback& callback,
                        rmw_qos_profile_t custom_qos, rclcpp::SubscriptionOptions options) override;
 #if CURRENT_IMAGE_TRANSPORT_VERSION >= FKIE_VERSION_TUPLE(6, 4, 0)
-    /* See subscriber_plugin.cpp: this entry point exists only to explain why the
-       transport does not work on these image_transport versions. */
+    /* Newer image_transport releases pass only their required node interfaces.
+       The implementation uses a short wall timer in place of a custom waitable
+       and a system clock when the node clock interface is unavailable. */
     void subscribeImpl(image_transport::RequiredInterfaces node_interfaces, const std::string& base_topic,
                        const Callback& callback, rclcpp::QoS custom_qos,
                        rclcpp::SubscriptionOptions options) override;
@@ -78,7 +79,7 @@ private:
     FrameDataPtr popFrame();
     rclcpp::Duration frameLag() const noexcept;
     void clearQueuedFrames();
-    void setupParameters(rclcpp::Node* node);
+    void setupParameters(const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& node_parameters);
     void updateParameters();
 
     struct Config;
@@ -90,11 +91,11 @@ private:
     rclcpp::node_interfaces::NodeTimersInterface::WeakPtr node_timers_;
     rclcpp::node_interfaces::NodeBaseInterface::WeakPtr node_base_;
     rclcpp::node_interfaces::NodeParametersInterface::WeakPtr node_param_;
-    rclcpp::Node::PostSetParametersCallbackHandle::SharedPtr param_cb_handle_;
+    rclcpp::node_interfaces::PostSetParametersCallbackHandle::SharedPtr param_cb_handle_;
     rclcpp::Clock::SharedPtr clock_;
     rclcpp::CallbackGroup::SharedPtr cooldown_cb_group_, scheduled_cb_group_;
     rclcpp::Duration old_lag_;
-    rclcpp::WallTimer<rclcpp::VoidCallbackType>::SharedPtr cooldown_timer_;
+    rclcpp::WallTimer<rclcpp::VoidCallbackType>::SharedPtr cooldown_timer_, frame_timer_;
     /* Guards cooldown_, cooldown_timer_, cooldown_cb_group_: reconnect
        bookkeeping is driven from ROS executor threads and from the Live555
        handler thread (session failed/timeout), which used to race. */
