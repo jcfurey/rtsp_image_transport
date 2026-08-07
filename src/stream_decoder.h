@@ -126,6 +126,7 @@ private:
     std::shared_ptr<AVFrame> frm_, sw_frm_, bgr_frm_;
     std::shared_ptr<SwsContext> sws_;
     std::deque<sensor_msgs::msg::Image::UniquePtr> frames_;
+    std::vector<FrameDataPtr> hardware_probe_packets_;
 };
 
 }  // namespace rtsp_image_transport

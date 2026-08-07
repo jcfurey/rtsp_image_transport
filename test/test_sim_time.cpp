@@ -224,19 +224,14 @@ TEST(Transport, PluginsAreActuallyDrivenByImageTransport)
         rclcpp::spin_some(fixture.node_);
         std::this_thread::sleep_for(20ms);
     }
-    const auto names = fixture.node_->list_parameters({}, 0).names;
-    auto has = [&names](const std::string& suffix)
-    {
-        for (const std::string& name : names)
-        {
-            if (name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
-                return true;
-        }
-        return false;
-    };
-    EXPECT_TRUE(has("rtsp.codec")) << "the publisher plugin never declared its parameters";
-    EXPECT_TRUE(has("rtsp.use_hw_decoder")) << "the subscriber plugin never declared its parameters";
-    EXPECT_TRUE(has("rtsp.timestamp_source")) << "the subscriber plugin never declared its parameters";
+    EXPECT_TRUE(fixture.node_->has_parameter("alive.image.rtsp.codec"))
+        << "the publisher plugin never declared its correctly scoped parameters";
+    EXPECT_TRUE(fixture.node_->has_parameter("alive.image.rtsp.use_hw_decoder"))
+        << "the subscriber plugin never declared its correctly scoped parameters";
+    EXPECT_TRUE(fixture.node_->has_parameter("alive.image.rtsp.timestamp_source"))
+        << "the subscriber plugin never declared its correctly scoped parameters";
+    EXPECT_FALSE(fixture.node_->has_parameter("live.image.rtsp.use_hw_decoder"))
+        << "the relative topic lost its first character while constructing parameter names";
 }
 
 TEST(Transport, SubscriberQosMatchesPublisher)
