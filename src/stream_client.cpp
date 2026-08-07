@@ -23,6 +23,7 @@
 #include "frame_extractor.h"
 #include "streaming_error.h"
 
+#include <GroupsockHelper.hh>
 #include <rclcpp/logging.hpp>
 
 #include <format>
@@ -70,6 +71,7 @@ private:
     static void continueAfterTEARDOWN(RTSPClient* client, int resultCode, char* resultMsg) noexcept;
     static bool collectVideoSubsessions(Live555Client* c, const std::shared_ptr<StreamClient>& sc) noexcept;
     static void setupNextSubsession(Live555Client* c) noexcept;
+    static void enlargeRtpBuffer(Live555Client* c, const std::shared_ptr<StreamClient>& sc) noexcept;
     static void subsessionAfterPlaying(void* obj) noexcept;
     static void checkTimeout(void* obj) noexcept;
 
@@ -352,6 +354,31 @@ void Live555Client::continueAfterPLAY(RTSPClient* client, int resultCode, char* 
     }
 }
 
+/* Ask the kernel for a bigger receive buffer on the RTP socket. Only meaningful
+   between initiate(), which creates the socket, and SETUP. */
+void Live555Client::enlargeRtpBuffer(Live555Client* c, const std::shared_ptr<StreamClient>& sc) noexcept
+{
+    const unsigned wanted = sc->rtpBufferSize();
+    if (wanted == 0)
+        return;
+    RTPSource* source = c->subsession_->rtpSource();
+    Groupsock* gs = source ? source->RTPgs() : nullptr;
+    if (!gs)
+        return;
+    const unsigned actual = increaseReceiveBufferTo(c->envir(), gs->socketNum(), wanted);
+    if (actual < wanted)
+    {
+        RCLCPP_WARN(sc->logger(),
+                    "[%s] RTP receive buffer is %u bytes, asked for %u; raise net.core.rmem_max to stop the "
+                    "kernel dropping packets under load",
+                    sc->topicName().c_str(), actual, wanted);
+    }
+    else
+    {
+        RCLCPP_DEBUG(sc->logger(), "[%s] RTP receive buffer set to %u bytes", sc->topicName().c_str(), actual);
+    }
+}
+
 void Live555Client::setupNextSubsession(Live555Client* c) noexcept
 {
     UsageEnvironment& env = c->envir();
@@ -366,12 +393,19 @@ void Live555Client::setupNextSubsession(Live555Client* c) noexcept
         const std::size_t index = c->try_order_[c->try_pos_++];
         c->subsession_ = c->candidates_[index];
         VideoCodec codec = fromRTSPCodecName(c->subsession_->codecName());
+        const bool over_tcp = sc->rtpOverTcp();
         if (c->subsession_->initiate())
         {
-            RCLCPP_INFO(sc->logger(), "[%s] selected RTSP video subsession %zu with %s video",
-                        sc->topicName().c_str(), index, videoCodecName(codec).c_str());
+            RCLCPP_INFO(sc->logger(), "[%s] selected RTSP video subsession %zu with %s video, RTP over %s",
+                        sc->topicName().c_str(), index, videoCodecName(codec).c_str(), over_tcp ? "TCP" : "UDP");
+            if (!over_tcp)
+                enlargeRtpBuffer(c, sc);
             RCLCPP_DEBUG(sc->logger(), "[%s] sending SETUP command for media subsession", sc->topicName().c_str());
-            c->sendSetupCommand(*c->subsession_, continueAfterSETUP);
+            /* Interleave RTP over the RTSP connection when asked. UDP loses
+               whole packets under buffer pressure, and a lost slice leaves its
+               macroblocks unwritten, which surfaces as green bands in the
+               decoded image. */
+            c->sendSetupCommand(*c->subsession_, continueAfterSETUP, False, over_tcp ? True : False);
             return;
         }
         RCLCPP_WARN(sc->logger(), "[%s] failed to initiate RTSP video subsession %zu: %s", sc->topicName().c_str(),
@@ -464,7 +498,8 @@ std::shared_ptr<StreamClient> StreamClient::create(const std::string& topic_name
 
 StreamClient::StreamClient(const std::string& topic_name, const std::string& url, const rclcpp::Logger& logger) noexcept
     : topic_name_(topic_name), url_(url), logger_(logger), codec_(VideoCodec::Unknown), video_subsession_(0),
-      retried_on_454_error_(false), timeout_(0), loop_(EventLoop::create()), client_(nullptr)
+      rtp_over_tcp_(true), rtp_buffer_size_(DEFAULT_RTP_BUFFER_SIZE), retried_on_454_error_(false), timeout_(0),
+      loop_(EventLoop::create()), client_(nullptr)
 {
 }
 
@@ -505,6 +540,30 @@ void StreamClient::setVideoSubsession(std::size_t index) noexcept
 {
     std::lock_guard<std::mutex> lock{client_mutex_};
     video_subsession_ = index;
+}
+
+bool StreamClient::rtpOverTcp() const noexcept
+{
+    std::lock_guard<std::mutex> lock{client_mutex_};
+    return rtp_over_tcp_;
+}
+
+void StreamClient::setRtpOverTcp(bool enable) noexcept
+{
+    std::lock_guard<std::mutex> lock{client_mutex_};
+    rtp_over_tcp_ = enable;
+}
+
+unsigned StreamClient::rtpBufferSize() const noexcept
+{
+    std::lock_guard<std::mutex> lock{client_mutex_};
+    return rtp_buffer_size_;
+}
+
+void StreamClient::setRtpBufferSize(unsigned bytes) noexcept
+{
+    std::lock_guard<std::mutex> lock{client_mutex_};
+    rtp_buffer_size_ = bytes;
 }
 
 std::string StreamClient::url() const noexcept

@@ -98,6 +98,22 @@ void free_buffer(AVBufferRef* buffer)
 void keep_buffer(void*, unsigned char*) {}
 #endif
 
+/* How many frames to accept without a key frame before giving up on finding one
+   and publishing anyway. Four seconds of 30 Hz video: longer than any sane GOP,
+   short enough that a stream which never flags key frames still shows something. */
+constexpr std::size_t KEYFRAME_WAIT_LIMIT = 120;
+
+/* AV_FRAME_FLAG_KEY replaced the deprecated AVFrame::key_frame field in FFmpeg
+   6.1 (libavutil 58.29.100); this package still builds against older releases. */
+bool isKeyFrame(const AVFrame* frame) noexcept
+{
+#ifdef AV_FRAME_FLAG_KEY
+    return (frame->flags & AV_FRAME_FLAG_KEY) != 0;
+#else
+    return frame->key_frame != 0;
+#endif
+}
+
 /* Colour space conversion is the most expensive step of the decoding pipeline
    for large frames, so let libswscale spread it over a few threads if the
    installed version supports it. Sets `threaded` when the returned context
@@ -282,8 +298,8 @@ std::vector<std::string> StreamDecoder::availableHwDevices(const std::string& hw
 
 StreamDecoder::StreamDecoder(VideoCodec codec, const Options& options, const rclcpp::Logger& logger)
     : logger_(logger), codec_(codec), options_(options), initialized_(false), sws_threaded_(false), hardware_(false),
-      width_(0), height_(0), last_pixel_format_(AV_PIX_FMT_NONE), hw_pixel_format_(AV_PIX_FMT_NONE),
-      candidate_index_(0)
+      awaiting_keyframe_(true), frames_before_keyframe_(0), corrupt_frames_(0), width_(0), height_(0),
+      last_pixel_format_(AV_PIX_FMT_NONE), hw_pixel_format_(AV_PIX_FMT_NONE), candidate_index_(0)
 {
     candidates_ = buildCandidates();
     if (candidates_.empty())
@@ -489,8 +505,19 @@ void StreamDecoder::openCandidate(const DecoderCandidate& candidate)
     if (codec_ == VideoCodec::H264 || codec_ == VideoCodec::H265)
     {
         ctx_->flags2 |= AV_CODEC_FLAG2_CHUNKS;
-        // The error concealment spams the log with spurious errors
-        ctx_->error_concealment = 0;
+        /* AV_CODEC_FLAG2_CHUNKS lets the decoder emit a picture assembled from
+           whatever slices arrived rather than waiting for a complete access
+           unit, so a lost RTP packet leaves its macroblocks at the value the
+           buffer was allocated with. An all-zero YUV block converts to bright
+           green, which is where the green bands in a lossy stream come from.
+
+           Error concealment has to stay on for two reasons: it repairs those
+           macroblocks from the reference frame, and ff_er_frame_end() is what
+           records the damage in decode_error_flags. With concealment off it
+           returns early, so a partially decoded frame is not flagged at all and
+           there is nothing for discardFrame() below to detect. The extra log
+           noise is already demoted to warnings by log_level_offset above. */
+        ctx_->error_concealment = FF_EC_GUESS_MVS | FF_EC_DEBLOCK;
     }
     if (options_.low_latency)
     {
@@ -561,6 +588,10 @@ bool StreamDecoder::fallBackToNextCandidate(const std::string& reason)
 void StreamDecoder::resetWorkingBuffers()
 {
     initialized_ = false;
+    /* A different decoder starts with no reference frames of its own, so the
+       wait for a key frame starts over with it. */
+    awaiting_keyframe_ = true;
+    frames_before_keyframe_ = 0;
     sws_.reset();
     frames_.clear();
     width_ = 0;
@@ -626,6 +657,11 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
     std::size_t count = 0;
     while ((result = avcodec_receive_frame(ctx_.get(), frm_.get())) == 0)
     {
+        if (discardFrame(frm_.get()))
+        {
+            av_frame_unref(frm_.get());
+            continue;
+        }
         AVFrame* source;
         try
         {
@@ -695,6 +731,47 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
         }
     }
     return count;
+}
+
+/* Frames that must not reach the subscriber, because the pixels they carry were
+   never decoded. Anything libavcodec did not write keeps the value its buffer
+   was allocated with, and an all-zero YUV macroblock converts to flat green
+   (BGR 0,135,0), so these show up as green bands rather than as missing data. */
+bool StreamDecoder::discardFrame(const AVFrame* frame) noexcept
+{
+    /* Connecting to a live stream lands somewhere inside a GOP, so the first
+       pictures reference data that was never received. Bounded rather than
+       open-ended: a stream whose key frames are never flagged would otherwise
+       never produce an image at all. */
+    if (awaiting_keyframe_)
+    {
+        if (isKeyFrame(frame))
+        {
+            awaiting_keyframe_ = false;
+        }
+        else if (++frames_before_keyframe_ < KEYFRAME_WAIT_LIMIT)
+        {
+            return true;
+        }
+        else
+        {
+            RCLCPP_WARN(logger_, "no key frame among the first %zu decoded frames; publishing without waiting",
+                        frames_before_keyframe_);
+            awaiting_keyframe_ = false;
+        }
+    }
+    if (!options_.drop_corrupt_frames)
+        return false;
+    if ((frame->flags & AV_FRAME_FLAG_CORRUPT) == 0 && frame->decode_error_flags == 0)
+        return false;
+    /* Loud on the first one, then occasional: a stream that loses packets
+       steadily would otherwise fill the log. */
+    if (++corrupt_frames_ == 1 || corrupt_frames_ % 100 == 0)
+    {
+        RCLCPP_WARN(logger_, "dropped %zu incompletely decoded frame(s); the stream is losing data",
+                    corrupt_frames_);
+    }
+    return true;
 }
 
 /* Frames decoded on the GPU live in device memory; the ROS image message needs

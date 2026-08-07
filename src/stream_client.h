@@ -44,6 +44,13 @@ class Live555Client;
 class FrameExtractor;
 class StreamingError;
 
+/* The kernel default receive buffer (net.core.rmem_default, typically 208 kB)
+   holds well under a frame of HD video, so a burst of RTP packets for one
+   access unit can overrun it before the Live555 loop drains the socket. Every
+   datagram lost that way costs a slice, and the macroblocks it carried stay
+   unwritten. 2 MB covers a 4K intra frame with room to spare. */
+inline constexpr unsigned DEFAULT_RTP_BUFFER_SIZE = 2u * 1024u * 1024u;
+
 class StreamClient : public std::enable_shared_from_this<StreamClient>
 {
     friend class Live555Client;
@@ -73,6 +80,14 @@ public:
     void connect();
     void disconnect();
     void setVideoSubsession(std::size_t index) noexcept;
+    /* Carry RTP interleaved over the established RTSP TCP connection instead of
+       over its own UDP sockets. Takes effect on the next connect(). */
+    void setRtpOverTcp(bool enable) noexcept;
+    bool rtpOverTcp() const noexcept;
+    /* Requested SO_RCVBUF for the RTP socket, in bytes. Ignored when RTP runs
+       over TCP, which has no socket of its own. 0 keeps the system default. */
+    void setRtpBufferSize(unsigned bytes) noexcept;
+    unsigned rtpBufferSize() const noexcept;
     void setSessionTimeout(const std::chrono::milliseconds& timeout) noexcept;
     void setSubsessionStartedHandler(SubsessionStartedHandler handler) noexcept;
     void setSubsessionFinishedHandler(SubsessionFinishedHandler handler) noexcept;
@@ -105,6 +120,8 @@ private:
     /* Written from the Live555 event loop thread, read by the plugin thread */
     std::atomic<VideoCodec> codec_;
     std::size_t video_subsession_;
+    bool rtp_over_tcp_;
+    unsigned rtp_buffer_size_;
     bool retried_on_454_error_;
     std::chrono::milliseconds timeout_;
     mutable std::mutex client_mutex_;

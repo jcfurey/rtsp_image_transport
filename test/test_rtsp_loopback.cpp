@@ -368,6 +368,105 @@ TEST(RtspLoopback, H265SessionDecodesBackToImages)
     EXPECT_GE(images, 3u) << "received H.265 stream did not decode into images";
 }
 
+TEST(RtspLoopback, RtpIsInterleavedOverTcpByDefault)
+{
+    /* UDP loses whole datagrams when the receive buffer overruns, and a lost
+       slice leaves its macroblocks unwritten — green bands in the decoded
+       image. Interleaving RTP over the RTSP connection removes the failure
+       mode outright, so it is what a fresh client asks for. */
+    std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", "rtsp://localhost:8554/test");
+    EXPECT_TRUE(client->rtpOverTcp());
+    EXPECT_EQ(client->rtpBufferSize(), DEFAULT_RTP_BUFFER_SIZE);
+}
+
+TEST(RtspLoopback, TcpInterleavedSessionDeliversVideo)
+{
+    if (!haveEncoderFor(VideoCodec::H264))
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    LoopbackServer server(VideoCodec::H264, 320, 240);
+
+    ClientObserver observer;
+    std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", server.url());
+    client->setRtpOverTcp(true);
+    observer.attach(client);
+    ASSERT_NO_THROW(client->connect());
+
+    ASSERT_TRUE(observer.waitFor([&] { return observer.started_ || observer.failed_; }))
+        << "session never started";
+    ASSERT_FALSE(observer.failed_) << "session failed: " << observer.failure_message_ << " ("
+                                   << observer.failure_code_ << ")";
+    ASSERT_TRUE(observer.waitForNals(30)) << "no video data arrived over interleaved TCP";
+    EXPECT_GT(observer.total_bytes_, 0u);
+    client->disconnect();
+}
+
+TEST(RtspLoopback, UdpSessionStillDeliversVideo)
+{
+    /* The UDP path stays supported for servers that cannot interleave. */
+    if (!haveEncoderFor(VideoCodec::H264))
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    LoopbackServer server(VideoCodec::H264, 320, 240);
+
+    ClientObserver observer;
+    std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", server.url());
+    client->setRtpOverTcp(false);
+    observer.attach(client);
+    ASSERT_NO_THROW(client->connect());
+
+    ASSERT_TRUE(observer.waitFor([&] { return observer.started_ || observer.failed_; }))
+        << "session never started";
+    ASSERT_FALSE(observer.failed_) << "session failed: " << observer.failure_message_ << " ("
+                                   << observer.failure_code_ << ")";
+    ASSERT_TRUE(observer.waitForNals(30)) << "no video data arrived over UDP";
+    client->disconnect();
+}
+
+TEST(RtspLoopback, TcpInterleavedStreamDecodesBackToImages)
+{
+    if (!haveEncoderFor(VideoCodec::H264))
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    const unsigned width = 320, height = 240;
+    LoopbackServer server(VideoCodec::H264, width, height);
+
+    ClientObserver observer;
+    std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", server.url());
+    client->setRtpOverTcp(true);
+    observer.attach(client);
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_TRUE(observer.waitForNals(60)) << "not enough video data arrived";
+
+    std::vector<FrameDataPtr> nals;
+    {
+        std::lock_guard<std::mutex> lock{observer.mutex_};
+        nals = observer.nals_;
+    }
+    client->disconnect();
+
+    StreamDecoder::Options options;
+    options.use_hw_decoder = false;
+    options.hw_device = "none";
+    StreamDecoder decoder(VideoCodec::H264, options);
+    std::size_t images = 0;
+    for (const FrameDataPtr& nal : nals)
+    {
+        try
+        {
+            decoder.decodeVideo(nal);
+        }
+        catch (const DecodingError&)
+        {
+            continue;
+        }
+        while (sensor_msgs::msg::Image::UniquePtr img = decoder.nextFrame())
+        {
+            EXPECT_EQ(img->width, width);
+            EXPECT_EQ(img->height, height);
+            images++;
+        }
+    }
+    EXPECT_GE(images, 3u) << "interleaved stream did not decode into images";
+}
+
 TEST(RtspLoopback, ClientReportsAvailableVideoSubsessions)
 {
     if (!haveEncoderFor(VideoCodec::H264))

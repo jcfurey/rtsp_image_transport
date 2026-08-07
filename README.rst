@@ -162,6 +162,36 @@ frames at 1 s, and everything at 2 s, so the pipeline catches up instead of
 drifting further behind.
 
 
+RTP transport and packet loss
+=============================
+
+The subscriber interleaves RTP over the RTSP TCP connection by default
+(``rtp_over_tcp``, on). The alternative — RTP on its own UDP sockets — drops
+whole datagrams whenever the socket receive buffer overruns, and a lost datagram
+costs a slice. With ``AV_CODEC_FLAG2_CHUNKS`` set, the decoder emits the picture
+anyway, built from the slices that did arrive; the macroblocks the missing slice
+covered are never written. An all-zero YUV block converts to BGR (0, 135, 0), so
+the damage shows up as flat green bands across part of the image.
+
+Set ``-p in.rtsp.rtp_over_tcp:=false`` for a server that cannot interleave.
+On UDP the subscriber asks for a 2 MB receive buffer on the RTP socket
+(``rtp_buffer_size``), since the kernel default holds well under one HD frame.
+The kernel silently caps the request at ``net.core.rmem_max``, and the log says
+so when it does::
+
+    sysctl -w net.core.rmem_max=4194304
+
+Residual loss is concealed rather than published as holes: the decoder
+reconstructs the missing macroblocks from the reference frame. Set
+``-p in.rtsp.drop_corrupt_frames:=true`` to discard damaged pictures instead,
+which trades artefacts for stutter — useful for consumers that would rather see
+nothing than see wrong pixels.
+
+Frames decoded before the first key frame of a session are never published.
+Connecting to a live stream lands mid-GOP, so those pictures reference data that
+was never received and would otherwise be the first thing on screen.
+
+
 Quality of Service
 ==================
 

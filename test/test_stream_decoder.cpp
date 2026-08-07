@@ -200,6 +200,177 @@ TEST(StreamDecoder, SkipFrameLevelsReduceOutput)
     EXPECT_EQ(none, 0u) << "discard-everything still produced frames";
 }
 
+namespace
+{
+
+/* decodeAll(), but a damaged stream is allowed to make decodeVideo() throw. */
+std::size_t decodeSurvivingImages(StreamDecoder& decoder, const std::vector<std::vector<std::uint8_t>>& packets)
+{
+    std::size_t images = 0;
+    for (std::size_t i = 0; i < packets.size(); ++i)
+    {
+        rclcpp::Time stamp(BASE_STAMP_NS + static_cast<std::int64_t>(i) * FRAME_INTERVAL_NS);
+        FrameDataPtr data = std::make_shared<FrameData>(packets[i].data(), packets[i].size(), stamp);
+        try
+        {
+            decoder.decodeVideo(data);
+        }
+        catch (const DecodingError&)
+        {
+            /* A damaged packet may be rejected outright, but frames decoded
+               before it still have to be collected. */
+        }
+        while (decoder.nextFrame())
+            images++;
+    }
+    return images;
+}
+
+/* Byte offsets of every Annex B start code in an elementary stream packet. A
+   four byte code is found at its trailing three bytes, which leaves one zero on
+   the end of the previous unit — harmless trailing padding to a decoder. */
+std::vector<std::size_t> nalOffsets(const std::vector<std::uint8_t>& packet)
+{
+    std::vector<std::size_t> offsets;
+    for (std::size_t i = 0; i + 2 < packet.size();)
+    {
+        if (packet[i] == 0 && packet[i + 1] == 0 && packet[i + 2] == 1)
+        {
+            offsets.push_back(i);
+            i += 3;
+        }
+        else
+        {
+            ++i;
+        }
+    }
+    return offsets;
+}
+
+/* Rebuilds a packet with the nth coded slice removed, which is what losing the
+   RTP packets carrying that slice looks like: the surviving slices decode, and
+   the macroblocks the missing one covered are never written at all. Parameter
+   sets and SEI are left alone, as they would be on a real stream. */
+std::vector<std::uint8_t> withoutSlice(const std::vector<std::uint8_t>& packet, std::size_t slice_to_drop)
+{
+    const std::vector<std::size_t> offsets = nalOffsets(packet);
+    std::vector<std::uint8_t> out;
+    std::size_t slice_index = 0;
+    for (std::size_t k = 0; k < offsets.size(); ++k)
+    {
+        const std::size_t begin = offsets[k];
+        const std::size_t end = k + 1 < offsets.size() ? offsets[k + 1] : packet.size();
+        const std::uint8_t nal_type = begin + 3 < packet.size() ? (packet[begin + 3] & 0x1f) : 0;
+        const bool is_slice = nal_type == 1 || nal_type == 5;
+        if (is_slice && slice_index++ == slice_to_drop)
+            continue;
+        out.insert(out.end(), packet.begin() + begin, packet.begin() + end);
+    }
+    return out;
+}
+
+std::size_t countSlices(const std::vector<std::uint8_t>& packet)
+{
+    std::size_t slices = 0;
+    for (std::size_t begin : nalOffsets(packet))
+    {
+        const std::uint8_t nal_type = begin + 3 < packet.size() ? (packet[begin + 3] & 0x1f) : 0;
+        if (nal_type == 1 || nal_type == 5)
+            slices++;
+    }
+    return slices;
+}
+
+/* A stream that lost one slice out of every inter coded picture. Key frames are
+   left whole so the sequence stays anchored, exactly as it would be on a link
+   that drops the occasional RTP packet. */
+std::vector<std::vector<std::uint8_t>> withSliceLoss(const std::vector<std::vector<std::uint8_t>>& packets,
+                                                     std::size_t gop_size, std::size_t slice_to_drop)
+{
+    std::vector<std::vector<std::uint8_t>> lossy = packets;
+    for (std::size_t i = 0; i < lossy.size(); ++i)
+    {
+        if (i % gop_size != 0)
+            lossy[i] = withoutSlice(lossy[i], slice_to_drop);
+    }
+    return lossy;
+}
+
+}  // namespace
+
+/* The failure this whole path exists for: a multi-slice picture that lost one of
+   its slices, which is what a dropped RTP packet leaves behind. The macroblocks
+   the missing slice covered are never written, and an all-zero YUV block
+   converts to flat green — the green bands seen on a lossy camera link. */
+constexpr std::size_t SLICE_LOSS_GOP = 10;
+constexpr std::size_t SLICE_LOSS_INDEX = 1;
+
+TEST(StreamDecoder, ConcealsSliceLossInsteadOfPublishingHoles)
+{
+    auto packets = encodeTestStream(VideoCodec::H264, 320, 240, 30, 4);
+    if (packets.size() < 20 || countSlices(packets[1]) < 3)
+        GTEST_SKIP() << "this FFmpeg build did not produce a multi-slice H.264 stream";
+
+    StreamDecoder intact(VideoCodec::H264, softwareOptions());
+    const std::size_t baseline = decodeSurvivingImages(intact, packets);
+    ASSERT_GT(baseline, 0u);
+
+    StreamDecoder decoder(VideoCodec::H264, softwareOptions());
+    const std::size_t concealed =
+        decodeSurvivingImages(decoder, withSliceLoss(packets, SLICE_LOSS_GOP, SLICE_LOSS_INDEX));
+
+    /* Concealment reconstructs the missing macroblocks from the reference frame,
+       so the video keeps flowing rather than stalling on every damaged picture.
+       Measured at the full 30 of 30 on FFmpeg 7.1; asserted with slack so a
+       different libavcodec's heuristics cannot fail the run. */
+    EXPECT_GE(concealed, baseline * 3 / 4)
+        << "slice loss cost far more frames than concealment should: " << concealed << " of " << baseline;
+}
+
+TEST(StreamDecoder, DropsIncompletelyDecodedFramesWhenAsked)
+{
+    auto packets = encodeTestStream(VideoCodec::H264, 320, 240, 30, 4);
+    if (packets.size() < 20 || countSlices(packets[1]) < 3)
+        GTEST_SKIP() << "this FFmpeg build did not produce a multi-slice H.264 stream";
+    const auto lossy = withSliceLoss(packets, SLICE_LOSS_GOP, SLICE_LOSS_INDEX);
+
+    StreamDecoder concealing(VideoCodec::H264, softwareOptions());
+    const std::size_t concealed = decodeSurvivingImages(concealing, lossy);
+
+    StreamDecoder::Options options = softwareOptions();
+    options.drop_corrupt_frames = true;
+    StreamDecoder dropping(VideoCodec::H264, options);
+    const std::size_t kept = decodeSurvivingImages(dropping, lossy);
+
+    /* Every picture that lost a slice has to be recognisable as damaged. If this
+       fails, error concealment has most likely been turned off again: it is
+       ff_er_frame_end() that records the damage in decode_error_flags, and with
+       concealment disabled it returns early and flags nothing. */
+    EXPECT_LT(kept, concealed / 2) << "damaged frames were not flagged: kept " << kept << " of " << concealed;
+    /* The undamaged key frames still have to get through. */
+    EXPECT_GT(kept, 0u) << "the guard dropped even the intact key frames";
+}
+
+TEST(StreamDecoder, DropCorruptFramesKeepsACleanStreamIntact)
+{
+    /* The guard must only fire on real damage: an undamaged stream has to decode
+       identically whether or not it is armed. */
+    auto packets = encodeTestStream(VideoCodec::H264, 320, 240, 20);
+    if (packets.size() < 10)
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+
+    StreamDecoder plain(VideoCodec::H264, softwareOptions());
+    const std::size_t baseline = decodeAll(plain, packets).images.size();
+
+    StreamDecoder::Options options = softwareOptions();
+    options.drop_corrupt_frames = true;
+    StreamDecoder guarded(VideoCodec::H264, options);
+    const std::size_t guarded_count = decodeAll(guarded, packets).images.size();
+
+    EXPECT_GT(baseline, 0u);
+    EXPECT_EQ(guarded_count, baseline) << "the corrupt-frame guard dropped frames from a clean stream";
+}
+
 TEST(StreamDecoder, SurvivesGarbageInput)
 {
     StreamDecoder decoder(VideoCodec::H264, softwareOptions());
