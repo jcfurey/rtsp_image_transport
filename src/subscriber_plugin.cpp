@@ -24,9 +24,12 @@
 #include "stream_client.h"
 #include "stream_decoder.h"
 #include "streaming_error.h"
+#include "topic_parameter.h"
 
+#include <rclcpp/detail/add_guard_condition_to_rcl_wait_set.hpp>
 #include <rclcpp/waitable.hpp>
 
+#include <atomic>
 #include <functional>
 
 namespace rtsp_image_transport
@@ -76,12 +79,14 @@ public:
 private:
     Signature func_;
     rclcpp::GuardCondition cond_;
+    std::atomic<bool> pending_{false};
 };
 
 ScheduledCB::ScheduledCB(const Signature& func) : func_(func) {}
 
 void ScheduledCB::trigger()
 {
+    pending_.store(true);
     cond_.trigger();
 }
 
@@ -106,17 +111,22 @@ void ScheduledCB::clear_on_ready_callback() {}
 
 void ScheduledCB::add_to_wait_set(rcl_wait_set_t& wait_set)
 {
-    cond_.add_to_wait_set(wait_set);
+    /* Waitables are collected into the executor's raw rcl wait set. Using
+       GuardCondition::add_to_wait_set() instead pins the condition to one
+       particular wait-set object, which breaks callers such as spin_some()
+       that legitimately construct a fresh executor for every call. */
+    rclcpp::detail::add_guard_condition_to_rcl_wait_set(wait_set, cond_);
 }
 
 bool ScheduledCB::is_ready(const rcl_wait_set_t&)
 {
-    return true;
+    return pending_.load();
 }
 
 void ScheduledCB::execute(const std::shared_ptr<void>&)
 {
-    func_();
+    if (pending_.exchange(false))
+        func_();
 }
 
 #if CURRENT_RCLCPP_VERSION >= FKIE_VERSION_TUPLE(29, 4, 0)
@@ -176,9 +186,11 @@ SubscriberPlugin::SubscriberPlugin()
 void SubscriberPlugin::shutdown()
 {
     frame_timer_.reset();
-    scheduled_cb_group_.reset();
-    scheduled_cb_.reset();
     notify_frame_ = {};
+    if (auto waitables = node_waitables_.lock(); waitables && scheduled_cb_)
+        waitables->remove_waitable(scheduled_cb_, scheduled_cb_group_);
+    scheduled_cb_.reset();
+    scheduled_cb_group_.reset();
     {
         std::lock_guard<std::mutex> lock{cooldown_mutex_};
         cooldown_cb_group_.reset();
@@ -244,20 +256,14 @@ void SubscriberPlugin::subscribeImpl(rclcpp::Node* node, const std::string& base
     /* Cached so the hot receive path does not need a dynamic_cast per NAL unit */
     notify_frame_ = [scheduled_cb]() { scheduled_cb->trigger(); };
     scheduled_cb_group_ = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    node_waitables_ = node->get_node_waitables_interface();
     node->get_node_waitables_interface()->add_waitable(scheduled_cb_, scheduled_cb_group_);
     topic_name_ = base_topic;
     node_base_ = rclcpp::node_interfaces::get_node_base_interface(node);
     node_timers_ = rclcpp::node_interfaces::get_node_timers_interface(node);
     node_param_ = rclcpp::node_interfaces::get_node_parameters_interface(node);
     failed_ = false;
-    std::size_t len = node->get_effective_namespace().length();
-    param_base_name_ = base_topic.substr(len);
-    std::replace(param_base_name_.begin(), param_base_name_.end(), '/', '.');
-    if (!param_base_name_.empty() && param_base_name_[0] == '.')
-        param_base_name_ = param_base_name_.substr(1);
-    if (!param_base_name_.empty())
-        param_base_name_.push_back('.');
-    param_base_name_ += getTransportName();
+    param_base_name_ = topicParameterBase(*node, base_topic, getTransportName());
     setupParameters(node_param_.lock());
     param_cb_handle_ = node_param_.lock()->add_post_set_parameters_callback(
         [this](const std::vector<rclcpp::Parameter>&) { this->updateParameters(); });
@@ -291,14 +297,7 @@ void SubscriberPlugin::subscribeImpl(image_transport::RequiredInterfaces node_in
     node_param_ = node_parameters;
     failed_ = false;
 
-    std::size_t len = std::string(node_base->get_namespace()).length();
-    param_base_name_ = base_topic.substr(len);
-    std::replace(param_base_name_.begin(), param_base_name_.end(), '/', '.');
-    if (!param_base_name_.empty() && param_base_name_[0] == '.')
-        param_base_name_ = param_base_name_.substr(1);
-    if (!param_base_name_.empty())
-        param_base_name_.push_back('.');
-    param_base_name_ += getTransportName();
+    param_base_name_ = topicParameterBase(node_base->get_namespace(), base_topic, getTransportName());
 
     setupParameters(node_parameters);
     param_cb_handle_ = node_parameters->add_post_set_parameters_callback(

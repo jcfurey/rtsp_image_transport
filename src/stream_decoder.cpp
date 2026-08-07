@@ -566,6 +566,7 @@ void StreamDecoder::resetWorkingBuffers()
     width_ = 0;
     height_ = 0;
     last_pixel_format_ = AV_PIX_FMT_NONE;
+    hardware_probe_packets_.clear();
 }
 
 void StreamDecoder::setDecodeFrames(DecodeFrames which) noexcept
@@ -589,6 +590,14 @@ void StreamDecoder::setDecodeFrames(DecodeFrames which) noexcept
 
 std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
 {
+    /* Some hardware decoders open successfully and accept every packet but
+       never return a frame. Retain the beginning of the stream while a hardware
+       candidate proves itself so that a software fallback can replay the SPS,
+       PPS and first key frame instead of waiting for another GOP. */
+    constexpr std::size_t hardware_probe_limit = 4;
+    if (hardware_)
+        hardware_probe_packets_.push_back(data);
+
     if (!initialized_)
     {
         pkt_.reset(av_packet_alloc(), free_packet);
@@ -668,6 +677,22 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
         if (hardware_ && fallBackToNextCandidate(message))
             return count;
         throw DecodingError(message);
+    }
+    if (count > 0)
+    {
+        hardware_probe_packets_.clear();
+    }
+    else if (hardware_ && hardware_probe_packets_.size() >= hardware_probe_limit)
+    {
+        std::vector<FrameDataPtr> replay_packets = std::move(hardware_probe_packets_);
+        hardware_probe_packets_.clear();
+        if (fallBackToNextCandidate("hardware decoder produced no frames during startup"))
+        {
+            std::size_t replayed = 0;
+            for (const FrameDataPtr& packet : replay_packets)
+                replayed += decodeVideo(packet);
+            return replayed;
+        }
     }
     return count;
 }

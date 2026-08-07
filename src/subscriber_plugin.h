@@ -91,6 +91,7 @@ private:
     rclcpp::node_interfaces::NodeTimersInterface::WeakPtr node_timers_;
     rclcpp::node_interfaces::NodeBaseInterface::WeakPtr node_base_;
     rclcpp::node_interfaces::NodeParametersInterface::WeakPtr node_param_;
+    rclcpp::node_interfaces::NodeWaitablesInterface::WeakPtr node_waitables_;
     rclcpp::node_interfaces::PostSetParametersCallbackHandle::SharedPtr param_cb_handle_;
     rclcpp::Clock::SharedPtr clock_;
     rclcpp::CallbackGroup::SharedPtr cooldown_cb_group_, scheduled_cb_group_;

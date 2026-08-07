@@ -23,6 +23,7 @@
 #include "init.h"
 #include "stream_encoder.h"
 #include "stream_server.h"
+#include "topic_parameter.h"
 #include "video_codec.h"
 
 #include <rclcpp/clock.hpp>
@@ -122,14 +123,7 @@ void PublisherPlugin::advertiseImpl(rclcpp::Node* node, const std::string& base_
     logger_ = node->get_logger();
     topic_name_ = base_topic;
     node_param_ = rclcpp::node_interfaces::get_node_parameters_interface(node);
-    std::size_t len = node->get_effective_namespace().length();
-    param_base_name_ = base_topic.substr(len);
-    std::replace(param_base_name_.begin(), param_base_name_.end(), '/', '.');
-    if (!param_base_name_.empty() && param_base_name_[0] == '.')
-        param_base_name_ = param_base_name_.substr(1);
-    if (!param_base_name_.empty())
-        param_base_name_.push_back('.');
-    param_base_name_ += getTransportName();
+    param_base_name_ = topicParameterBase(*node, base_topic, getTransportName());
     setupParameters(node);
     param_cb_handle_ = node->add_post_set_parameters_callback([this](const std::vector<rclcpp::Parameter>&)
                                                               { this->updateParameters(); });
