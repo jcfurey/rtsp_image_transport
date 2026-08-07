@@ -105,9 +105,14 @@ inline const char* testEncoderFor(VideoCodec codec)
 
 /* Encodes a short synthetic clip and returns the elementary stream packets,
    which is what the RTSP client would hand to the decoder. Empty if this
-   FFmpeg build has no encoder for the codec. */
+   FFmpeg build has no encoder for the codec.
+
+   `slices` splits every picture into that many independently decodable slices,
+   which is what makes it possible to lose part of a frame rather than all of
+   it: an RTSP source configured this way puts each slice in its own NAL unit,
+   and losing one leaves a band of macroblocks that the decoder never writes. */
 inline std::vector<std::vector<std::uint8_t>> encodeTestStream(VideoCodec codec, int width, int height,
-                                                               int frame_count)
+                                                               int frame_count, int slices = 0)
 {
     std::vector<std::vector<std::uint8_t>> packets;
     const char* encoder_name = testEncoderFor(codec);
@@ -125,6 +130,8 @@ inline std::vector<std::vector<std::uint8_t>> encodeTestStream(VideoCodec codec,
     ctx->gop_size = 10;
     ctx->max_b_frames = 0;
     ctx->bit_rate = 4000000;
+    if (slices > 0)
+        ctx->slices = slices;
     if (std::string(encoder_name).find("x26") != std::string::npos)
     {
         av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);

@@ -83,6 +83,12 @@ public:
         std::string hw_device_path;
         /* Forces a specific FFmpeg decoder (e.g. "hevc_cuvid") when not empty */
         std::string decoder;
+        /* Drop frames the decoder could not fully reconstruct instead of
+           publishing the concealed result. Off by default: concealment repairs
+           the damage from the reference frame, which keeps the video smooth,
+           whereas dropping trades artefacts for stutter. Turn it on for
+           consumers that would rather see nothing than see wrong pixels. */
+        bool drop_corrupt_frames = false;
     };
 
     StreamDecoder(VideoCodec codec, const Options& options,
@@ -109,12 +115,17 @@ private:
     bool fallBackToNextCandidate(const std::string& reason);
     AVFrame* downloadIfHardwareFrame(AVFrame* frame);
     void convertToBGR(sensor_msgs::msg::Image& img, AVFrame* source);
+    bool discardFrame(const AVFrame* frame) noexcept;
     void resetWorkingBuffers();
 
     rclcpp::Logger logger_;
     VideoCodec codec_;
     Options options_;
     bool initialized_, sws_threaded_, hardware_;
+    /* Set until a key frame has been decoded, so the partial pictures produced
+       by joining a live stream mid-GOP are not published. */
+    bool awaiting_keyframe_;
+    std::size_t frames_before_keyframe_, corrupt_frames_;
     int width_, height_;
     AVPixelFormat last_pixel_format_, hw_pixel_format_;
     std::string description_;

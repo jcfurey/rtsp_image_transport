@@ -63,6 +63,47 @@ Decode-only support for MPEG-2 (`MPV`) and H.263 (`H263`, `H263-1998`,
 `H263-2000`) was added alongside, since those RTSP payload names still turn up
 on older cameras.
 
+## RTP transport and lossy links
+
+Upstream never passes `streamUsingTCP` to `sendSetupCommand()`, so Live555's
+default applies and RTP runs over its own UDP sockets. Nothing calls
+`increaseReceiveBufferTo()` either, which leaves the RTP socket on the kernel
+default receive buffer — well under one HD frame. On the Nautilus tether this
+showed up as flat green bands over part of the decoded image, and the system UDP
+counters attributed every input error to receive-buffer overflow.
+
+The green is the tell. A lost datagram costs a slice; `AV_CODEC_FLAG2_CHUNKS`
+makes the decoder emit the picture from the slices that did arrive, and the
+macroblocks the missing one covered keep the value their buffer was allocated
+with. Zero-filled YUV converts to BGR (0, 135, 0).
+
+Three changes:
+
+- New `rtp_over_tcp` subscriber parameter, **on by default**. RTP is interleaved
+  over the RTSP connection, which removes the loss rather than tuning around it.
+  For a camera on one Ethernet link this is close to strictly better: no loss, no
+  reordering, no buffer sizing.
+- New `rtp_buffer_size` parameter (2 MB default), applied to the RTP socket
+  between `initiate()` and SETUP when UDP is selected. The kernel caps the
+  request at `net.core.rmem_max` and the subscriber logs a warning when it does.
+- Error concealment is enabled again. The fork had set `error_concealment = 0`
+  to quieten the log, but `ff_er_frame_end()` returns early when concealment is
+  off, so a partially decoded frame was neither repaired from the reference
+  frame nor recorded in `decode_error_flags` — it simply reached the subscriber
+  with holes in it. The log noise it was silencing is already demoted to
+  warnings by `log_level_offset`.
+
+On top of that the decoder no longer publishes pictures it could not fully
+reconstruct at session start: frames are held until the first key frame, bounded
+at 120 frames so a stream that never flags one still produces video. New
+`drop_corrupt_frames` parameter (off by default) discards damaged frames outright
+instead of publishing the concealed result.
+
+Regression tested by reconstructing the real failure: a stream encoded with four
+slices per picture, with one slice NAL removed from every inter frame. Concealing
+delivers all 30 of 30 frames; `drop_corrupt_frames` keeps only the 3 undamaged key
+frames, which is what confirms the damage is being detected at all.
+
 ## QoS, ROS time and bags
 
 - The URL topic keeps its required RELIABLE / TRANSIENT_LOCAL / KEEP_LAST(1)

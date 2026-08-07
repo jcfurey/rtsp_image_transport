@@ -168,6 +168,8 @@ struct RTSP_IMAGE_TRANSPORT_NO_EXPORT SubscriberPlugin::Config
     StreamDecoder::Options decoder;
     TimestampSource timestamp_source = TimestampAuto;
     int video_subsession = 0;
+    bool rtp_over_tcp = true;
+    int rtp_buffer_size = static_cast<int>(DEFAULT_RTP_BUFFER_SIZE);
     ReconnectPolicy reconnect_policy = ReconnectOnTimeout;
     std::chrono::milliseconds timeout = 2s;
     std::chrono::milliseconds reconnect_minwait = 100ms;
@@ -330,6 +332,8 @@ void SubscriberPlugin::internalCallback(const std_msgs::msg::String::ConstShared
     {
         client_ = StreamClient::create(topic_name_, msg->data, logger_);
         client_->setVideoSubsession(static_cast<std::size_t>(config_->video_subsession));
+        client_->setRtpOverTcp(config_->rtp_over_tcp);
+        client_->setRtpBufferSize(static_cast<unsigned>(config_->rtp_buffer_size));
         client_->setSessionTimeout(config_->timeout);
         client_->setReceiveStreamDataHandler(std::bind(&SubscriberPlugin::receiveDataStream, this,
                                                        std::placeholders::_1, std::placeholders::_2,
@@ -441,6 +445,24 @@ void SubscriberPlugin::setupParameters(
             .set__description("zero-based supported video subsession to decode")
             .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(31)}));
     declareParameter(
+        node_parameters, param_base_name_ + ".rtp_over_tcp", rclcpp::ParameterValue(config_->rtp_over_tcp),
+        ParameterDescriptor().set__description(
+            "carry RTP interleaved over the RTSP TCP connection instead of separate UDP sockets; "
+            "avoids the packet loss that shows up as green bands in the decoded image"));
+    declareParameter(
+        node_parameters, param_base_name_ + ".rtp_buffer_size",
+        rclcpp::ParameterValue(config_->rtp_buffer_size),
+        ParameterDescriptor()
+            .set__description("receive buffer requested for the RTP socket [bytes], UDP only "
+                              "(0 = keep the system default)")
+            .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(64 << 20)}));
+    declareParameter(
+        node_parameters, param_base_name_ + ".drop_corrupt_frames",
+        rclcpp::ParameterValue(config_->decoder.drop_corrupt_frames),
+        ParameterDescriptor().set__description(
+            "drop frames the decoder could not fully reconstruct instead of publishing the concealed "
+            "result; trades artefacts for stutter on a lossy stream"));
+    declareParameter(
         node_parameters, param_base_name_ + ".reconnect_policy",
         rclcpp::ParameterValue(static_cast<int>(config_->reconnect_policy)),
         ParameterDescriptor()
@@ -486,6 +508,11 @@ void SubscriberPlugin::updateParameters()
         static_cast<TimestampSource>(np->get_parameter(param_base_name_ + ".timestamp_source").as_int());
     new_config.video_subsession =
         static_cast<int>(np->get_parameter(param_base_name_ + ".video_subsession").as_int());
+    new_config.rtp_over_tcp = np->get_parameter(param_base_name_ + ".rtp_over_tcp").as_bool();
+    new_config.rtp_buffer_size =
+        static_cast<int>(np->get_parameter(param_base_name_ + ".rtp_buffer_size").as_int());
+    new_config.decoder.drop_corrupt_frames =
+        np->get_parameter(param_base_name_ + ".drop_corrupt_frames").as_bool();
     new_config.reconnect_policy =
         static_cast<ReconnectPolicy>(np->get_parameter(param_base_name_ + ".reconnect_policy").as_int());
     new_config.timeout = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
@@ -500,9 +527,14 @@ void SubscriberPlugin::updateParameters()
         || new_config.decoder.low_latency != config_->decoder.low_latency
         || new_config.decoder.hw_device != config_->decoder.hw_device
         || new_config.decoder.hw_device_path != config_->decoder.hw_device_path
-        || new_config.decoder.decoder != config_->decoder.decoder)
+        || new_config.decoder.decoder != config_->decoder.decoder
+        || new_config.decoder.drop_corrupt_frames != config_->decoder.drop_corrupt_frames)
         changelevel |= LVL_CODEC;
-    if (new_config.video_subsession != config_->video_subsession)
+    /* The transport is chosen in the SETUP request and the RTP socket is sized
+       right before it, so either change needs a new session. */
+    if (new_config.video_subsession != config_->video_subsession
+        || new_config.rtp_over_tcp != config_->rtp_over_tcp
+        || new_config.rtp_buffer_size != config_->rtp_buffer_size)
         changelevel |= LVL_CONNECTION;
 
     *config_ = new_config;
@@ -655,6 +687,8 @@ void SubscriberPlugin::reconnect()
         return;
     client_->disconnect();
     client_->setVideoSubsession(static_cast<std::size_t>(config_->video_subsession));
+    client_->setRtpOverTcp(config_->rtp_over_tcp);
+    client_->setRtpBufferSize(static_cast<unsigned>(config_->rtp_buffer_size));
     clearQueuedFrames();
     rclcpp::node_interfaces::NodeBaseInterface::SharedPtr nb = node_base_.lock();
     rclcpp::node_interfaces::NodeTimersInterface::SharedPtr nt = node_timers_.lock();
