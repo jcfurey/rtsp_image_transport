@@ -281,6 +281,53 @@ std::size_t countSlices(const std::vector<std::uint8_t>& packet)
     return slices;
 }
 
+/* Feeds the decoder one NAL unit per call, which is how FrameExtractor drives
+   it: live555 hands over a single NAL at a time and the extractor forwards each
+   one on its own. Nothing else in this suite exercises that path. */
+std::vector<sensor_msgs::msg::Image::UniquePtr> decodeNalAtATime(
+    StreamDecoder& decoder, const std::vector<std::vector<std::uint8_t>>& packets)
+{
+    std::vector<sensor_msgs::msg::Image::UniquePtr> images;
+    for (std::size_t i = 0; i < packets.size(); ++i)
+    {
+        rclcpp::Time stamp(BASE_STAMP_NS + static_cast<std::int64_t>(i) * FRAME_INTERVAL_NS);
+        const std::vector<std::size_t> offsets = nalOffsets(packets[i]);
+        for (std::size_t k = 0; k < offsets.size(); ++k)
+        {
+            const std::size_t end = k + 1 < offsets.size() ? offsets[k + 1] : packets[i].size();
+            const std::vector<std::uint8_t> nal(packets[i].begin() + offsets[k], packets[i].begin() + end);
+            try
+            {
+                decoder.decodeVideo(std::make_shared<FrameData>(nal.data(), nal.size(), stamp));
+            }
+            catch (const DecodingError&)
+            {
+            }
+            while (sensor_msgs::msg::Image::UniquePtr img = decoder.nextFrame())
+                images.push_back(std::move(img));
+        }
+    }
+    return images;
+}
+
+/* Fraction of pixels that are exactly BGR (0, 135, 0) — what an all-zero YUV
+   macroblock converts to, and therefore the signature of image area the decoder
+   never wrote. */
+double decoderGreenFraction(const sensor_msgs::msg::Image& img)
+{
+    std::size_t green = 0;
+    for (unsigned y = 0; y < img.height; ++y)
+    {
+        for (unsigned x = 0; x < img.width; ++x)
+        {
+            const std::uint8_t* p = &img.data[static_cast<std::size_t>(y) * img.step + 3 * x];
+            if (p[0] == 0 && p[1] == 135 && p[2] == 0)
+                green++;
+        }
+    }
+    return static_cast<double>(green) / (static_cast<double>(img.width) * img.height);
+}
+
 /* A stream that lost one slice out of every inter coded picture. Key frames are
    left whole so the sequence stays anchored, exactly as it would be on a link
    that drops the occasional RTP packet. */
@@ -304,6 +351,36 @@ std::vector<std::vector<std::uint8_t>> withSliceLoss(const std::vector<std::vect
    converts to flat green — the green bands seen on a lossy camera link. */
 constexpr std::size_t SLICE_LOSS_GOP = 10;
 constexpr std::size_t SLICE_LOSS_INDEX = 1;
+
+TEST(StreamDecoder, DecodesOneNalAtATimeLikeTheRtspSource)
+{
+    /* AV_CODEC_FLAG2_CHUNKS is what lets the decoder assemble a picture across
+       several calls, because that is how frames actually arrive: one NAL unit
+       per call. A picture emitted before all of its slices had been handed over
+       would leave part of the image unwritten, and unwritten YUV is green. At
+       full HD, where a picture is most likely to be split up. */
+    for (VideoCodec codec : {VideoCodec::H264, VideoCodec::H265})
+    {
+        auto packets = encodeTestStream(codec, 1920, 1080, 6);
+        if (packets.empty())
+            continue;
+
+        StreamDecoder whole(codec, softwareOptions());
+        const std::size_t whole_count = decodeAll(whole, packets).images.size();
+
+        StreamDecoder split(codec, softwareOptions());
+        const auto images = decodeNalAtATime(split, packets);
+
+        ASSERT_FALSE(images.empty()) << videoCodecName(codec) << ": NAL-at-a-time produced no images";
+        EXPECT_EQ(images.size(), whole_count)
+            << videoCodecName(codec) << ": feeding one NAL at a time changed the frame count";
+        for (const auto& img : images)
+        {
+            EXPECT_EQ(decoderGreenFraction(*img), 0.0)
+                << videoCodecName(codec) << ": part of the picture was never written";
+        }
+    }
+}
 
 TEST(StreamDecoder, ConcealsSliceLossInsteadOfPublishingHoles)
 {
