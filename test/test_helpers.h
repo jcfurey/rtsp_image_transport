@@ -138,10 +138,18 @@ inline std::vector<std::vector<std::uint8_t>> encodeTestStream(VideoCodec codec,
         av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
     }
     /* x265 does not read AVCodecContext::slices, so an H.265 test stream comes
-       out with one slice per picture unless it is asked through x265-params. */
+       out with one slice per picture unless it is asked through x265-params.
+
+       `pools` has to be set with it. x265 4.x declines to allocate a thread
+       pool by itself in a container that cannot call set_mempolicy, and then
+       segfaults in NALList::serializeSubstreams() the moment maxSlices is above
+       one — taking the whole test binary with it. Reproduced on x265 4.1 and
+       4.x (Lyrical, Rolling) and not on 3.5 (Jazzy, Kilted); asking for the
+       pool explicitly avoids it everywhere. */
     if (slices > 0 && std::string(encoder_name) == "libx265")
     {
-        const std::string params = "slices=" + std::to_string(slices);
+        const std::string params =
+            "slices=" + std::to_string(slices) + ":pools=" + std::to_string(slices);
         av_opt_set(ctx->priv_data, "x265-params", params.c_str(), 0);
     }
     if (std::string(encoder_name).find("vpx") != std::string::npos)

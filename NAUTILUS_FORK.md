@@ -255,6 +255,15 @@ Verified on ROS 2 Jazzy, Kilted, Lyrical and Rolling in the official
 tests, not by reading — including the H.265 one above, which had a passing
 H.264 test sitting next to it the whole time.
 
+Running all four distributions is worth the wall clock. The multi-slice H.265
+stream the damage tests need takes `x265-params`, and x265 4.x segfaults inside
+`NALList::serializeSubstreams()` when `maxSlices` is above one and it has
+declined to allocate a thread pool — which it does in a container that cannot
+call `set_mempolicy`. x265 3.5 on Jazzy and Kilted allocates the pool and is
+fine, so the crash appeared only on Lyrical and Rolling, and it took the whole
+`test_stream_decoder` binary with it: 32 cases silently stopped running rather
+than failing. Asking for the pool explicitly (`pools=`) avoids it everywhere.
+
 ## Latency and throughput work
 
 - The subscriber's frame-dropping ladder never escalated past "discard
