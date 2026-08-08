@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <format>
 #include <map>
 #include <mutex>
@@ -265,6 +266,43 @@ bool isHardwarePixelFormat(AVPixelFormat format)
     return desc && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) != 0;
 }
 
+/* Value written into every freshly allocated luma plane, and into the chroma
+   planes, before the decoder fills a picture in. Y=1 is below the legal TV range
+   floor of 16 and pairs with neutral chroma, so anything left over reads as
+   black rather than as the flat green an all-zero YUV block converts to, and is
+   rare enough in real picture content to be recognisable as "never written".
+
+   The alternative, zero, is what produces the bright green bands: YUV(0,0,0) is
+   BGR(0,135,0). */
+constexpr unsigned char FRAME_FILL_LUMA = 1;
+constexpr unsigned char FRAME_FILL_CHROMA = 128;
+
+/* Above this fraction of the picture left unwritten, the frame is treated as
+   damaged. Measured on a 4-slice stream missing one slice: 41% of the picture
+   is left over, against under 1% of accidental matches in undamaged pictures,
+   so the threshold sits an order of magnitude clear of both. */
+constexpr double UNWRITTEN_FRACTION_LIMIT = 0.05;
+
+/* Whether libavcodec repairs a picture that lost a slice for this codec.
+   Error concealment lives in the mpegvideo/H.264 error resilience code; the
+   HEVC, VP8/VP9 and AV1 decoders have nothing equivalent, so a lost slice
+   leaves its macroblocks exactly as the frame buffer was allocated and neither
+   ff_er_frame_end() nor anything else records that it happened. Those are the
+   decoders whose frames are worth pre-filling. */
+bool decoderConcealsSliceLoss(VideoCodec codec) noexcept
+{
+    switch (codec)
+    {
+        case VideoCodec::H264:
+        case VideoCodec::MPEG4:
+        case VideoCodec::MPEG2:
+        case VideoCodec::H263:
+            return true;
+        default:
+            return false;
+    }
+}
+
 /* Standalone hardware decoders open the GPU themselves, but only when the
    vendor runtime is actually there. avcodec_open2() does not always notice that
    it is missing: h264_qsv, for instance, opens happily on a machine without
@@ -298,7 +336,8 @@ std::vector<std::string> StreamDecoder::availableHwDevices(const std::string& hw
 
 StreamDecoder::StreamDecoder(VideoCodec codec, const Options& options, const rclcpp::Logger& logger)
     : logger_(logger), codec_(codec), options_(options), initialized_(false), sws_threaded_(false), hardware_(false),
-      awaiting_keyframe_(true), frames_before_keyframe_(0), corrupt_frames_(0), width_(0), height_(0),
+      fills_frames_(false), awaiting_keyframe_(true), frames_before_keyframe_(0), corrupt_frames_(0), width_(0),
+      height_(0),
       last_pixel_format_(AV_PIX_FMT_NONE), hw_pixel_format_(AV_PIX_FMT_NONE), candidate_index_(0)
 {
     candidates_ = buildCandidates();
@@ -500,6 +539,15 @@ void StreamDecoder::openCandidate(const DecoderCandidate& candidate)
     {
         set_codec_option(ctx_, "async_depth", 1, logger_);
     }
+    /* Only for the codecs libavcodec will not repair by itself, and only when
+       decoding into system memory: a hardware decoder allocates its own frames
+       on the device, where neither the fill nor the check below can reach. */
+    fills_frames_ = !decoderConcealsSliceLoss(codec_) && !candidate.hardware;
+    if (fills_frames_)
+    {
+        ctx_->opaque = this;
+        ctx_->get_buffer2 = prepareFrameBuffer;
+    }
     ctx_->log_level_offset = 8;  // Turn errors into warnings
     ctx_->pkt_timebase = NANOSECOND_TIME_BASE;
     if (codec_ == VideoCodec::H264 || codec_ == VideoCodec::H265)
@@ -542,7 +590,7 @@ void StreamDecoder::openCandidate(const DecoderCandidate& candidate)
    once the stream parameters are known. */
 AVPixelFormat StreamDecoder::selectPixelFormat(AVCodecContext* ctx, const AVPixelFormat* formats)
 {
-    const StreamDecoder* self = static_cast<const StreamDecoder*>(ctx->opaque);
+    StreamDecoder* self = static_cast<StreamDecoder*>(ctx->opaque);
     if (self)
     {
         for (const AVPixelFormat* p = formats; *p != AV_PIX_FMT_NONE; ++p)
@@ -551,15 +599,98 @@ AVPixelFormat StreamDecoder::selectPixelFormat(AVCodecContext* ctx, const AVPixe
                 return *p;
         }
     }
-    /* The hardware cannot handle this stream (an unsupported profile, for
-       instance). Decode in software rather than failing; picking a hardware
-       format we did not prepare frame buffers for would abort the decode. */
-    for (const AVPixelFormat* p = formats; *p != AV_PIX_FMT_NONE; ++p)
+    /* This hardware cannot handle this stream: the profile, bit depth or
+       chroma format is outside what the device decodes. Returning NONE fails
+       the decode, which hands the stream to the next entry in the candidate
+       list — very often another GPU path that does support it, and only
+       software once every device has been ruled out.
+
+       Silently returning a software format here instead would decode on the
+       CPU while still reporting the stream as hardware accelerated, which is
+       the harder failure to diagnose of the two. */
+    if (self)
     {
-        if (!isHardwarePixelFormat(*p))
-            return *p;
+        std::string offered;
+        for (const AVPixelFormat* p = formats; *p != AV_PIX_FMT_NONE; ++p)
+        {
+            const char* name = av_get_pix_fmt_name(*p);
+            if (!offered.empty())
+                offered += ", ";
+            offered += name ? name : "?";
+        }
+        const char* wanted = av_get_pix_fmt_name(self->hw_pixel_format_);
+        RCLCPP_WARN(self->logger_, "%s cannot decode this stream (it offers %s, not %s); trying the next decoder",
+                    self->description_.c_str(), offered.empty() ? "nothing" : offered.c_str(),
+                    wanted ? wanted : "the prepared format");
     }
-    return formats[0];
+    return AV_PIX_FMT_NONE;
+}
+
+/* Fills freshly allocated frames so that macroblocks the decoder never writes
+   are recognisable afterwards, and read as black rather than as bright green.
+   Installed only for the codecs libavcodec cannot conceal slice loss for. */
+int StreamDecoder::prepareFrameBuffer(AVCodecContext* ctx, AVFrame* frame, int flags)
+{
+    const int result = avcodec_default_get_buffer2(ctx, frame, flags);
+    if (result < 0)
+        return result;
+    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
+    /* Hardware frames live in device memory and are not ours to touch */
+    if (!desc || (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) != 0)
+        return result;
+    for (int plane = 0; plane < AV_NUM_DATA_POINTERS && frame->data[plane]; ++plane)
+    {
+        const int height = plane == 0 ? frame->height : AV_CEIL_RSHIFT(frame->height, desc->log2_chroma_h);
+        const int stride = frame->linesize[plane];
+        const unsigned char value = plane == 0 ? FRAME_FILL_LUMA : FRAME_FILL_CHROMA;
+        /* A negative stride means data[] points at the last row and the plane
+           runs backwards; nothing a decoder produces, but filling it forwards
+           would run off the end of the allocation. */
+        if (stride > 0 && height > 0)
+            std::memset(frame->data[plane], value, static_cast<std::size_t>(stride) * height);
+    }
+    return result;
+}
+
+/* How much of the picture still carries the fill value, sampled every eighth
+   pixel in both directions. A lost slice covers whole rows of macroblocks, so
+   the sparse grid finds it at a sixty-fourth of the cost of a full scan.
+   Chroma has to match as well: a luma value of 1 does turn up in ordinary
+   picture content, but not with perfectly neutral chroma on top of it. */
+double StreamDecoder::unwrittenFraction(const AVFrame* frame) const noexcept
+{
+    if (!fills_frames_ || !frame->data[0] || frame->width <= 0 || frame->height <= 0)
+        return 0.0;
+    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
+    if (!desc || (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) != 0 || frame->linesize[0] <= 0)
+        return 0.0;
+    const bool planar_chroma =
+        frame->data[1] && frame->data[2] && desc->nb_components >= 3 && frame->linesize[1] > 0
+        && frame->linesize[2] > 0;
+    std::size_t sampled = 0, unwritten = 0;
+    for (int y = 0; y < frame->height; y += 8)
+    {
+        const unsigned char* luma = frame->data[0] + static_cast<std::ptrdiff_t>(y) * frame->linesize[0];
+        const int cy = y >> desc->log2_chroma_h;
+        for (int x = 0; x < frame->width; x += 8)
+        {
+            ++sampled;
+            if (luma[x] != FRAME_FILL_LUMA)
+                continue;
+            if (planar_chroma)
+            {
+                const int cx = x >> desc->log2_chroma_w;
+                const unsigned char u =
+                    frame->data[1][static_cast<std::ptrdiff_t>(cy) * frame->linesize[1] + cx];
+                const unsigned char v =
+                    frame->data[2][static_cast<std::ptrdiff_t>(cy) * frame->linesize[2] + cx];
+                if (u != FRAME_FILL_CHROMA || v != FRAME_FILL_CHROMA)
+                    continue;
+            }
+            ++unwritten;
+        }
+    }
+    return sampled > 0 ? static_cast<double>(unwritten) / static_cast<double>(sampled) : 0.0;
 }
 
 /* Moves to the next way of decoding this stream after a hardware path turned
@@ -624,9 +755,13 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
     /* Some hardware decoders open successfully and accept every packet but
        never return a frame. Retain the beginning of the stream while a hardware
        candidate proves itself so that a software fallback can replay the SPS,
-       PPS and first key frame instead of waiting for another GOP. */
+       PPS and first key frame instead of waiting for another GOP.
+
+       Not while replaying: the replay runs through this same function, and
+       letting it refill the buffer would let one fallback trigger the next from
+       inside its own replay loop, reordering the stream as it went. */
     constexpr std::size_t hardware_probe_limit = 4;
-    if (hardware_)
+    if (hardware_ && !replaying_probe_packets_)
         hardware_probe_packets_.push_back(data);
 
     if (!initialized_)
@@ -725,8 +860,18 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
         if (fallBackToNextCandidate("hardware decoder produced no frames during startup"))
         {
             std::size_t replayed = 0;
-            for (const FrameDataPtr& packet : replay_packets)
-                replayed += decodeVideo(packet);
+            replaying_probe_packets_ = true;
+            try
+            {
+                for (const FrameDataPtr& packet : replay_packets)
+                    replayed += decodeVideo(packet);
+            }
+            catch (...)
+            {
+                replaying_probe_packets_ = false;
+                throw;
+            }
+            replaying_probe_packets_ = false;
             return replayed;
         }
     }
@@ -762,7 +907,13 @@ bool StreamDecoder::discardFrame(const AVFrame* frame) noexcept
     }
     if (!options_.drop_corrupt_frames)
         return false;
-    if ((frame->flags & AV_FRAME_FLAG_CORRUPT) == 0 && frame->decode_error_flags == 0)
+    /* libavcodec reports the damage for the codecs it can conceal. For the rest
+       — H.265 above all, which is what most cameras now stream — a picture
+       missing a slice arrives with no flags set at all, and the only evidence
+       is the part of the frame buffer the decoder never wrote over. */
+    const bool flagged_by_libavcodec =
+        (frame->flags & AV_FRAME_FLAG_CORRUPT) != 0 || frame->decode_error_flags != 0;
+    if (!flagged_by_libavcodec && unwrittenFraction(frame) <= UNWRITTEN_FRACTION_LIMIT)
         return false;
     /* Loud on the first one, then occasional: a stream that loses packets
        steadily would otherwise fill the log. */

@@ -108,6 +108,7 @@ public:
 
 private:
     static AVPixelFormat selectPixelFormat(AVCodecContext* ctx, const AVPixelFormat* formats);
+    static int prepareFrameBuffer(AVCodecContext* ctx, AVFrame* frame, int flags);
 
     std::vector<DecoderCandidate> buildCandidates() const;
     std::vector<AVHWDeviceType> hwDevicePreference() const;
@@ -116,12 +117,19 @@ private:
     AVFrame* downloadIfHardwareFrame(AVFrame* frame);
     void convertToBGR(sensor_msgs::msg::Image& img, AVFrame* source);
     bool discardFrame(const AVFrame* frame) noexcept;
+    /* Fraction of the picture libavcodec never wrote, or 0 when this decoder
+       does not pre-fill its frames. Sparsely sampled; see the implementation. */
+    double unwrittenFraction(const AVFrame* frame) const noexcept;
     void resetWorkingBuffers();
 
     rclcpp::Logger logger_;
     VideoCodec codec_;
     Options options_;
     bool initialized_, sws_threaded_, hardware_;
+    /* Set when the decoder pre-fills freshly allocated frames, which is how a
+       picture that lost a slice is told apart from one that decoded cleanly for
+       the codecs libavcodec has no error concealment for. */
+    bool fills_frames_;
     /* Set until a key frame has been decoded, so the partial pictures produced
        by joining a live stream mid-GOP are not published. */
     bool awaiting_keyframe_;
@@ -138,6 +146,7 @@ private:
     std::shared_ptr<SwsContext> sws_;
     std::deque<sensor_msgs::msg::Image::UniquePtr> frames_;
     std::vector<FrameDataPtr> hardware_probe_packets_;
+    bool replaying_probe_packets_ = false;
 };
 
 }  // namespace rtsp_image_transport

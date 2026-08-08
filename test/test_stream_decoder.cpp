@@ -26,6 +26,7 @@
 
 #include <sensor_msgs/image_encodings.hpp>
 
+#include <memory>
 #include <vector>
 
 using namespace rtsp_image_transport;
@@ -247,11 +248,27 @@ std::vector<std::size_t> nalOffsets(const std::vector<std::uint8_t>& packet)
     return offsets;
 }
 
+/* Whether the NAL unit starting at this offset carries coded picture data.
+   H.264 puts the type in the low five bits of a one byte header; H.265 uses a
+   two byte header with the type in bits 1 to 6, and calls everything below 32 a
+   video coding layer unit. */
+bool isSliceNal(const std::vector<std::uint8_t>& packet, std::size_t begin, VideoCodec codec)
+{
+    if (begin + 3 >= packet.size())
+        return false;
+    const std::uint8_t header = packet[begin + 3];
+    if (codec == VideoCodec::H265)
+        return ((header >> 1) & 0x3f) <= 31;
+    const std::uint8_t nal_type = header & 0x1f;
+    return nal_type == 1 || nal_type == 5;
+}
+
 /* Rebuilds a packet with the nth coded slice removed, which is what losing the
    RTP packets carrying that slice looks like: the surviving slices decode, and
    the macroblocks the missing one covered are never written at all. Parameter
    sets and SEI are left alone, as they would be on a real stream. */
-std::vector<std::uint8_t> withoutSlice(const std::vector<std::uint8_t>& packet, std::size_t slice_to_drop)
+std::vector<std::uint8_t> withoutSlice(const std::vector<std::uint8_t>& packet, std::size_t slice_to_drop,
+                                       VideoCodec codec = VideoCodec::H264)
 {
     const std::vector<std::size_t> offsets = nalOffsets(packet);
     std::vector<std::uint8_t> out;
@@ -260,22 +277,19 @@ std::vector<std::uint8_t> withoutSlice(const std::vector<std::uint8_t>& packet, 
     {
         const std::size_t begin = offsets[k];
         const std::size_t end = k + 1 < offsets.size() ? offsets[k + 1] : packet.size();
-        const std::uint8_t nal_type = begin + 3 < packet.size() ? (packet[begin + 3] & 0x1f) : 0;
-        const bool is_slice = nal_type == 1 || nal_type == 5;
-        if (is_slice && slice_index++ == slice_to_drop)
+        if (isSliceNal(packet, begin, codec) && slice_index++ == slice_to_drop)
             continue;
         out.insert(out.end(), packet.begin() + begin, packet.begin() + end);
     }
     return out;
 }
 
-std::size_t countSlices(const std::vector<std::uint8_t>& packet)
+std::size_t countSlices(const std::vector<std::uint8_t>& packet, VideoCodec codec = VideoCodec::H264)
 {
     std::size_t slices = 0;
     for (std::size_t begin : nalOffsets(packet))
     {
-        const std::uint8_t nal_type = begin + 3 < packet.size() ? (packet[begin + 3] & 0x1f) : 0;
-        if (nal_type == 1 || nal_type == 5)
+        if (isSliceNal(packet, begin, codec))
             slices++;
     }
     return slices;
@@ -332,13 +346,14 @@ double decoderGreenFraction(const sensor_msgs::msg::Image& img)
    left whole so the sequence stays anchored, exactly as it would be on a link
    that drops the occasional RTP packet. */
 std::vector<std::vector<std::uint8_t>> withSliceLoss(const std::vector<std::vector<std::uint8_t>>& packets,
-                                                     std::size_t gop_size, std::size_t slice_to_drop)
+                                                     std::size_t gop_size, std::size_t slice_to_drop,
+                                                     VideoCodec codec = VideoCodec::H264)
 {
     std::vector<std::vector<std::uint8_t>> lossy = packets;
     for (std::size_t i = 0; i < lossy.size(); ++i)
     {
         if (i % gop_size != 0)
-            lossy[i] = withoutSlice(lossy[i], slice_to_drop);
+            lossy[i] = withoutSlice(lossy[i], slice_to_drop, codec);
     }
     return lossy;
 }
@@ -426,6 +441,74 @@ TEST(StreamDecoder, DropsIncompletelyDecodedFramesWhenAsked)
     EXPECT_LT(kept, concealed / 2) << "damaged frames were not flagged: kept " << kept << " of " << concealed;
     /* The undamaged key frames still have to get through. */
     EXPECT_GT(kept, 0u) << "the guard dropped even the intact key frames";
+}
+
+/* H.265 is where the camera actually streams from, and it is the case the two
+   tests above cannot cover: libavcodec has no error resilience for HEVC, so a
+   picture that lost a slice arrives with decode_error_flags clear and
+   AV_FRAME_FLAG_CORRUPT unset. Nothing libavcodec reports distinguishes it from
+   a clean picture; the only evidence is the part of the frame buffer the
+   decoder never wrote into. */
+TEST(StreamDecoder, HevcSliceLossIsNotPublishedAsGreenBands)
+{
+    auto packets = encodeTestStream(VideoCodec::H265, 640, 480, 30, 4);
+    if (packets.size() < 20 || countSlices(packets[1], VideoCodec::H265) < 3)
+        GTEST_SKIP() << "this FFmpeg build did not produce a multi-slice H.265 stream";
+    const auto lossy = withSliceLoss(packets, SLICE_LOSS_GOP, SLICE_LOSS_INDEX, VideoCodec::H265);
+
+    StreamDecoder decoder(VideoCodec::H265, softwareOptions());
+    DecodeResult result = decodeAll(decoder, lossy);
+    ASSERT_FALSE(result.images.empty());
+
+    /* An all-zero YUV macroblock converts to BGR(0,135,0). Before the decoder
+       pre-filled its frames, a quarter of every damaged picture came out in
+       exactly that colour. */
+    for (const auto& img : result.images)
+    {
+        EXPECT_EQ(decoderGreenFraction(*img), 0.0)
+            << "an unwritten region reached the subscriber as flat green";
+    }
+}
+
+TEST(StreamDecoder, HevcDamageIsDetectedWithoutLibavcodecFlaggingIt)
+{
+    auto packets = encodeTestStream(VideoCodec::H265, 640, 480, 30, 4);
+    if (packets.size() < 20 || countSlices(packets[1], VideoCodec::H265) < 3)
+        GTEST_SKIP() << "this FFmpeg build did not produce a multi-slice H.265 stream";
+    const auto lossy = withSliceLoss(packets, SLICE_LOSS_GOP, SLICE_LOSS_INDEX, VideoCodec::H265);
+
+    StreamDecoder publishing(VideoCodec::H265, softwareOptions());
+    const std::size_t published = decodeSurvivingImages(publishing, lossy);
+    ASSERT_GT(published, 0u);
+
+    StreamDecoder::Options options = softwareOptions();
+    options.drop_corrupt_frames = true;
+    StreamDecoder dropping(VideoCodec::H265, options);
+    const std::size_t kept = decodeSurvivingImages(dropping, lossy);
+
+    EXPECT_LT(kept, published / 2) << "damaged H.265 frames were not recognised: kept " << kept << " of "
+                                   << published;
+    EXPECT_GT(kept, 0u) << "the guard dropped even the intact key frames";
+}
+
+/* The detector must not fire on ordinary picture content. A luma value of 1
+   does occur naturally; what marks a region as never written is that value
+   together with perfectly neutral chroma across a large part of the frame. */
+TEST(StreamDecoder, DropCorruptFramesKeepsACleanHevcStreamIntact)
+{
+    auto packets = encodeTestStream(VideoCodec::H265, 640, 480, 20);
+    if (packets.size() < 10)
+        GTEST_SKIP() << "no H.265 encoder in this FFmpeg build";
+
+    StreamDecoder plain(VideoCodec::H265, softwareOptions());
+    const std::size_t without_guard = decodeSurvivingImages(plain, packets);
+
+    StreamDecoder::Options options = softwareOptions();
+    options.drop_corrupt_frames = true;
+    StreamDecoder guarded(VideoCodec::H265, options);
+    const std::size_t with_guard = decodeSurvivingImages(guarded, packets);
+
+    EXPECT_EQ(with_guard, without_guard) << "the damage detector fired on an undamaged H.265 stream";
 }
 
 TEST(StreamDecoder, DropCorruptFramesKeepsACleanStreamIntact)
@@ -620,6 +703,45 @@ TEST(StreamDecoderHardware, IntelIgpuPathIsOfferedWhenTheDeviceExists)
         {
             EXPECT_EQ(img->encoding, sensor_msgs::image_encodings::BGR8);
             EXPECT_EQ(img->data.size(), static_cast<std::size_t>(3) * 320 * 240);
+        }
+        /* Decoding may still have moved to another candidate part way through,
+           if the device turned out not to handle this profile. Whatever it
+           settled on, what it reports has to match: claiming acceleration while
+           running on the CPU is the failure this guards against, because it
+           looks exactly like a working GPU until someone measures the load. */
+        EXPECT_EQ(decoder.isHardwareAccelerated(),
+                  decoder.description().find("software") == std::string::npos)
+            << "decoder reports " << decoder.description() << " but isHardwareAccelerated() says "
+            << decoder.isHardwareAccelerated();
+    }
+}
+
+/* A hardware decoder that opens but cannot handle the stream must hand it on
+   rather than quietly decode on the CPU under a hardware label. The device
+   probe decides which half of this runs, so it is meaningful either way. */
+TEST(StreamDecoderHardware, ReportedAccelerationMatchesRealityForEveryDevice)
+{
+    for (const char* device : {"auto", "vaapi", "cuda", "qsv", "vdpau"})
+    {
+        for (VideoCodec codec : {VideoCodec::H264, VideoCodec::H265})
+        {
+            StreamDecoder::Options options;
+            options.use_hw_decoder = true;
+            options.hw_device = device;
+            SCOPED_TRACE(std::string(device) + " / " + videoCodecName(codec));
+
+            std::unique_ptr<StreamDecoder> decoder;
+            ASSERT_NO_THROW(decoder = std::make_unique<StreamDecoder>(codec, options));
+
+            auto packets = encodeTestStream(codec, 320, 240, 8);
+            if (packets.empty())
+                continue;
+            DecodeResult result = decodeAll(*decoder, packets);
+            /* Whichever candidate it ends on, the stream still has to decode. */
+            EXPECT_GE(result.images.size(), 4u) << "frames were lost while settling on a decoder";
+            EXPECT_EQ(decoder->isHardwareAccelerated(),
+                      decoder->description().find("software") == std::string::npos)
+                << "reported " << decoder->description();
         }
     }
 }
