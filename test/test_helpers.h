@@ -137,6 +137,13 @@ inline std::vector<std::vector<std::uint8_t>> encodeTestStream(VideoCodec codec,
         av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
         av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
     }
+    /* x265 does not read AVCodecContext::slices, so an H.265 test stream comes
+       out with one slice per picture unless it is asked through x265-params. */
+    if (slices > 0 && std::string(encoder_name) == "libx265")
+    {
+        const std::string params = "slices=" + std::to_string(slices);
+        av_opt_set(ctx->priv_data, "x265-params", params.c_str(), 0);
+    }
     if (std::string(encoder_name).find("vpx") != std::string::npos)
         av_opt_set(ctx->priv_data, "deadline", "realtime", 0);
     if (std::string(encoder_name).find("aom") != std::string::npos)

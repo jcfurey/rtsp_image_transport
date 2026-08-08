@@ -113,6 +113,18 @@ continues with the next option rather than dropping the stream::
 
   [/camera0] failed to send bitstream packet to decoder: ...; falling back to hevc (software)
 
+The same applies when a device opens but turns out not to implement the
+stream's profile, which is the usual outcome for 10 bit or 4:2:2 video on an
+iGPU. That case used to decode on the CPU while still reporting the stream as
+hardware accelerated, so the only symptom was a busy core. It now moves to the
+next candidate — often a different GPU path that does support the profile, and
+only then software::
+
+  [/camera0] hevc + vaapi cannot decode this stream (it offers yuv420p10le, not vaapi); trying the next decoder
+
+Whatever it settles on, the decoder named in the ``start decoding`` line is the
+one actually running.
+
 Supported codecs are listed under `Supported Formats`_. Availability of a
 hardware path for any given one depends on your GPU and FFmpeg build; the
 subscriber only offers combinations that FFmpeg reports as supported, so an
@@ -181,11 +193,21 @@ so when it does::
 
     sysctl -w net.core.rmem_max=4194304
 
-Residual loss is concealed rather than published as holes: the decoder
-reconstructs the missing macroblocks from the reference frame. Set
-``-p in.rtsp.drop_corrupt_frames:=true`` to discard damaged pictures instead,
-which trades artefacts for stutter — useful for consumers that would rather see
-nothing than see wrong pixels.
+What happens to residual loss depends on the codec, because libavcodec's error
+concealment only covers some of them. For H.264, MPEG-2, MPEG-4 and H.263 the
+decoder reconstructs the missing macroblocks from the reference frame, and the
+picture is published repaired.
+
+H.265, VP8, VP9 and AV1 have no concealment in libavcodec at all, and no way to
+report that a picture came out incomplete. For those the subscriber pre-fills
+each frame before decoding, so anything the decoder never writes reads as black
+rather than as a bright green band, and the leftover fill is what identifies the
+damaged region afterwards. Costs about 1.6% of decoding time.
+
+Set ``-p in.rtsp.drop_corrupt_frames:=true`` to discard damaged pictures instead
+of publishing them, which trades artefacts for stutter — useful for consumers
+that would rather see nothing than see wrong pixels. It works for every codec
+listed above, concealed or not.
 
 Frames decoded before the first key frame of a session are never published.
 Connecting to a live stream lands mid-GOP, so those pictures reference data that

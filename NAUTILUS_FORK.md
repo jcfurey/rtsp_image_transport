@@ -56,12 +56,60 @@ with no Quick Sync and only fails on the first packet, and `hw_device:=none`
 still reached the standalone hardware decoders. Both are handled — the
 standalone decoders are now gated on their vendor device being creatable.
 
+A third one behaved worse than either, because it looked like success. When a
+device opened but could not handle the particular stream — a 10 bit or 4:2:2
+profile the iGPU does not implement, most often — `get_format` was handed a
+list without the hardware pixel format in it and picked a software format
+instead. libavcodec then decoded the whole stream on the CPU while the
+transport went on reporting `hevc + vaapi`, so the only symptom was a busy
+core. That case now declines the format, which drops the stream to the next
+candidate: usually another GPU path that does support the profile, and only
+then software. Either way `description()` and `isHardwareAccelerated()` agree
+with what is actually running, and the reason is in the log.
+
 New subscriber parameters `hw_device` (auto/none/cuda/vaapi/qsv/...) and
 `decoder` (pin one FFmpeg decoder by name). `use_hw_decoder` keeps its meaning.
 
 Decode-only support for MPEG-2 (`MPV`) and H.263 (`H263`, `H263-1998`,
 `H263-2000`) was added alongside, since those RTSP payload names still turn up
 on older cameras.
+
+## H.265 slice loss
+
+The green banding work assumed libavcodec would repair a picture that lost a
+slice, and report it when it could not. That holds for H.264 and the other
+mpegvideo-family decoders, which is what it was measured on. It does not hold
+for H.265, and H.265 is what the cameras stream.
+
+libavcodec has no error resilience for HEVC. `ff_er_frame_end()` is never
+reached, so a picture missing a slice is neither repaired from the reference
+frame nor recorded anywhere: `decode_error_flags` stays zero and
+`AV_FRAME_FLAG_CORRUPT` stays clear. Measured on a four-slice 640x480 stream
+missing one slice from every inter frame:
+
+| | H.264 | H.265 (before) | H.265 (after) |
+| --- | --- | --- | --- |
+| worst flat-green area of a published frame | 0% | **27%** | 0% |
+| frames kept with `drop_corrupt_frames` | 3 of 30 | **30 of 30** | 3 of 30 |
+
+So the codec that needed the guard was the one it did not cover, and the
+`drop_corrupt_frames` escape hatch silently did nothing.
+
+The decoder now pre-fills every frame it allocates, for the codecs libavcodec
+will not conceal for (H.265, VP8/VP9, AV1), with luma 1 and neutral chroma
+instead of leaving the buffer at zero. Two things follow. Anything the decoder
+never writes reads as black rather than as the BGR(0,135,0) that an all-zero
+YUV block converts to, so a lost slice is no longer a fluorescent green band.
+And what is left of the fill afterwards is exactly the region that was never
+decoded, which is the signal `drop_corrupt_frames` needs and libavcodec does
+not provide. It is sampled on every eighth pixel in both directions, and
+requires neutral chroma as well as the luma value, because luma 1 does occur in
+real picture content while the pair does not.
+
+Costs one `memset` per decoded frame: 0.10 ms at 1080p and 0.42 ms at 4K,
+against 6.4 ms and 26.9 ms of decoding, so about 1.6% either way. Hardware
+frames are left alone — they live in device memory, and a GPU decoder handles
+slice loss itself.
 
 ## RTP transport and lossy links
 
@@ -190,20 +238,22 @@ points remain for image_transport 6.3 and earlier and are compiled out from 7.0.
 
 ## Tests
 
-`test/` holds a GoogleTest suite (104 cases) run with `colcon test`. It covers
-codec name mapping, `FrameData`, the decoder across every supported codec plus
-hardware selection and fallback, the encoder, an encode/decode round trip, the
-Live555 event loop, the graph monitor, and a loopback integration test that
-runs a real RTSP session over localhost. Cases skip themselves when an encoder
-or a GPU is absent, so the same suite is meaningful on a headless builder and
-on a machine with an iGPU.
+`test/` holds a GoogleTest suite run with `colcon test`. It covers codec name
+mapping, `FrameData`, the decoder across every supported codec plus hardware
+selection and fallback, slice loss and damage detection per codec, the encoder,
+an encode/decode round trip, the Live555 event loop, the graph monitor, and a
+loopback integration test that runs a real RTSP session over localhost. Cases
+skip themselves when an encoder or a GPU is absent, so the same suite is
+meaningful on a headless builder and on a machine with an iGPU.
 
 Building the sources into a static `rtsp_image_transport_core` library made
 this possible: the plugins stay in the loadable module, everything else can be
 linked into a test binary.
 
-Verified on ROS 2 Jazzy and Lyrical in the official `ros:*-ros-base` images.
-Three of the bugs listed below were found by these tests, not by reading.
+Verified on ROS 2 Jazzy, Kilted, Lyrical and Rolling in the official
+`ros:*-ros-base` images. Several of the bugs listed below were found by these
+tests, not by reading — including the H.265 one above, which had a passing
+H.264 test sitting next to it the whole time.
 
 ## Latency and throughput work
 
