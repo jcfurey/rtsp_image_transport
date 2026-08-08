@@ -111,6 +111,27 @@ against 6.4 ms and 26.9 ms of decoding, so about 1.6% either way. Hardware
 frames are left alone — they live in device memory, and a GPU decoder handles
 slice loss itself.
 
+## SDP parameter sets survive a buffer growth
+
+The VPS/SPS/PPS from the SDP are copied to the front of the frame buffer once,
+in the extractor's constructor, and travel to the decoder in front of the first
+NAL unit. A NAL unit too large for the buffer resets `buffer_length_` to zero
+before growing it, which threw them away — and the camera this fork exists for
+is exactly the kind that announces them out of band and never repeats them.
+
+The initial buffer is 256 kB and Live555 hands over one NAL unit at a time, so
+a single 4K key-frame slice is enough to trigger it. The decoder then has no
+parameter sets for the rest of the session and cannot start at all; only a
+reconnect recovers.
+
+The parameter sets are now retained in Annex B form and put back whenever the
+buffer is emptied without having been delivered. Re-sending them is harmless —
+a decoder that already has them ignores a repeat.
+
+Reasoned rather than reproduced: constructing a `FrameExtractor` needs a live
+`MediaSubsession`, and the loopback server does not advertise sprop attributes,
+so this path has no direct test.
+
 ## The graph monitor aborted the process on node destruction
 
 This is the intermittent test failure that had been written off as a flake. It
@@ -134,6 +155,16 @@ context has been shut down, where it throws rather than being ignored.
 Worth stating plainly because the failure was not confined to tests: the
 publisher plugin is what uses `GraphMonitor`, and a node shutting down while a
 publisher was still advertised is exactly the reproducing sequence.
+
+## Event loop thread identity
+
+`EventLoop::create()` recorded the loop thread's id from `thread.get_id()`
+after starting it, leaving a window in which the loop thread did not recognise
+itself. A `post()` issued from a Live555 callback inside that window would take
+the "not on the loop thread" branch, queue itself, and then block waiting for
+the only thread that could drain the queue — itself. The thread now records its
+own id as its first action, before `doEventLoop()`, so no callback can run
+before it is set.
 
 ## RTP transport and lossy links
 
@@ -211,6 +242,14 @@ parameters interface. Because the node clock is not provided, this path uses a
 system clock for receive timestamps; callers on 6.4+ should explicitly select
 `timestamp_source:=1` when receiver timestamps are wanted. The FLIR A700 launch
 does this by default.
+
+Simulated time cannot be honoured on that path at all, and used to fail
+quietly: `ros_time_is_active()` is false on a plain system clock whatever the
+node is configured for, so the automatic `timestamp_source` resolved to sender
+time and every image carried a wall clock stamp in a simulated time base. The
+subscriber now checks `use_sim_time` through the parameters interface — which
+`RequiredInterfaces` does provide — and says outright that stamps will not
+follow `/clock` on this image_transport version.
 
 The image_transport publisher plugin remains unavailable on 6.4+ because its
 subscriber-graph monitoring cannot be recreated from the provided interfaces.

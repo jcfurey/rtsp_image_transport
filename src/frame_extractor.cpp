@@ -72,12 +72,10 @@ FrameExtractor::FrameExtractor(const std::weak_ptr<StreamClient>& stream_client,
             std::unique_ptr<SPropRecord[]> nals(parseSPropParameterSets(sprops, num_nals));
             for (unsigned i = 0; i < num_nals; ++i)
             {
-                if (buffer_length_ + nals[i].sPropLength + sizeof(MPEG_START_CODE) > buffer_.size())
-                    throw StreamingError("frame buffer overflow");
-                std::copy_n(MPEG_START_CODE, sizeof(MPEG_START_CODE), buffer_.data() + buffer_length_);
-                std::copy_n(nals[i].sPropBytes, nals[i].sPropLength,
-                            buffer_.data() + buffer_length_ + sizeof(MPEG_START_CODE));
-                buffer_length_ += nals[i].sPropLength + sizeof(MPEG_START_CODE);
+                parameter_sets_.insert(parameter_sets_.end(), MPEG_START_CODE,
+                                       MPEG_START_CODE + sizeof(MPEG_START_CODE));
+                parameter_sets_.insert(parameter_sets_.end(), nals[i].sPropBytes,
+                                       nals[i].sPropBytes + nals[i].sPropLength);
             }
         };
 
@@ -91,7 +89,24 @@ FrameExtractor::FrameExtractor(const std::weak_ptr<StreamClient>& stream_client,
             append_parameter_sets(subsession->fmtp_spropsps());
             append_parameter_sets(subsession->fmtp_sproppps());
         }
+        if (parameter_sets_.size() > buffer_.size())
+            throw StreamingError("SDP parameter sets do not fit the frame buffer");
+        seedParameterSets();
     }
+}
+
+/* The parameter sets have to reach the decoder ahead of the first slice, and
+   they are only announced once, in the SDP. Whenever the buffer is emptied
+   without having been delivered — which a NAL unit too large for it does — they
+   have to go back in, or a camera that never repeats them in band leaves the
+   decoder unable to start. Re-sending them is harmless: a decoder that already
+   has them ignores a repeat. */
+void FrameExtractor::seedParameterSets()
+{
+    if (parameter_sets_.empty() || buffer_length_ != 0 || parameter_sets_.size() > buffer_.size())
+        return;
+    std::copy_n(parameter_sets_.data(), parameter_sets_.size(), buffer_.data());
+    buffer_length_ = parameter_sets_.size();
 }
 
 VideoCodec FrameExtractor::codec() const
@@ -140,6 +155,7 @@ void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes
                             sc->topicName().c_str(), MAXIMUM_FRAME_BUFFER_SIZE);
             }
             buffer_length_ = 0;
+            seedParameterSets();
             continuePlaying();
             return;
         }

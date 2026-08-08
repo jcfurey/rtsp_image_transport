@@ -54,6 +54,9 @@ private:
     void deliverFrame(unsigned frameSize, unsigned numTruncatedBytes, struct timeval presentationTime,
                       unsigned durationInMicroseconds);
 
+    /* Copies the out-of-band parameter sets to the front of an empty buffer */
+    void seedParameterSets();
+
     std::weak_ptr<StreamClient> stream_client_;
     MediaSubsession* subsession_;
     VideoCodec codec_;
@@ -61,6 +64,11 @@ private:
        truncated NAL unit is worthless to the decoder. */
     std::vector<unsigned char> buffer_;
     std::size_t buffer_length_;
+    /* The VPS/SPS/PPS NAL units the SDP announced, already in Annex B form.
+       Kept so they can be prepended again after the buffer is discarded: a
+       camera that only sends them out of band would otherwise never get them to
+       the decoder at all. */
+    std::vector<unsigned char> parameter_sets_;
     bool warned_at_limit_;
 };
 

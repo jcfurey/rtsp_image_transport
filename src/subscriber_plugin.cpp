@@ -312,6 +312,23 @@ void SubscriberPlugin::subscribeImpl(image_transport::RequiredInterfaces node_in
     node_timers->add_timer(frame_timer_, scheduled_cb_group_);
     RCLCPP_INFO(logger_, "[%s] using image_transport node-interface API with executor timer frame delivery",
                 topic_name_.c_str());
+
+    /* RequiredInterfaces carries no clock interface, so clock_ above is a plain
+       system clock and ros_time_is_active() is false on it whatever the node is
+       configured for. That makes the automatic timestamp_source pick sender
+       time, and nothing on this path can produce a simulated stamp at all. Say
+       so rather than letting every published image carry a wall clock time in a
+       simulated time base. */
+    if (node_parameters->has_parameter("use_sim_time")
+        && node_parameters->get_parameter("use_sim_time").get_value<bool>())
+    {
+        RCLCPP_ERROR(logger_,
+                     "[%s] use_sim_time is set, but image_transport %d.%d gives this transport no clock "
+                     "interface, so published images will be stamped from the wall clock and not from /clock. "
+                     "Use image_transport 6.3 or earlier if the stamps have to follow simulated time",
+                     topic_name_.c_str(), CURRENT_IMAGE_TRANSPORT_VERSION >> 16,
+                     (CURRENT_IMAGE_TRANSPORT_VERSION >> 8) & 0xff);
+    }
 }
 #endif
 

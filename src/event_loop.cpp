@@ -50,11 +50,12 @@ constexpr std::chrono::seconds STOP_TIMEOUT{5};
 std::shared_ptr<EventLoop> EventLoop::create(unsigned scheduler_granularity_us)
 {
     std::shared_ptr<EventLoop> loop(new EventLoop(scheduler_granularity_us));
+    /* The thread records its own id, as the first thing it does and before any
+       Live555 callback can run. Assigning it here from thread.get_id() instead
+       leaves a window in which the loop thread does not recognise itself, and a
+       post() issued from a callback inside that window would queue itself and
+       then block the only thread able to drain the queue. */
     std::thread thread([loop]() { loop->run(); });
-    {
-        std::lock_guard<std::mutex> lock{loop->mutex_};
-        loop->thread_id_ = thread.get_id();
-    }
     /* Detached on purpose: nothing ever joins this thread, which is what makes
        it safe for the loop to outlive its last external owner. */
     thread.detach();
@@ -77,6 +78,10 @@ EventLoop::~EventLoop()
 
 void EventLoop::run()
 {
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        thread_id_ = std::this_thread::get_id();
+    }
     env_->taskScheduler().doEventLoop(&quit_flag_);
     {
         std::lock_guard<std::mutex> lock{mutex_};
