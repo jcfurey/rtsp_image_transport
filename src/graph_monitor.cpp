@@ -31,7 +31,8 @@ std::condition_variable GraphMonitor::instance_released_;
 GraphMonitor::SharedPtr GraphMonitor::instance_;
 
 GraphMonitor::GraphMonitor(rclcpp::Node* node)
-    : node_graph_(node->get_node_graph_interface()), event_(node_graph_->get_graph_event()), shutdown_flag_(false),
+    : node_base_(node->get_node_base_interface()), node_graph_(node->get_node_graph_interface()),
+      event_(node_graph_->get_graph_event()), shutdown_flag_(false),
       thread_(std::bind(&GraphMonitor::eventLoop, this))
 {
     thread_.detach();
@@ -92,7 +93,18 @@ void GraphMonitor::removeListener(GraphMonitorListener* listener)
             if (listeners_.empty())
             {
                 shutdown_flag_.store(true);
-                node_graph_->notify_graph_change();
+                /* Only to wake the wait below. Once the context is down there
+                   is nothing to wake and nothing valid to poke: rclcpp throws
+                   out of this rather than ignoring it, and the loop is about to
+                   notice the flag on its own timeout anyway. */
+                try
+                {
+                    if (node_base_ && node_base_->get_context() && node_base_->get_context()->is_valid())
+                        node_graph_->notify_graph_change();
+                }
+                catch (const std::exception&)
+                {
+                }
             }
         }
     }

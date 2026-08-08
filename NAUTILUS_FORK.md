@@ -111,6 +111,30 @@ against 6.4 ms and 26.9 ms of decoding, so about 1.6% either way. Hardware
 frames are left alone — they live in device memory, and a GPU decoder handles
 slice loss itself.
 
+## The graph monitor aborted the process on node destruction
+
+This is the intermittent test failure that had been written off as a flake. It
+reproduces 10 times in 25 on Rolling once you run the binary on its own:
+
+    [ERROR] [rclcpp]: caught std::exception exception in GraphListener thread:
+            failed to trigger notify guard condition because it is invalid
+    terminate called after throwing an instance of 'std::runtime_error'
+
+`GraphMonitor` held the node's `NodeGraphInterface` in a shared pointer and
+watched it from a detached thread, so the graph interface routinely outlived
+the node. `NodeGraph` keeps only a raw `NodeBaseInterface*`, and its destructor
+is what unregisters the node from rclcpp's own `GraphListener` — deferring that
+destructor past the node leaves the listener polling a node whose base is gone.
+It then throws out of its own thread, which is fatal.
+
+Holding the base interface alive alongside the graph interface fixes it: 0
+failures in 40 runs. `notify_graph_change()` is also no longer called once the
+context has been shut down, where it throws rather than being ignored.
+
+Worth stating plainly because the failure was not confined to tests: the
+publisher plugin is what uses `GraphMonitor`, and a node shutting down while a
+publisher was still advertised is exactly the reproducing sequence.
+
 ## RTP transport and lossy links
 
 Upstream never passes `streamUsingTCP` to `sendSetupCommand()`, so Live555's

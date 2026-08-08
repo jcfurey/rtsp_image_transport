@@ -52,6 +52,14 @@ private:
     explicit GraphMonitor(rclcpp::Node* node);
     void eventLoop();
 
+    /* Declared before node_graph_, so it is destroyed after it. NodeGraph keeps
+       only a raw NodeBaseInterface*, and holding the graph interface alive past
+       the node — which the detached thread below does by construction — leaves
+       that pointer dangling and the node still registered with rclcpp's own
+       GraphListener. That listener then triggers a notify guard condition whose
+       owner is gone, throws out of its thread, and aborts the process. Keeping
+       the base alive for exactly as long as the graph keeps both valid. */
+    rclcpp::node_interfaces::NodeBaseInterface::SharedPtr node_base_;
     rclcpp::node_interfaces::NodeGraphInterface::SharedPtr node_graph_;
     rclcpp::Event::SharedPtr event_;
     std::set<GraphMonitorListener*> listeners_;
