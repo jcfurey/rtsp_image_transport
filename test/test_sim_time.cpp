@@ -116,17 +116,22 @@ public:
 
     bool start(const std::string& topic = "camera/image")
     {
+        auto collect = [this](const sensor_msgs::msg::Image::ConstSharedPtr& img)
+        {
+            std::lock_guard<std::mutex> lock{mutex_};
+            received_.push_back(*img);
+        };
         try
         {
+#if RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API
             publisher_ = image_transport::create_publisher(node_.get(), topic);
-            subscriber_ = image_transport::create_subscription(
-                node_.get(), topic,
-                [this](const sensor_msgs::msg::Image::ConstSharedPtr& img)
-                {
-                    std::lock_guard<std::mutex> lock{mutex_};
-                    received_.push_back(*img);
-                },
-                "rtsp");
+            subscriber_ = image_transport::create_subscription(node_.get(), topic, collect, "rtsp");
+#else
+            /* image_transport 7.0 takes node interfaces, and its QoS argument
+               has no default. */
+            publisher_ = image_transport::create_publisher(*node_, topic, rclcpp::QoS(1));
+            subscriber_ = image_transport::create_subscription(*node_, topic, collect, "rtsp", rclcpp::QoS(1));
+#endif
         }
         catch (const std::exception& e)
         {

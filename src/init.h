@@ -23,6 +23,16 @@
 
 #define FKIE_VERSION_TUPLE(major, minor, patch) (65536 * (major) + 256 * (minor) + patch)
 
+/* image_transport 6.4 added plugin entry points taking node interfaces rather
+   than a node, and stopped calling the old ones. 7.0 removed the old ones
+   altogether, so overriding them there does not compile. The two boundaries are
+   distinct: 6.4 decides which entry point does the work, 7.0 decides whether the
+   legacy one may be declared at all. */
+#define RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES \
+    (CURRENT_IMAGE_TRANSPORT_VERSION >= FKIE_VERSION_TUPLE(6, 4, 0))
+#define RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API \
+    (CURRENT_IMAGE_TRANSPORT_VERSION < FKIE_VERSION_TUPLE(7, 0, 0))
+
 namespace rtsp_image_transport
 {
 

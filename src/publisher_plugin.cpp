@@ -31,16 +31,11 @@
 namespace rtsp_image_transport
 {
 
-/* From image_transport 6.4 the plugin entry points take node interfaces rather
-   than a node, and the old ones are never called. This transport cannot be
-   ported to them yet: RequiredInterfaces carries neither the clock interface
-   the subscriber needs to honour simulated time, nor the waitables interface it
-   uses to hand decoding to the executor, nor the graph interface the publisher
-   watches for departing subscribers. Overriding the new entry point at least
-   turns a silent black screen into something the log explains. */
-#define RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES \
-    (CURRENT_IMAGE_TRANSPORT_VERSION >= FKIE_VERSION_TUPLE(6, 4, 0))
-
+/* The publisher still has no node-interface implementation: RequiredInterfaces
+   carries no graph interface, and this plugin watches the graph to notice
+   departing subscribers. On 6.4 the legacy entry point below is still declared
+   but no longer called, so the new one exists purely to explain the silence; on
+   7.0 the legacy one is gone entirely. See RTSP_IMAGE_TRANSPORT_* in init.h. */
 
 namespace
 {
@@ -97,6 +92,7 @@ std::string PublisherPlugin::getTransportName() const
     return "rtsp";
 }
 
+#if RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API
 void PublisherPlugin::advertiseImpl(rclcpp::Node* node, const std::string& base_topic, rmw_qos_profile_t custom_qos,
                                     rclcpp::PublisherOptions options)
 {
@@ -129,6 +125,7 @@ void PublisherPlugin::advertiseImpl(rclcpp::Node* node, const std::string& base_
                                                               { this->updateParameters(); });
     updateParameters();
 }
+#endif
 
 #if RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
 void PublisherPlugin::advertiseImpl(image_transport::RequiredInterfaces node_interfaces,

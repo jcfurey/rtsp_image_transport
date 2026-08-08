@@ -39,10 +39,8 @@ namespace rtsp_image_transport
    than a node, and the old ones are never called. RequiredInterfaces does not
    include the clock or waitables interfaces. The newer implementation therefore
    uses a short wall timer to process queued frames on the executor and falls
-   back to a system clock for receive timestamps. */
-#define RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES \
-    (CURRENT_IMAGE_TRANSPORT_VERSION >= FKIE_VERSION_TUPLE(6, 4, 0))
-
+   back to a system clock for receive timestamps. See RTSP_IMAGE_TRANSPORT_* in
+   init.h for the 6.4 and 7.0 boundaries. */
 
 namespace
 {
@@ -228,6 +226,7 @@ bool SubscriberPlugin::useReceiveTimestamps() const
     }
 }
 
+#if RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API
 void SubscriberPlugin::subscribeImpl(rclcpp::Node* node, const std::string& base_topic, const Callback& callback,
                                      rmw_qos_profile_t custom_qos, rclcpp::SubscriptionOptions options)
 {
@@ -271,6 +270,7 @@ void SubscriberPlugin::subscribeImpl(rclcpp::Node* node, const std::string& base
         [this](const std::vector<rclcpp::Parameter>&) { this->updateParameters(); });
     updateParameters();
 }
+#endif
 
 #if RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
 void SubscriberPlugin::subscribeImpl(image_transport::RequiredInterfaces node_interfaces,

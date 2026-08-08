@@ -48,9 +48,11 @@ public:
     std::string getTransportName() const override;
 
 protected:
+#if RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API
     void advertiseImpl(rclcpp::Node* node, const std::string& base_topic, rmw_qos_profile_t custom_qos,
                        rclcpp::PublisherOptions options) override;
-#if CURRENT_IMAGE_TRANSPORT_VERSION >= FKIE_VERSION_TUPLE(6, 4, 0)
+#endif
+#if RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
     /* See publisher_plugin.cpp: this entry point exists only to explain why the
        transport does not work on these image_transport versions. */
     void advertiseImpl(image_transport::RequiredInterfaces node_interfaces, const std::string& base_topic,
