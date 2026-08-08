@@ -51,9 +51,11 @@ public:
     std::string getTransportName() const override;
 
 protected:
+#if RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API
     void subscribeImpl(rclcpp::Node* node, const std::string& base_topic, const Callback& callback,
                        rmw_qos_profile_t custom_qos, rclcpp::SubscriptionOptions options) override;
-#if CURRENT_IMAGE_TRANSPORT_VERSION >= FKIE_VERSION_TUPLE(6, 4, 0)
+#endif
+#if RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
     /* Newer image_transport releases pass only their required node interfaces.
        The implementation uses a short wall timer in place of a custom waitable
        and a system clock when the node clock interface is unavailable. */

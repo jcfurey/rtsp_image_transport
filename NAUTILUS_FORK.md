@@ -147,6 +147,18 @@ publishes the RTSP URL directly and is the pattern used by the Deep Trekker and
 FLIR adapters. End-to-end tests that require the publisher plugin still skip on
 these versions.
 
+6.4 and 7.0 are separate boundaries, and conflating them is what kept Rolling
+from compiling. 6.4 added the node-interface entry points and stopped calling
+the old ones, but still declares them, so an override of the old signature
+compiles and is simply never invoked. 7.0 removed them, and an override of a
+method that no longer exists is an error — which is what both plugins were,
+since each declared the legacy entry point unconditionally. The two boundaries
+now have their own macros in `init.h`:
+`RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES` (>= 6.4) decides which entry point
+does the work, and `RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API` (< 7.0) decides
+whether the legacy one may be declared at all. Rolling now builds and passes
+the suite, with the subscriber on its node-interface path.
+
 ## Build system
 
 Converted to `ament_cmake_auto`. package.xml is now the single place the ROS
@@ -172,8 +184,9 @@ the unmodified upstream package:
   linked through `${sensor_msgs_TARGETS}`, and `ament_target_dependencies()` is
   avoided because Lyrical removed it.
 
-Builds on Lyrical with the node-interface subscriber path used by the FLIR
-adapter. The legacy entry points remain for image_transport 6.3 and earlier.
+Builds on Jazzy, Kilted, Lyrical and Rolling. Lyrical and Rolling use the
+node-interface subscriber path used by the FLIR adapter; the legacy entry
+points remain for image_transport 6.3 and earlier and are compiled out from 7.0.
 
 ## Tests
 
