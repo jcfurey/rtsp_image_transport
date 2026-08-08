@@ -148,13 +148,49 @@ is what unregisters the node from rclcpp's own `GraphListener` — deferring tha
 destructor past the node leaves the listener polling a node whose base is gone.
 It then throws out of its own thread, which is fatal.
 
-Holding the base interface alive alongside the graph interface fixes it: 0
-failures in 40 runs. `notify_graph_change()` is also no longer called once the
-context has been shut down, where it throws rather than being ignored.
+Holding the base interface alive alongside the graph interface fixes the abort.
+`notify_graph_change()` is also no longer called once the context has been shut
+down, where it throws rather than being ignored.
 
 Worth stating plainly because the failure was not confined to tests: the
 publisher plugin is what uses `GraphMonitor`, and a node shutting down while a
 publisher was still advertised is exactly the reproducing sequence.
+
+### A second fault underneath it
+
+Removing the abort left a rarer failure with no crash at all: after a monitor
+had been shut down and restarted, the new one never reported a graph change
+again. Instrumenting showed it sitting in `wait_for_graph_change` for the full
+timeout with its flag clear, while a manual `notify_graph_change()` from
+`removeListener` woke it instantly — so the node's own graph changes were not
+reaching it.
+
+The reason is in rclcpp. `NodeGraph::get_graph_event()` registers the node with
+the `GraphListener` only on the first call:
+
+    if (should_add_to_graph_listener_.exchange(false)) {
+      graph_listener_->add_node(this);
+      graph_listener_->start_if_not_started();
+    }
+
+and `GraphListener::run_loop()` leaves out any node that currently has no
+graph users when it builds its wait set:
+
+    if (node_ptr->count_graph_users() == 0) { continue; }
+
+A monitor that shuts down when its last listener leaves releases the node's
+last graph event, so the count falls to zero and the node drops out of the wait
+set. The next monitor's `get_graph_event()` raises the count again but the
+one-shot has already fired, so the listener is never interrupted and never
+re-adds the node. Its graph guard condition is simply not waited on any more.
+
+Holding one graph event per node for the life of the process keeps the count
+above zero. 0 failures in 200 runs of the restart case and 100 of the whole
+binary, against a first failure inside 20 runs before.
+
+This one is not test-only either. It is the publisher's "last subscriber left,
+then a new one arrived" path: the second publisher would never notice
+subscribers appearing or leaving.
 
 ## Event loop thread identity
 
