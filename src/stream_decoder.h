@@ -105,6 +105,10 @@ public:
     /* Hardware device types this build of FFmpeg can instantiate right now.
        Probed once and cached; intended for diagnostics. */
     static std::vector<std::string> availableHwDevices(const std::string& hw_device_path = std::string());
+    /* Every FFmpeg decoder this codec would consider, native and standalone
+       hardware alike. Same reason as the encoder side: a name filed under the
+       wrong codec opens and then decodes garbage. */
+    static std::vector<std::string> candidateDecoderNames(VideoCodec codec);
 
 private:
     static AVPixelFormat selectPixelFormat(AVCodecContext* ctx, const AVPixelFormat* formats);

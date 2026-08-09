@@ -49,6 +49,11 @@ class StreamEncoder
 public:
     StreamEncoder(VideoCodec codec, bool use_hw_encoder = true,
                   const rclcpp::Logger& logger = rclcpp::get_logger("StreamEncoder"));
+    /* The FFmpeg encoders that will be tried for this codec, best first.
+       Exposed so a test can check that each one really does encode the codec it
+       is listed under: a name in the wrong list opens fine and produces a
+       bitstream the receiver cannot make sense of. */
+    static std::vector<std::string> candidateEncoderNames(VideoCodec codec);
     void setBitrate(unsigned long bit_rate);
     void setFramerate(unsigned fps);
     void setPackageSizeHint(unsigned size);
