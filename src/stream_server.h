@@ -74,6 +74,9 @@ private:
 
     StreamServer(const std::string& topic_name, unsigned udp_port, unsigned udp_packet_size,
                  const rclcpp::Logger& logger);
+    /* The bodies of start()/stop(), which must run on the Live555 loop thread */
+    void startOnLoop(VideoCodec codec, bool use_multicast);
+    void stopOnLoop();
 
     rclcpp::Logger logger_;
     VideoCodec codec_;

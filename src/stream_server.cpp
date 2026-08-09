@@ -277,7 +277,24 @@ StreamServer::StreamServer(const std::string& topic_name, unsigned udp_port, uns
                                            : std::format("cannot create RTSP server on port {}", udp_port));
 }
 
+/* Creating and tearing down RTP sinks, RTCP instances and media sessions all
+   reach into objects the Live555 loop dispatches into, and in multicast mode
+   the loop is transmitting from the moment the sink starts playing. Doing that
+   from a ROS executor thread frees a groupsock out from under an in-flight
+   sendto(). Both entry points therefore hand the work to the loop thread and
+   wait for it; post() runs inline when the caller is already the loop thread,
+   so start() calling stop() nests safely. */
 void StreamServer::start(VideoCodec codec, bool use_multicast)
+{
+    loop_->post([this, codec, use_multicast] { startOnLoop(codec, use_multicast); });
+}
+
+void StreamServer::stop()
+{
+    loop_->post([this] { stopOnLoop(); });
+}
+
+void StreamServer::startOnLoop(VideoCodec codec, bool use_multicast)
 {
     RTCPInstance* rtcp = nullptr;
     OutPacketBuffer::increaseMaxSizeTo(MAX_OUT_PACKET_BUFFER_SIZE);
@@ -341,7 +358,7 @@ void StreamServer::start(VideoCodec codec, bool use_multicast)
     RCLCPP_INFO(logger_, "[%s] new RTSP session at %s", topic_name_.c_str(), url_.c_str());
 }
 
-void StreamServer::stop()
+void StreamServer::stopOnLoop()
 {
     std::unique_lock<std::mutex> lock{streams_mutex_};
     if (!url_.empty())
@@ -368,23 +385,44 @@ void StreamServer::stop()
     {
         rtsp_->deleteServerMediaSession(old_sms);
     }
-    /* The multicast RTP objects are ours; the framer closes the FrameInjector
-       feeding it. */
+    /* The multicast RTP objects are ours to close, and the order is not free.
+       The source stays ours throughout: for H.264 and H.265 Live555 wraps it in
+       an H264or5Fragmenter, whose destructor calls detachInputSource() precisely
+       so that ~FramedFilter does not close what it was handed. So the sink never
+       takes the source with it — but it does reach into it while being
+       destroyed, because ~H264or5VideoRTPSink puts the fragmenter back in
+       fSource and calls stopPlaying() one last time.
+
+       Hence: sink first, then the source, which closes the framer and through it
+       the FrameInjector. Closing the source first is a use-after-free inside the
+       sink's destructor; not closing it at all leaks the whole chain. Both were
+       measured under AddressSanitizer, which is what would catch a future
+       Live555 changing its mind about this. */
     if (old_mcast_sink)
         old_mcast_sink->stopPlaying();
-    if (old_mcast_source)
-        Medium::close(old_mcast_source);
     if (old_mcast_rtcp)
         Medium::close(old_mcast_rtcp);
     if (old_mcast_sink)
         Medium::close(old_mcast_sink);
+    if (old_mcast_source)
+        Medium::close(old_mcast_source);
 }
 
 StreamServer::~StreamServer()
 {
-    stop();
-    if (rtsp_)
-        Medium::close(rtsp_);
+    /* Same reason as start()/stop(): the RTSP server object belongs to the loop
+       thread. post() runs inline once the loop has stopped, and inline when
+       this runs on the loop thread itself, so both teardown routes work. */
+    loop_->post(
+        [this]
+        {
+            stopOnLoop();
+            if (rtsp_)
+            {
+                Medium::close(rtsp_);
+                rtsp_ = nullptr;
+            }
+        });
     /* May run on the Live555 thread itself when a callback held the last
        reference; stop() knows not to wait for itself in that case. */
     loop_->stop();
