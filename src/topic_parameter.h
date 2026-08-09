@@ -57,6 +57,28 @@ inline std::string topicParameterBase(const rclcpp::Node& node, const std::strin
     return topicParameterBase(node.get_effective_namespace(), base_topic, transport);
 }
 
+/* The absolute topic name a relative one resolves to when nothing remaps it. */
+inline std::string unremappedTopicName(const std::string& node_namespace, const std::string& default_name)
+{
+    std::string name = node_namespace == "/" ? std::string() : node_namespace;
+    while (!name.empty() && name.back() == '/')
+        name.pop_back();
+    name += '/';
+    name += default_name;
+    return name;
+}
+
+/* Whether the caller actually remapped a relative topic name.
+   resolve_topic_name() always hands back an absolute name — "image" becomes
+   "/image", or "/robot/image" under a namespace — so comparing its result
+   against the relative default can never match, and a check written that way
+   silently never fires. */
+inline bool topicWasRemapped(const std::string& resolved_topic, const std::string& node_namespace,
+                             const std::string& default_name)
+{
+    return resolved_topic != unremappedTopicName(node_namespace, default_name);
+}
+
 }  // namespace rtsp_image_transport
 
 #endif

@@ -18,6 +18,8 @@
  * limitations under the License.
  *
  ****************************************************************************/
+#include "topic_parameter.h"
+
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -44,7 +46,7 @@ int main(int argc, char** argv)
                      self.c_str());
         return 2;
     }
-    if (topic == "image")
+    if (!rtsp_image_transport::topicWasRemapped(topic, node->get_effective_namespace(), "image"))
     {
         RCLCPP_WARN(logger,
                     "Topic 'image' has not been remapped! Typical command line usage:\n"
@@ -74,4 +76,9 @@ int main(int argc, char** argv)
         topic + "/rtsp", rclcpp::QoS(rclcpp::KeepLast(1)).durability(RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL));
     pub->publish(url);
     rclcpp::spin(node);
+    /* Without this the context is still up when the node and its publishers are
+       torn down, which is the sequence that used to take rclcpp's graph
+       listener down with it. */
+    rclcpp::shutdown();
+    return 0;
 }
