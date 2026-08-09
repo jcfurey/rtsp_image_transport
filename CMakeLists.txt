@@ -278,6 +278,9 @@ if(BUILD_TESTING)
         test_graph_monitor
         test_topic_parameter
         test_codec_tables
+        test_frame_extractor
+        test_reconnect_policy
+        test_ffmpeg_logging
     )
     # Serve a real RTSP session; the transport tests additionally drive the
     # image_transport plugins through pluginlib.
