@@ -162,9 +162,12 @@ The parameter sets are now retained in Annex B form and put back whenever the
 buffer is emptied without having been delivered. Re-sending them is harmless —
 a decoder that already has them ignores a repeat.
 
-Reasoned rather than reproduced: constructing a `FrameExtractor` needs a live
-`MediaSubsession`, and the loopback server does not advertise sprop attributes,
-so this path has no direct test.
+This now has a direct test, which it did not when the fix was written. A
+`MediaSubsession` does not need a server behind it — `MediaSession::createNew()`
+parses an SDP string — and a `FramedSource` can be scripted, so the whole path
+runs with no network: a synthetic SDP carrying the VPS, SPS and PPS of a real
+H.265 stream, then a NAL unit larger than the buffer, then an ordinary one. The
+test fails on the unfixed code every time.
 
 ## MPEG-4 hardware encoding produced MJPEG
 
@@ -439,9 +442,21 @@ H.264 test sitting next to it the whole time.
 Coverage is measured with gcov rather than guessed at, and it is what pointed
 at the last round of bugs: the two command line programs had no test at all,
 and `stream_server.cpp` sat at 67% because nothing ever set `use_multicast`.
-Writing the missing tests found a crash in each. Current line coverage of the
-package's own sources runs from 92% for the small files down to about 65% for
-`frame_extractor.cpp`, whose remaining gap is the buffer-growth path.
+Writing the missing tests found a crash in each.
+
+The pieces that had no coverage at all now do. The frame extractor is driven
+over a scripted `FramedSource` against a `MediaSubsession` parsed from an SDP
+string; the reconnect policy moved into `reconnect_policy.h` so the truth table
+and the backoff can be exercised directly; and the ffmpeg-to-ROS log bridge is
+driven through `av_log()` with a capturing rcutils handler, which is what pins
+down the severity mapping and the behaviour around its 256 byte formatting
+buffer.
+
+Moving the backoff out also fixed it. `cooldown_ *= 2` never grows from zero,
+and `reconnect_minwait` is a double parameter, so a launch file setting it to 0
+turned the retry into a spin. `nextReconnectCooldown()` starts from something
+non-zero and clamps before doubling rather than after, so it cannot overflow
+into a negative wait either.
 
 Running all four distributions is worth the wall clock. The multi-slice H.265
 stream the damage tests need takes `x265-params`, and x265 4.x segfaults inside
