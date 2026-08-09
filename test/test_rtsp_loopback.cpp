@@ -47,12 +47,12 @@ namespace
 class LoopbackServer
 {
 public:
-    LoopbackServer(VideoCodec codec, unsigned width, unsigned height)
+    LoopbackServer(VideoCodec codec, unsigned width, unsigned height, bool use_multicast = false)
         : codec_(codec), width_(width), height_(height), stop_(false)
     {
         /* Port 0 lets the OS pick, so parallel test runs cannot collide */
         server_ = StreamServer::create("test_topic", 0, 1396 - 42);
-        server_->start(codec_, /*use_multicast=*/false);
+        server_->start(codec_, use_multicast);
         encoder_ = std::make_unique<StreamEncoder>(codec_, /*use_hw_encoder=*/false);
         encoder_->setBitrate(2000000);
         encoder_->setFramerate(30);
@@ -620,4 +620,100 @@ TEST(RtspLoopback, ServerRestartsCleanlyWithADifferentCodec)
         EXPECT_FALSE(server->url().empty());
     }
     EXPECT_FALSE(server->hasActiveStreams());
+}
+
+/* Multicast is a separate code path in the server: its own RTP and RTCP
+   group sockets, its own sink, and a session that transmits whether or not a
+   client is attached. Nothing exercised it, which is where the leaked sink,
+   RTCP instance and framer went unnoticed across restarts. */
+TEST(RtspLoopback, MulticastServerAdvertisesAUsableUrl)
+{
+    if (!haveEncoderFor(VideoCodec::H264))
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    std::shared_ptr<StreamServer> server = StreamServer::create("test_topic", 0, 1354);
+    ASSERT_NO_THROW(server->start(VideoCodec::H264, /*use_multicast=*/true));
+    const std::string url = server->url();
+    EXPECT_EQ(url.rfind("rtsp://", 0), 0u) << url;
+    /* A multicast session is always transmitting, so it counts as active with
+       no client attached — which is what stops the publisher from tearing the
+       encoder down between subscribers. */
+    EXPECT_TRUE(server->hasActiveStreams());
+    EXPECT_NO_THROW(server->stop());
+    EXPECT_TRUE(server->url().empty());
+}
+
+TEST(RtspLoopback, MulticastServerRestartsWithoutLeaking)
+{
+    if (!haveEncoderFor(VideoCodec::H264))
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    std::shared_ptr<StreamServer> server = StreamServer::create("test_topic", 0, 1354);
+    for (int i = 0; i < 5; ++i)
+    {
+        ASSERT_NO_THROW(server->start(VideoCodec::H264, /*use_multicast=*/true)) << "round " << i;
+        EXPECT_FALSE(server->url().empty());
+        ASSERT_NO_THROW(server->stop()) << "round " << i;
+    }
+}
+
+/* Switching between the two transport modes on one server has to release
+   whichever set of objects the previous mode allocated. */
+TEST(RtspLoopback, ServerSwitchesBetweenUnicastAndMulticast)
+{
+    if (!haveEncoderFor(VideoCodec::H264))
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    std::shared_ptr<StreamServer> server = StreamServer::create("test_topic", 0, 1354);
+    for (int i = 0; i < 3; ++i)
+    {
+        ASSERT_NO_THROW(server->start(VideoCodec::H264, /*use_multicast=*/false));
+        EXPECT_FALSE(server->hasActiveStreams()) << "unicast with no client is idle";
+        ASSERT_NO_THROW(server->stop());
+        ASSERT_NO_THROW(server->start(VideoCodec::H264, /*use_multicast=*/true));
+        EXPECT_TRUE(server->hasActiveStreams()) << "multicast transmits regardless";
+        ASSERT_NO_THROW(server->stop());
+    }
+}
+
+/* Whether closing the multicast sink also closes the source differs by codec:
+   the H.264 and H.265 sinks own it through Live555's fragmenter, the rest do
+   not. Getting that wrong is a double free one way and a leak the other, and
+   neither shows up without running every codec the server can serve. Under
+   AddressSanitizer this is the test that pins the rule down. */
+TEST(RtspLoopback, MulticastTeardownIsCleanForEveryCodec)
+{
+    for (VideoCodec codec : {VideoCodec::H264, VideoCodec::H265, VideoCodec::MPEG4, VideoCodec::VP8, VideoCodec::VP9,
+                             VideoCodec::AV1})
+    {
+        SCOPED_TRACE(videoCodecName(codec));
+        std::shared_ptr<StreamServer> server = StreamServer::create("test_topic", 0, 1354);
+        try
+        {
+            server->start(codec, /*use_multicast=*/true);
+        }
+        catch (const StreamingError&)
+        {
+            /* This Live555 build cannot serve the codec at all */
+            continue;
+        }
+        EXPECT_FALSE(server->url().empty());
+        ASSERT_NO_THROW(server->stop());
+        /* Twice, because the second round is what frees objects the first round
+           left behind rather than the ones it created. */
+        ASSERT_NO_THROW(server->start(codec, /*use_multicast=*/true));
+        ASSERT_NO_THROW(server->stop());
+    }
+}
+
+/* A multicast server still encodes and hands packets to the sink with nobody
+   listening, which is the property the publisher relies on. */
+TEST(RtspLoopback, MulticastServerAcceptsFrames)
+{
+    if (!haveEncoderFor(VideoCodec::H264))
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    LoopbackServer server(VideoCodec::H264, 320, 240, /*use_multicast=*/true);
+    EXPECT_FALSE(server.url().empty());
+
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (server.framesPushed() < 5 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(50ms);
+    EXPECT_GE(server.framesPushed(), 5u) << "no frames reached the multicast sink";
 }
