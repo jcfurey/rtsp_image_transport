@@ -21,6 +21,7 @@
 #include "subscriber_plugin.h"
 
 #include "init.h"
+#include "reconnect_policy.h"
 #include "stream_client.h"
 #include "stream_decoder.h"
 #include "streaming_error.h"
@@ -135,14 +136,6 @@ std::vector<std::shared_ptr<rclcpp::TimerBase>> ScheduledCB::get_timers() const
 #endif
 
 }  // namespace
-
-enum ReconnectPolicy
-{
-    ReconnectNever = 0,
-    ReconnectOnTimeout = 1,
-    ReconnectOnFailure = 2,
-    ReconnectAlways = 3,
-};
 
 using namespace std::chrono_literals;
 
@@ -369,7 +362,7 @@ void SubscriberPlugin::internalCallback(const std_msgs::msg::String::ConstShared
         RCLCPP_ERROR(logger_, "[%s] %s", topic_name_.c_str(), e.what());
         failed_ = true;
         clearQueuedFrames();
-        if (config_->reconnect_policy >= ReconnectOnFailure)
+        if (reconnectAfterFailure(config_->reconnect_policy))
         {
             reconnect();
         }
@@ -586,7 +579,7 @@ void SubscriberPlugin::updateParameters()
         RCLCPP_ERROR(logger_, "[%s] %s", topic_name_.c_str(), e.what());
         failed_ = true;
         clearQueuedFrames();
-        if (config_->reconnect_policy >= ReconnectOnFailure)
+        if (reconnectAfterFailure(config_->reconnect_policy))
         {
             reconnect();
         }
@@ -655,7 +648,7 @@ void SubscriberPlugin::processFrame()
         RCLCPP_ERROR(logger_, "[%s] %s", topic_name_.c_str(), e.what());
         failed_ = true;
         clearQueuedFrames();
-        if (config_->reconnect_policy >= ReconnectOnFailure)
+        if (reconnectAfterFailure(config_->reconnect_policy))
         {
             reconnect();
         }
@@ -673,7 +666,7 @@ void SubscriberPlugin::sessionTimeout()
 {
     RCLCPP_ERROR(logger_, "[%s] session timeout for stream at %s", topic_name_.c_str(),
                  client_ ? client_->url().c_str() : "(unknown)");
-    if (config_->reconnect_policy >= ReconnectOnTimeout)
+    if (reconnectAfterTimeout(config_->reconnect_policy))
     {
         reconnect();
     }
@@ -683,7 +676,7 @@ void SubscriberPlugin::sessionFailed(int code, const std::string& message)
 {
     RCLCPP_ERROR(logger_, "[%s] %s failed. %s (%d)", topic_name_.c_str(),
                  client_ ? client_->url().c_str() : "(unknown)", message.c_str(), code);
-    if (config_->reconnect_policy >= ReconnectOnFailure)
+    if (reconnectAfterFailure(config_->reconnect_policy))
     {
         reconnect();
     }
@@ -692,7 +685,7 @@ void SubscriberPlugin::sessionFailed(int code, const std::string& message)
 void SubscriberPlugin::sessionFinished()
 {
     RCLCPP_INFO(logger_, "[%s] end of video stream", topic_name_.c_str());
-    if (config_->reconnect_policy >= ReconnectAlways)
+    if (reconnectAfterNormalEnd(config_->reconnect_policy))
     {
         reconnect();
     }
@@ -721,9 +714,7 @@ void SubscriberPlugin::reconnect()
         cooldown_timer_ = std::make_shared<rclcpp::WallTimer<rclcpp::VoidCallbackType>>(
             cooldown_, std::bind(&SubscriberPlugin::cooldownTimerCallback, this), nb->get_context());
         nt->add_timer(cooldown_timer_, cooldown_cb_group_);
-        cooldown_ *= 2;
-        if (cooldown_ > config_->reconnect_maxwait)
-            cooldown_ = config_->reconnect_maxwait;
+        cooldown_ = nextReconnectCooldown(cooldown_, config_->reconnect_maxwait);
     }
 }
 
@@ -743,7 +734,7 @@ void SubscriberPlugin::cooldownTimerCallback()
     catch (const std::exception& e)
     {
         RCLCPP_ERROR(logger_, "[%s] %s", topic_name_.c_str(), e.what());
-        if (config_->reconnect_policy >= ReconnectOnFailure)
+        if (reconnectAfterFailure(config_->reconnect_policy))
             reconnect();
     }
 }
