@@ -206,12 +206,22 @@ std::size_t splitNALs(FrameContainer& output, const unsigned char* data, std::si
 const std::map<VideoCodec, std::vector<std::string>> FFMPEG_ENCODERS{
     {VideoCodec::H264, {"h264_vaapi", "h264_qsv", "h264_nvenc", "h264_vulkan", "h264_omx", "libx264", "h264"}},
     {VideoCodec::H265, {"hevc_vaapi", "hevc_qsv", "hevc_nvenc", "hevc_vulkan", "libx265", "h265"}},
-    {VideoCodec::MPEG4, {"mjpeg_vaapi", "mjpeg_qsv", "mpeg4_omx", "libxvid", "mpeg4"}},
+    /* No hardware entry: neither VAAPI nor Quick Sync encodes MPEG-4 Part 2,
+       and the mjpeg_vaapi/mjpeg_qsv that used to head this list are MJPEG
+       encoders. They open perfectly well on a machine with an iGPU, so with
+       use_hw_encoder the publisher produced MJPEG and announced it as MPEG-4. */
+    {VideoCodec::MPEG4, {"mpeg4_omx", "libxvid", "mpeg4"}},
     {VideoCodec::VP8, {"vp8_vaapi", "vp8_qsv", "libvpx", "vp8"}},
     {VideoCodec::VP9, {"vp9_vaapi", "vp9_qsv", "libvpx-vp9", "vp9"}},
     {VideoCodec::AV1, {"av1_vaapi", "av1_qsv", "av1_nvenc", "librav1e", "libaom-av1"}}};
 
 }  // namespace
+
+std::vector<std::string> StreamEncoder::candidateEncoderNames(VideoCodec codec)
+{
+    auto entry = FFMPEG_ENCODERS.find(codec);
+    return entry == FFMPEG_ENCODERS.end() ? std::vector<std::string>() : entry->second;
+}
 
 StreamEncoder::StreamEncoder(VideoCodec codec, bool use_hw_encoder, const rclcpp::Logger& logger)
     : logger_(logger), codec_(codec), initialized_(false), is_vaapi_(false),

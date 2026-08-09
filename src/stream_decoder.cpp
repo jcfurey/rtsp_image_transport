@@ -322,6 +322,18 @@ AVHWDeviceType standaloneDeviceRequirement(const std::string& decoder_name)
 
 }  // namespace
 
+std::vector<std::string> StreamDecoder::candidateDecoderNames(VideoCodec codec)
+{
+    std::vector<std::string> names;
+    auto native = NATIVE_DECODERS.find(codec);
+    if (native != NATIVE_DECODERS.end())
+        names.insert(names.end(), native->second.begin(), native->second.end());
+    auto standalone = STANDALONE_HW_DECODERS.find(codec);
+    if (standalone != STANDALONE_HW_DECODERS.end())
+        names.insert(names.end(), standalone->second.begin(), standalone->second.end());
+    return names;
+}
+
 std::vector<std::string> StreamDecoder::availableHwDevices(const std::string& hw_device_path)
 {
     rclcpp::Logger logger = rclcpp::get_logger("StreamDecoder");
