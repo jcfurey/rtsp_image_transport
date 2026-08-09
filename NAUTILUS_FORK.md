@@ -129,6 +129,22 @@ up that `publish_rtsp_stream` was the one target still built at the compiler's
 default C++ standard rather than C++20, and that it never called
 `rclcpp::shutdown()`.
 
+One thing running them turned up is a middleware difference rather than a bug
+here, worth knowing because it looks like one. The placeholder image on the raw
+topic is published exactly once, latched. On Fast DDS that single
+transient-local `sensor_msgs/Image` reaches a late joiner on Jazzy and Kilted
+but not on Lyrical or Rolling; the `std_msgs/String` URL published moments later
+by the same process reaches it on all four. Measured directly: republishing the
+same image at 5 Hz makes it arrive on Lyrical, with either durability.
+
+The behaviour is left alone. Republishing to force it would put a stream of 1x1
+frames on the user's image topic and skew anything measuring the rate there, and
+republishing the *URL* would be worse — the subscriber tears down and rebuilds
+its RTSP session on every URL message, so a periodic republish would restart the
+stream once a period. The test asserts what the program guarantees, which is
+that the topic is advertised and the sample, if the middleware delivers it, has
+the right shape.
+
 ## SDP parameter sets survive a buffer growth
 
 The VPS/SPS/PPS from the SDP are copied to the front of the frame buffer once,
