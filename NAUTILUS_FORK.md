@@ -111,6 +111,24 @@ against 6.4 ms and 26.9 ms of decoding, so about 1.6% either way. Hardware
 frames are left alone — they live in device memory, and a GPU decoder handles
 slice loss itself.
 
+## The "you forgot to remap" warning never fired
+
+`publish_rtsp_stream` checks whether its image topic was remapped and warns if
+not, because the URL is useless on the default name. The check compared
+`resolve_topic_name("image")` against the string `"image"` — and resolution
+always returns an absolute name, `/image` at the root or `/robot/image` under a
+namespace. It was never equal, so the warning has never appeared for anyone, in
+this fork or upstream. The comparison now goes against the name the topic
+resolves to when nothing remaps it.
+
+Found by measuring coverage rather than by reading: both command line programs
+had no test at all, and they are the documented entry points — the camera
+adapters announce their streams through `publish_rtsp_stream`. They now get
+run as child processes and driven the way a user drives them, which also turned
+up that `publish_rtsp_stream` was the one target still built at the compiler's
+default C++ standard rather than C++20, and that it never called
+`rclcpp::shutdown()`.
+
 ## SDP parameter sets survive a buffer growth
 
 The VPS/SPS/PPS from the SDP are copied to the front of the frame buffer once,
@@ -131,6 +149,54 @@ a decoder that already has them ignores a repeat.
 Reasoned rather than reproduced: constructing a `FrameExtractor` needs a live
 `MediaSubsession`, and the loopback server does not advertise sprop attributes,
 so this path has no direct test.
+
+## MPEG-4 hardware encoding produced MJPEG
+
+The encoder candidate list for MPEG-4 began `mjpeg_vaapi`, `mjpeg_qsv`. Those
+are MJPEG encoders — `AV_CODEC_ID_MJPEG`, not `AV_CODEC_ID_MPEG4` — and the
+stock Ubuntu FFmpeg has both. With `use_hw_encoder` on a machine with an iGPU
+they open, succeed, and encode every frame, so the publisher emitted MJPEG and
+announced it over RTP as MPEG-4 Part 2. Nothing downstream can decode that.
+
+It stayed invisible because it needs the hardware to reproduce: a builder with
+no render node skips both names for want of a device and quietly lands on
+`libxvid`. Neither VAAPI nor Quick Sync encodes MPEG-4 Part 2 at all, so the
+entries are simply gone rather than replaced.
+
+The tables are now checked against libavcodec: every name in every encoder and
+decoder list must report the codec ID of the row it sits in.
+`avcodec_find_encoder_by_name()` answers that whether or not a device exists,
+so the check runs on any machine — which is the point, since this is precisely
+the class of mistake that only bites where the hardware is.
+
+## Multicast crashed on teardown, and nothing ran it
+
+`use_multicast` had no test at all. Writing one crashed on the first call, and
+the fix took two attempts because the ownership rule is the opposite of what it
+looks like.
+
+Live555's H.264 and H.265 sinks put an `H264or5Fragmenter` between themselves
+and the source. A `FramedFilter` normally closes its input source when
+destroyed, so the obvious reading is that the sink owns the chain — but
+`~H264or5Fragmenter` calls `detachInputSource()` for exactly this reason, so it
+does not. The source stays ours. What the sink *does* do is reach back into the
+fragmenter while being destroyed: `~H264or5VideoRTPSink` puts it back in
+`fSource` and calls `stopPlaying()` once more.
+
+So the source has to be closed, and it has to be closed after the sink.
+Closing it first — which is what the code did — is a use-after-free inside the
+sink's destructor. Skipping it, which was the first fix, leaks the framer and
+the `FrameInjector` behind it. AddressSanitizer caught the leak that
+sequence-of-events reasoning had missed; the tests now run every codec the
+server can serve, twice each, so a future Live555 changing its mind shows up.
+
+Underneath that was a second one. `StreamServer::start()` and `stop()` built and
+destroyed Live555 objects on whichever thread called them, while the event loop
+dispatched into the same objects. Unicast hides it, because nothing transmits
+until a client attaches; a multicast sink transmits from the moment it starts
+playing, so teardown freed a groupsock out from under an in-flight `sendto()`.
+Both entry points and the destructor now hand their work to the loop thread, the
+same way `StreamClient` already did.
 
 ## The graph monitor aborted the process on node destruction
 
@@ -353,6 +419,13 @@ Verified on ROS 2 Jazzy, Kilted, Lyrical and Rolling in the official
 `ros:*-ros-base` images. Several of the bugs listed below were found by these
 tests, not by reading — including the H.265 one above, which had a passing
 H.264 test sitting next to it the whole time.
+
+Coverage is measured with gcov rather than guessed at, and it is what pointed
+at the last round of bugs: the two command line programs had no test at all,
+and `stream_server.cpp` sat at 67% because nothing ever set `use_multicast`.
+Writing the missing tests found a crash in each. Current line coverage of the
+package's own sources runs from 92% for the small files down to about 65% for
+`frame_extractor.cpp`, whose remaining gap is the buffer-growth path.
 
 Running all four distributions is worth the wall clock. The multi-slice H.265
 stream the damage tests need takes `x265-params`, and x265 4.x segfaults inside

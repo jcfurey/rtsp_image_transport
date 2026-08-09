@@ -229,6 +229,9 @@ ament_auto_add_executable(publish_rtsp_stream src/publish_rtsp_stream.cpp)
 target_compile_definitions(
     publish_rtsp_stream PRIVATE "ROS_PACKAGE_NAME=\"${PROJECT_NAME}\""
 )
+# Shares the topic name helpers with the plugins, which are C++20. Without this
+# the executable was the one target still built at the compiler default.
+target_compile_features(publish_rtsp_stream PRIVATE cxx_std_20)
 
 ament_auto_add_executable(
     rtsp_camera_proxy src/host_override.cpp src/rtsp_camera_proxy.cpp
@@ -273,6 +276,8 @@ if(BUILD_TESTING)
         test_roundtrip
         test_host_override
         test_graph_monitor
+        test_topic_parameter
+        test_codec_tables
     )
     # Serve a real RTSP session; the transport tests additionally drive the
     # image_transport plugins through pluginlib.
@@ -290,6 +295,22 @@ if(BUILD_TESTING)
             set_tests_properties(${test_name} PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=157")
         endif()
     endforeach()
+
+    # Runs the two command line programs as child processes, so it needs to
+    # know where they were built and must not start before they exist. Its own
+    # ROS domain: it waits on latched topics by name, and the loopback tests
+    # publish similar ones alongside it.
+    ament_auto_add_gtest(test_executables test/test_executables.cpp TIMEOUT 300)
+    if(TARGET test_executables)
+        target_link_libraries(test_executables ${PROJECT_NAME}_core)
+        target_compile_definitions(
+            test_executables PRIVATE "RTSP_BINARY_DIR=\"${CMAKE_CURRENT_BINARY_DIR}\""
+        )
+        add_dependencies(test_executables publish_rtsp_stream rtsp_camera_proxy)
+        set_tests_properties(
+            test_executables PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=158"
+        )
+    endif()
 endif()
 
 # Ament package handling. ament_auto_package() installs the executables to
