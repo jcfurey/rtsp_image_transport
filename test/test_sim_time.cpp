@@ -235,6 +235,8 @@ TEST(Transport, PluginsAreActuallyDrivenByImageTransport)
         << "the subscriber plugin never declared its correctly scoped parameters";
     EXPECT_TRUE(fixture.node_->has_parameter("alive.image.rtsp.timestamp_source"))
         << "the subscriber plugin never declared its correctly scoped parameters";
+    EXPECT_TRUE(fixture.node_->has_parameter("alive.image.rtsp.frame_id"))
+        << "the subscriber plugin did not expose decoded-image frame stamping";
     EXPECT_FALSE(fixture.node_->has_parameter("live.image.rtsp.use_hw_decoder"))
         << "the relative topic lost its first character while constructing parameter names";
 }

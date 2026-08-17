@@ -157,6 +157,7 @@ enum TimestampSource
 struct RTSP_IMAGE_TRANSPORT_NO_EXPORT SubscriberPlugin::Config
 {
     StreamDecoder::Options decoder;
+    std::string frame_id;
     TimestampSource timestamp_source = TimestampAuto;
     int video_subsession = 0;
     bool rtp_over_tcp = true;
@@ -419,6 +420,10 @@ void SubscriberPlugin::setupParameters(
 {
     using rcl_interfaces::msg::ParameterDescriptor;
     declareParameter(
+        node_parameters, param_base_name_ + ".frame_id", rclcpp::ParameterValue(config_->frame_id),
+        ParameterDescriptor().set__description(
+            "frame_id assigned to decoded images (RTSP video carries no ROS header)"));
+    declareParameter(
         node_parameters, param_base_name_ + ".use_hw_decoder",
         rclcpp::ParameterValue(config_->decoder.use_hw_decoder),
         ParameterDescriptor().set__description("use GPU accelerated video decoding if possible"));
@@ -509,6 +514,7 @@ void SubscriberPlugin::updateParameters()
     if (!np)
         return;
     Config new_config;
+    new_config.frame_id = np->get_parameter(param_base_name_ + ".frame_id").as_string();
     new_config.decoder.use_hw_decoder = np->get_parameter(param_base_name_ + ".use_hw_decoder").as_bool();
     new_config.decoder.hw_device = np->get_parameter(param_base_name_ + ".hw_device").as_string();
     new_config.decoder.hw_device_path = np->get_parameter(param_base_name_ + ".hw_device_path").as_string();
@@ -632,8 +638,10 @@ void SubscriberPlugin::processFrame()
             }
             if (decoder->decodeVideo(frame) > 0)
             {
-                while (sensor_msgs::msg::Image::ConstSharedPtr img = decoder->nextFrame())
+                while (sensor_msgs::msg::Image::UniquePtr decoded = decoder->nextFrame())
                 {
+                    decoded->header.frame_id = config_->frame_id;
+                    sensor_msgs::msg::Image::ConstSharedPtr img(std::move(decoded));
                     callback_(img);
                 }
             }
