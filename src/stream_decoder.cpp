@@ -50,6 +50,19 @@ extern "C"
 #  include <immintrin.h>
 #endif
 
+#include <cstddef>
+#include <cstdint>
+/* Streaming stores are x86-64 only here. Restricting to __x86_64__ (rather than
+ * any i386) guarantees SSE2 is baseline, so _mm_sfence() needs no target gate.
+ * The AVX2 body itself is compiled with a target attribute because the build is
+ * plain -O2 with no -march, and entered only after __builtin_cpu_supports. */
+#if defined(__x86_64__) && defined(__GNUC__)
+#  define PREFILL_HAVE_X86_STREAM 1
+#  include <immintrin.h>
+#else
+#  define PREFILL_HAVE_X86_STREAM 0
+#endif
+
 namespace rtsp_image_transport
 {
 
@@ -646,26 +659,113 @@ AVPixelFormat StreamDecoder::selectPixelFormat(AVCodecContext* ctx, const AVPixe
 /* Fills freshly allocated frames so that macroblocks the decoder never writes
    are recognisable afterwards, and read as black rather than as bright green.
    Installed only for the codecs libavcodec cannot conceal slice loss for. */
-int StreamDecoder::prepareFrameBuffer(AVCodecContext* ctx, AVFrame* frame, int flags)
+namespace {
+
+/* Below this the non-temporal path is not worth it: the write-combining
+ * buffers need a long run to amortise, and a plane this small may still be
+ * usefully cache-resident for whatever touches it next. Small planes -- and
+ * every degenerate case in the contract sweep -- stay on plain memset. */
+constexpr std::size_t kStreamThreshold = 128u * 1024u;
+
+#if PREFILL_HAVE_X86_STREAM
+
+/* Fills exactly n bytes at dst. Head and tail go through memset so the
+ * streaming body only ever sees 32-byte-aligned addresses; the head clamp is
+ * what stops a short plane from stepping into the poisoned guard band. */
+__attribute__((target("avx2")))
+void fill_stream_avx2(unsigned char* dst, unsigned char value, std::size_t n) noexcept
 {
-    const int result = avcodec_default_get_buffer2(ctx, frame, flags);
-    if (result < 0)
-        return result;
+    std::size_t head = (32u - (reinterpret_cast<std::uintptr_t>(dst) & 31u)) & 31u;
+    if (head > n)
+        head = n;
+    if (head != 0)
+    {
+        std::memset(dst, value, head);
+        dst += head;
+        n -= head;
+    }
+
+    const __m256i v = _mm256_set1_epi8(static_cast<char>(value));
+    while (n >= 128)
+    {
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(dst + 0), v);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(dst + 32), v);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(dst + 64), v);
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(dst + 96), v);
+        dst += 128;
+        n -= 128;
+    }
+    while (n >= 32)
+    {
+        _mm256_stream_si256(reinterpret_cast<__m256i*>(dst), v);
+        dst += 32;
+        n -= 32;
+    }
+    if (n != 0)
+        std::memset(dst, value, n);
+}
+
+bool cpu_has_avx2() noexcept
+{
+    static const bool ok = __builtin_cpu_supports("avx2") != 0;
+    return ok;
+}
+
+#endif // PREFILL_HAVE_X86_STREAM
+
+// Returns true when non-temporal stores were used, i.e. the caller owes a fence.
+bool fill_plane(void* p, unsigned char value, std::size_t n) noexcept
+{
+#if PREFILL_HAVE_X86_STREAM
+    if (n >= kStreamThreshold && cpu_has_avx2())
+    {
+        fill_stream_avx2(reinterpret_cast<unsigned char*>(p), value, n);
+        return true;
+    }
+#endif
+    std::memset(p, value, n);
+    return false;
+}
+
+} // namespace
+
+static void prefillPlanes(AVFrame* frame) noexcept
+{
+
     const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
-    /* Hardware frames live in device memory and are not ours to touch */
     if (!desc || (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) != 0)
-        return result;
+        return;
+
+    bool streamed = false;
     for (int plane = 0; plane < AV_NUM_DATA_POINTERS && frame->data[plane]; ++plane)
     {
         const int height = plane == 0 ? frame->height : AV_CEIL_RSHIFT(frame->height, desc->log2_chroma_h);
         const int stride = frame->linesize[plane];
         const unsigned char value = plane == 0 ? FRAME_FILL_LUMA : FRAME_FILL_CHROMA;
-        /* A negative stride means data[] points at the last row and the plane
-           runs backwards; nothing a decoder produces, but filling it forwards
-           would run off the end of the allocation. */
         if (stride > 0 && height > 0)
-            std::memset(frame->data[plane], value, static_cast<std::size_t>(stride) * height);
+        {
+            const std::size_t bytes = static_cast<std::size_t>(stride) * static_cast<std::size_t>(height);
+            streamed = fill_plane(frame->data[plane], value, bytes) || streamed;
+        }
     }
+
+#if PREFILL_HAVE_X86_STREAM
+    /* Once per frame, not once per plane. Non-temporal stores are weakly
+     * ordered and libavcodec hands this buffer straight to its worker threads;
+     * without this they are not guaranteed to observe the fill. */
+    if (streamed)
+        _mm_sfence();
+#else
+    (void)streamed;
+#endif
+}
+
+int StreamDecoder::prepareFrameBuffer(AVCodecContext* ctx, AVFrame* frame, int flags)
+{
+    const int result = avcodec_default_get_buffer2(ctx, frame, flags);
+    if (result < 0)
+        return result;
+    prefillPlanes(frame);
     return result;
 }
 
