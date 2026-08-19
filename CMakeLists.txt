@@ -181,6 +181,7 @@ add_library(
     ${PROJECT_NAME}_core STATIC
     src/event_loop.cpp
     src/frame_data.cpp
+    src/frame_fill.cpp
     src/frame_extractor.cpp
     src/frame_injector.cpp
     src/graph_monitor.cpp
@@ -271,6 +272,7 @@ if(BUILD_TESTING)
         test_stream_clock
         test_time_handling
         test_frame_data
+        test_frame_fill
         test_stream_decoder
         test_stream_encoder
         test_roundtrip
