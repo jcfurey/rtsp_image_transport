@@ -89,6 +89,14 @@ public:
            whereas dropping trades artefacts for stutter. Turn it on for
            consumers that would rather see nothing than see wrong pixels. */
         bool drop_corrupt_frames = false;
+        /* Worker threads for the YUV to BGR conversion. The conversion is
+           bandwidth-bound and scales well past this on a workstation -- 4K
+           measures about 2.8x faster at 20 threads than at 4 -- but this driver
+           shares a CPU with everything else on the vehicle, and a camera per
+           stream taking that many threads is not a good neighbour. The default
+           stays where it has always been; raise it per deployment when the core
+           budget actually allows. 0 uses hardware_concurrency() unclamped. */
+        int sws_threads = 4;
     };
 
     StreamDecoder(VideoCodec codec, const Options& options,

@@ -139,11 +139,16 @@ bool isKeyFrame(const AVFrame* frame) noexcept
    requires the sws_scale_frame() calling convention; falls back to a plain
    single threaded context otherwise. */
 std::shared_ptr<SwsContext> allocScaler(int width, int height, AVPixelFormat src_format, AVPixelFormat dst_format,
-                                        bool& threaded)
+                                        int requested_threads, bool& threaded)
 {
     threaded = false;
 #ifdef FFMPEG_HAS_SWS_THREADS
-    int threads = static_cast<int>(std::clamp<unsigned>(std::thread::hardware_concurrency(), 1u, 4u));
+    /* A request of 0 means "as many as the machine has"; anything else is taken
+       as the ceiling, so a deployment that has the cores to spare can raise it
+       without rebuilding. Either way it cannot exceed hardware_concurrency(). */
+    const unsigned available = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned ceiling = requested_threads > 0 ? static_cast<unsigned>(requested_threads) : available;
+    int threads = static_cast<int>(std::clamp(available, 1u, ceiling));
     if (threads > 1)
     {
         SwsContext* ctx = sws_alloc_context();
@@ -1041,7 +1046,8 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
             width_ = source->width;
             height_ = source->height;
             last_pixel_format_ = source_format;
-            sws_ = allocScaler(width_, height_, last_pixel_format_, AV_PIX_FMT_BGR24, sws_threaded_);
+            sws_ = allocScaler(width_, height_, last_pixel_format_, AV_PIX_FMT_BGR24,
+                              options_.sws_threads, sws_threaded_);
             if (!sws_)
             {
                 const char* name = av_get_pix_fmt_name(last_pixel_format_);

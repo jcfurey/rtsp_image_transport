@@ -478,6 +478,14 @@ void SubscriberPlugin::setupParameters(
             "drop frames the decoder could not fully reconstruct instead of publishing the concealed "
             "result; trades artefacts for stutter on a lossy stream"));
     declareParameter(
+        node_parameters, param_base_name_ + ".sws_threads",
+        rclcpp::ParameterValue(config_->decoder.sws_threads),
+        ParameterDescriptor()
+            .set__description("worker threads for the YUV to BGR conversion (0 = one per hardware thread); "
+                              "the default shares the CPU with the rest of the vehicle rather than taking "
+                              "everything the machine has")
+            .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(64)}));
+    declareParameter(
         node_parameters, param_base_name_ + ".reconnect_policy",
         rclcpp::ParameterValue(static_cast<int>(config_->reconnect_policy)),
         ParameterDescriptor()
@@ -529,6 +537,8 @@ void SubscriberPlugin::updateParameters()
         static_cast<int>(np->get_parameter(param_base_name_ + ".rtp_buffer_size").as_int());
     new_config.decoder.drop_corrupt_frames =
         np->get_parameter(param_base_name_ + ".drop_corrupt_frames").as_bool();
+    new_config.decoder.sws_threads =
+        static_cast<int>(np->get_parameter(param_base_name_ + ".sws_threads").as_int());
     new_config.reconnect_policy =
         static_cast<ReconnectPolicy>(np->get_parameter(param_base_name_ + ".reconnect_policy").as_int());
     new_config.timeout = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
