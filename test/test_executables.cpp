@@ -22,6 +22,9 @@
    documented entry points — publish_rtsp_stream is how the camera adapters
    announce a stream — and neither had any test at all. */
 
+#include "stream_client.h"
+#include "test_helpers.h"
+
 #include <gtest/gtest.h>
 
 #include <rclcpp/rclcpp.hpp>
@@ -30,7 +33,9 @@
 
 #include <chrono>
 #include <csignal>
+#include <condition_variable>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -39,6 +44,8 @@
 #include <unistd.h>
 
 using namespace std::chrono_literals;
+using namespace rtsp_image_transport;
+using namespace rtsp_image_transport::test;
 
 namespace
 {
@@ -135,6 +142,60 @@ bool awaitUrl(const std::string& topic, std::string& out, std::chrono::seconds b
         rclcpp::spin_some(node);
     return got;
 }
+
+bool waitForSubscriptionCount(const rclcpp::PublisherBase::SharedPtr& publisher, std::size_t wanted,
+                              std::chrono::seconds budget)
+{
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        if (publisher->get_subscription_count() == wanted)
+            return true;
+        std::this_thread::sleep_for(20ms);
+    }
+    return false;
+}
+
+class RtspObserver
+{
+public:
+    void attach(const std::shared_ptr<StreamClient>& client)
+    {
+        client->setSessionFailedHandler(
+            [this](int, const std::string& message)
+            {
+                std::lock_guard<std::mutex> lock{mutex_};
+                failure_ = message;
+                cv_.notify_all();
+            });
+        client->setReceiveStreamDataHandler(
+            [this](VideoCodec, MediaSubsession*, const FrameDataPtr&)
+            {
+                std::lock_guard<std::mutex> lock{mutex_};
+                ++nal_count_;
+                cv_.notify_all();
+            });
+    }
+
+    bool waitForNals(std::size_t wanted, std::chrono::seconds budget)
+    {
+        std::unique_lock<std::mutex> lock{mutex_};
+        return cv_.wait_for(lock, budget, [&] { return nal_count_ >= wanted || !failure_.empty(); })
+               && failure_.empty() && nal_count_ >= wanted;
+    }
+
+    std::string failure()
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        return failure_;
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::size_t nal_count_ = 0;
+    std::string failure_;
+};
 
 }  // namespace
 
@@ -251,6 +312,61 @@ TEST(RtspCameraProxy, AdvertisesAProxyUrlPerCamera)
     EXPECT_EQ(received.rfind("rtsp://", 0), 0u) << "advertised URL was " << received;
     /* Its own server, not the upstream camera it proxies for. */
     EXPECT_EQ(received.find("192.0.2.1"), std::string::npos) << "the upstream URL was advertised: " << received;
+}
+
+TEST(ImageTransportRepublish, NativeRtspClientDrivesLazyInput)
+{
+    /* image_transport republish normally subscribes to `in` only while its
+       output has a ROS subscriber. A native RTSP client is not in the ROS
+       graph, so this is the regression test for the publisher plugin's virtual
+       matched event: direct RTSP demand must start the raw subscription and
+       leaving must release it again. */
+    if (!testEncoderFor(VideoCodec::H264))
+        GTEST_SKIP() << "no software H.264 encoder in this FFmpeg build";
+
+    constexpr const char* input_topic = "/native_demand/input";
+    constexpr const char* output_topic = "/native_demand/output/rtsp";
+    auto node = std::make_shared<rclcpp::Node>("native_demand_test_source");
+    auto publisher = node->create_publisher<sensor_msgs::msg::Image>(input_topic, rclcpp::QoS(1));
+
+    std::jthread pump(
+        [&](std::stop_token stop)
+        {
+            unsigned sequence = 0;
+            while (!stop.stop_requested())
+            {
+                publisher->publish(makeTestImage(320, 240, sequence++));
+                std::this_thread::sleep_for(33ms);
+            }
+        });
+
+    Child relay("/usr/bin/env",
+                {"ros2", "run", "image_transport", "republish", "--ros-args", "-p", "in_transport:=raw", "-p",
+                 "out_transport:=rtsp", "-p", "out.rtsp.codec:=H264", "-p", "out.rtsp.use_hw_encoder:=false",
+                 "-p", "out.rtsp.udp_port:=0", "-r", std::string("in:=") + input_topic, "-r",
+                 std::string("out/rtsp:=") + output_topic, "-r", "__node:=native_demand_republisher"});
+    ASSERT_TRUE(relay.started());
+
+    /* A short-lived ROS subscriber gets the advertised URL. Once it is gone,
+       prove the normal republisher match callback has made the input lazy
+       before testing the native-client path. */
+    std::string url;
+    ASSERT_TRUE(awaitUrl(output_topic, url, 30s)) << "the relay never advertised its RTSP URL";
+    ASSERT_TRUE(waitForSubscriptionCount(publisher, 0, 10s))
+        << "the relay kept its raw input after the URL subscriber left";
+
+    RtspObserver observer;
+    std::shared_ptr<StreamClient> client = StreamClient::create("native_demand", url);
+    observer.attach(client);
+    ASSERT_NO_THROW(client->connect());
+
+    ASSERT_TRUE(waitForSubscriptionCount(publisher, 1, 10s))
+        << "a native RTSP client did not activate the raw image subscription";
+    ASSERT_TRUE(observer.waitForNals(3, 30s)) << "no video reached the native RTSP client: " << observer.failure();
+
+    client->disconnect();
+    ASSERT_TRUE(waitForSubscriptionCount(publisher, 0, 10s))
+        << "the relay kept its raw input after the native RTSP client left";
 }
 
 int main(int argc, char** argv)

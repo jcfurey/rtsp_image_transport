@@ -1,0 +1,80 @@
+# Copyright © 2026 Nautilus project contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Low-latency ROS image topic -> H.264 RTSP relay.
+#
+# Usually only input_topic and output_topic need changing:
+#   ros2 launch rtsp_image_transport ros_to_rtsp_h264.launch.yaml \
+#     input_topic:=/camera/image_raw \
+#     output_topic:=/camera/image_h264/rtsp
+#
+# Read the resulting RTSP URL with:
+#   ros2 topic echo --once /camera/image_h264/rtsp
+
+launch:
+  - arg:
+      name: input_topic
+      default: /camera/image_raw
+      description: Raw sensor_msgs/Image topic to encode
+  - arg:
+      name: output_topic
+      default: /camera/image_h264/rtsp
+      description: std_msgs/String topic on which the RTSP URL is advertised
+  - arg:
+      name: rtsp_port
+      default: '8555'
+      description: TCP port on which the RTSP server listens
+  - arg:
+      name: bitrate
+      default: '8000000'
+      description: Target video bitrate in bits per second
+  - arg:
+      name: framerate
+      default: '30'
+      description: Expected source frame rate
+
+  - node:
+      pkg: image_transport
+      exec: republish
+      name: image_to_rtsp_h264
+      output: screen
+      param:
+        - name: in_transport
+          value: raw
+        - name: out_transport
+          value: rtsp
+        - name: out.rtsp.codec
+          value: H264
+        - name: out.rtsp.target_bitrate
+          value: $(var bitrate)
+          type: int
+        - name: out.rtsp.expected_framerate
+          value: $(var framerate)
+          type: int
+        - name: out.rtsp.use_hw_encoder
+          value: true
+        - name: out.rtsp.udp_port
+          value: $(var rtsp_port)
+          type: int
+        - name: out.rtsp.udp_packet_size
+          value: 1396
+        - name: out.rtsp.use_ip_multicast
+          value: false
+
+        # Best-effort accepts both SensorDataQoS and reliable image sources.
+        # Depth 1 prevents stale frames from accumulating ahead of the encoder.
+        - name: qos_overrides.$(var input_topic).subscription.reliability
+          value: best_effort
+        - name: qos_overrides.$(var input_topic).subscription.history
+          value: keep_last
+        - name: qos_overrides.$(var input_topic).subscription.depth
+          value: 1
+        - name: qos_overrides.$(var input_topic).subscription.durability
+          value: volatile
+      remap:
+        - from: in
+          to: $(var input_topic)
+        # Remap the full transport topic. Remapping only "out" does not remap
+        # its "out/rtsp" child in ROS 2.
+        - from: out/rtsp
+          to: $(var output_topic)

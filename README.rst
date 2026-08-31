@@ -25,6 +25,60 @@ The ``rtsp_image_transport`` plugin is compatible with many commercially
 available IP cameras. You can use the ``publish_rtsp_stream`` node to create an
 image topic with RTSP transport that reuses the existing RTSP stream.
 
+ROS Image Topic to RTSP
+=======================
+
+The package includes ready-to-run Jazzy launch YAMLs for the other direction:
+encoding a regular ``sensor_msgs/Image`` topic and serving it to native RTSP
+clients. H.264 is the broadly compatible choice::
+
+  ros2 launch rtsp_image_transport ros_to_rtsp_h264.launch.yaml \
+      input_topic:=/camera/image_raw \
+      output_topic:=/camera/image_h264/rtsp
+
+The HEVC example uses less bandwidth at comparable quality::
+
+  ros2 launch rtsp_image_transport ros_to_rtsp_h265.launch.yaml \
+      input_topic:=/camera/image_raw \
+      output_topic:=/camera/image_h265/rtsp
+
+Those topic arguments are normally the only values to change. The H.264 and
+H.265 examples default to ports 8555 and 8556, respectively, and also accept
+``rtsp_port``, ``bitrate`` and ``framerate`` launch arguments. Both request a
+hardware encoder and transparently fall back to software when the machine has
+no usable one. On NVIDIA hardware the selected encoder is logged as
+``h264_nvenc`` or ``hevc_nvenc``.
+
+The output ROS topic carries the URL, not the video. Read it once, then hand
+the value to ffplay, VLC, GStreamer, or another RTSP client::
+
+  ros2 topic echo --once /camera/image_h264/rtsp
+  ffplay -rtsp_transport tcp -fflags nobuffer -flags low_delay \
+      rtsp://HOST:8555/
+
+The examples request best-effort input QoS with depth 1. That accepts both the
+usual ``SensorDataQoS`` camera publisher and a reliable publisher, while
+preventing old images from queuing ahead of the encoder. The encoder itself is
+configured for no B-frames, zero look-ahead and the hardware encoder's
+low-latency preset.
+
+The relay is demand-driven. While no native client is playing the stream,
+``image_transport republish`` releases its raw input subscription and the
+encoder does no work. A native RTSP PLAY request activates the subscription in
+about 10 ms; disconnecting the last client releases it again. Merely reading
+the URL once therefore does not leave a high-bandwidth raw subscription or GPU
+encoder running.
+
+If starting the relay by hand instead of using the launch YAML, remap the full
+``out/rtsp`` topic. In ROS 2, remapping ``out`` alone does not also remap that
+child transport topic::
+
+  ros2 run image_transport republish --ros-args \
+      -p in_transport:=raw -p out_transport:=rtsp \
+      -p out.rtsp.codec:=H264 -p out.rtsp.use_hw_encoder:=true \
+      -r in:=/camera/image_raw \
+      -r out/rtsp:=/camera/image_h264/rtsp
+
 Multiple Video Subsessions
 ==========================
 
@@ -298,20 +352,14 @@ retrying a stream that no longer exists.
 Supported image_transport versions
 ==================================
 
-This transport works with ``image_transport`` up to and including 6.3, which
-covers ROS 2 Jazzy and Kilted.
+The transport supports both the legacy plugin API used by Jazzy and Kilted and
+the node-interface API introduced in ``image_transport`` 6.4.
 
-From 6.4 onwards (Lyrical, Rolling) ``image_transport`` calls plugins through a
-new entry point that receives a fixed set of node interfaces. That set does not
-include the clock interface this transport needs to honour simulated time, the
-waitables interface it uses to hand decoding to the executor, or the graph
-interface the publisher watches for departing subscribers, so the plugins
-cannot be ported to it as they stand. On those versions the topics are still
-created but no video is served, and both plugins say so::
-
-  [/camera0] the rtsp transport is not supported with image_transport 6.4: its
-             plugin API no longer provides the clock, waitables and graph
-             interfaces this transport needs.
+The newer API does not provide the node clock interface. Consequently, on
+6.4+ a subscriber plugin cannot stamp decoded images in simulated ROS time;
+select ``timestamp_source:=1`` for receive timestamps, which use the system
+clock on that API. Encoding, native RTSP serving, lazy ROS-to-RTSP republishing,
+QoS handling, and wall-clock operation are supported normally.
 
 Building
 ========

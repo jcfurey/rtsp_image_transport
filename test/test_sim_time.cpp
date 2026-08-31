@@ -36,19 +36,17 @@ using namespace std::chrono_literals;
 using namespace rtsp_image_transport::test;
 
 /* image_transport 6.4 replaced the plugin entry points with ones that take node
-   interfaces. The subscriber supports that API, but RequiredInterfaces still
-   lacks the graph interface needed by the RTSP publisher plugin. These tests
-   exercise a complete publisher/subscriber transport hop, so they remain
-   unavailable until the publisher can monitor its subscriber graph. */
-#define TRANSPORT_IS_SUPPORTED (CURRENT_IMAGE_TRANSPORT_VERSION < FKIE_VERSION_TUPLE(6, 4, 0))
-#define SKIP_IF_TRANSPORT_UNSUPPORTED()                                                             \
+   interfaces. Encoding and transport work through that API, but it does not
+   include the node clock interface the subscriber needs for simulated stamps. */
+#define TRANSPORT_SUPPORTS_SIM_TIME (CURRENT_IMAGE_TRANSPORT_VERSION < FKIE_VERSION_TUPLE(6, 4, 0))
+#define SKIP_IF_SIM_TIME_UNSUPPORTED()                                                              \
     do                                                                                              \
     {                                                                                               \
-        if (!TRANSPORT_IS_SUPPORTED)                                                                \
+        if (!TRANSPORT_SUPPORTS_SIM_TIME)                                                           \
             GTEST_SKIP() << "image_transport " << (CURRENT_IMAGE_TRANSPORT_VERSION >> 16) << "."     \
                          << ((CURRENT_IMAGE_TRANSPORT_VERSION >> 8) & 0xff)                          \
-                         << " uses the node-interface plugin API, whose interfaces are insufficient " \
-                            "for the RTSP publisher plugin used by this round-trip test";             \
+                         << " does not give subscriber plugins the node clock interface needed "      \
+                            "for simulated image stamps";                                            \
     } while (0)
 
 namespace
@@ -193,7 +191,6 @@ private:
 
 TEST(Transport, DeliversImagesEndToEnd)
 {
-    SKIP_IF_TRANSPORT_UNSUPPORTED();
     /* The whole transport in one process: encode, serve over RTSP, discover the
        URL over the latched topic, connect, decode. Also proves the publisher
        and subscriber QoS settings actually match each other. */
@@ -216,7 +213,6 @@ TEST(Transport, DeliversImagesEndToEnd)
 
 TEST(Transport, PluginsAreActuallyDrivenByImageTransport)
 {
-    SKIP_IF_TRANSPORT_UNSUPPORTED();
     /* image_transport has more than one plugin entry point, and picking the
        wrong one to override compiles cleanly but leaves the plugin inert: the
        topic appears, no RTSP server is ever started, and no video flows. The
@@ -243,7 +239,6 @@ TEST(Transport, PluginsAreActuallyDrivenByImageTransport)
 
 TEST(Transport, SubscriberQosMatchesPublisher)
 {
-    SKIP_IF_TRANSPORT_UNSUPPORTED();
     /* Both ends force RELIABLE and TRANSIENT_LOCAL on the URL topic. If those
        ever drift apart the subscriber silently receives nothing, so check the
        endpoints agree rather than waiting for video to fail. */
@@ -279,7 +274,7 @@ TEST(Transport, SubscriberQosMatchesPublisher)
 
 TEST(Transport, DeliversImagesStampedInSimulatedTime)
 {
-    SKIP_IF_TRANSPORT_UNSUPPORTED();
+    SKIP_IF_SIM_TIME_UNSUPPORTED();
     /* With use_sim_time the rest of the system works in the simulated time
        base. Images arriving stamped with the sender's wall clock would be
        hours or years away from it, and every downstream TF lookup or message
@@ -311,7 +306,7 @@ TEST(Transport, DeliversImagesStampedInSimulatedTime)
 
 TEST(Transport, KeepsDeliveringWhenTheClockJumpsBackwards)
 {
-    SKIP_IF_TRANSPORT_UNSUPPORTED();
+    SKIP_IF_SIM_TIME_UNSUPPORTED();
     /* `ros2 bag play --loop --clock` sends the clock back to the start of the
        recording. The stream has to carry on rather than stalling. */
     TransportFixture fixture("rtsp_transport_bag_loop", /*use_sim_time=*/true);

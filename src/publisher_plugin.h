@@ -28,6 +28,11 @@
 
 #include <image_transport/simple_publisher_plugin.hpp>
 #include <rclcpp/graph_listener.hpp>
+#include <rclcpp/node_interfaces/node_base_interface.hpp>
+#include <rclcpp/node_interfaces/node_interfaces.hpp>
+#include <rclcpp/node_interfaces/node_parameters_interface.hpp>
+#include <rclcpp/node_interfaces/node_timers_interface.hpp>
+#include <rclcpp/timer.hpp>
 #include <std_msgs/msg/string.hpp>
 
 namespace rtsp_image_transport
@@ -53,15 +58,25 @@ protected:
                        rclcpp::PublisherOptions options) override;
 #endif
 #if RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
-    /* See publisher_plugin.cpp: this entry point exists only to explain why the
-       transport does not work on these image_transport versions. */
+    /* Newer image_transport releases pass only their required node interfaces.
+       They do not include the graph interface, so this path relies on the RTSP
+       server's active-stream state instead of the graph-listener optimization. */
     void advertiseImpl(image_transport::RequiredInterfaces node_interfaces, const std::string& base_topic,
                        rclcpp::QoS custom_qos, rclcpp::PublisherOptions options) override;
 #endif
     void publish(const sensor_msgs::msg::Image& image, const PublisherT& publisher) const override;
 
 private:
-    void setupParameters(rclcpp::Node* node);
+    using DemandInterfaces = rclcpp::node_interfaces::NodeInterfaces<
+        rclcpp::node_interfaces::NodeBaseInterface, rclcpp::node_interfaces::NodeParametersInterface,
+        rclcpp::node_interfaces::NodeTimersInterface>;
+
+    void setupParameters(const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& node_parameters);
+    void setupMatchedCallback(rclcpp::PublisherOptions& options);
+    void setupDemandMonitor(DemandInterfaces node_interfaces);
+    void onPublisherMatched(rclcpp::MatchedInfo& info);
+    void updateDemand();
+    void forwardDemand(rclcpp::MatchedInfo info);
     void updateParameters();
     void onGraphChange() override;
 
@@ -73,6 +88,12 @@ private:
     rclcpp::Node::PostSetParametersCallbackHandle::SharedPtr param_cb_handle_;
     std::shared_ptr<StreamServer> server_;
     std::shared_ptr<GraphMonitor> graph_monitor_;
+    rclcpp::CallbackGroup::SharedPtr demand_cb_group_;
+    rclcpp::TimerBase::SharedPtr demand_timer_;
+    rclcpp::PublisherMatchedCallbackType source_demand_callback_;
+    std::mutex demand_state_mutex_, demand_callback_mutex_;
+    std::size_t ros_subscriber_count_ = 0;
+    bool rtsp_client_active_ = false;
     mutable std::unique_ptr<StreamEncoder> encoder_;
     /* Maps ROS image stamps onto the wall clock timeline RTP and RTCP expect.
        Deliberately a system clock rather than the node clock, which may be

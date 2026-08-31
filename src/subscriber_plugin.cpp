@@ -216,7 +216,11 @@ bool SubscriberPlugin::useReceiveTimestamps() const
         case TimestampFromReceiver:
             return true;
         default:
-            return clock_ && clock_->ros_time_is_active();
+            /* ros_time_is_active() throws when called on a system or steady
+               clock in newer rclcpp releases. The node-interface plugin API
+               has no clock interface and deliberately installs a system clock,
+               so check its type before asking about a ROS-time override. */
+            return clock_ && clock_->get_clock_type() == RCL_ROS_TIME && clock_->ros_time_is_active();
     }
 }
 
@@ -308,11 +312,10 @@ void SubscriberPlugin::subscribeImpl(image_transport::RequiredInterfaces node_in
                 topic_name_.c_str());
 
     /* RequiredInterfaces carries no clock interface, so clock_ above is a plain
-       system clock and ros_time_is_active() is false on it whatever the node is
-       configured for. That makes the automatic timestamp_source pick sender
-       time, and nothing on this path can produce a simulated stamp at all. Say
-       so rather than letting every published image carry a wall clock time in a
-       simulated time base. */
+       system clock and automatic timestamp_source picks sender time. Nothing
+       on this path can produce a simulated stamp at all. Say so rather than
+       letting every published image carry a wall clock time in a simulated time
+       base. */
     if (node_parameters->has_parameter("use_sim_time")
         && node_parameters->get_parameter("use_sim_time").get_value<bool>())
     {
