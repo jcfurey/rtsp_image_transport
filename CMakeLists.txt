@@ -321,4 +321,4 @@ endif()
 # Ament package handling. ament_auto_package() installs the executables to
 # lib/${PROJECT_NAME}, which is where ros2 run looks for them.
 pluginlib_export_plugin_description_file(image_transport plugin.xml)
-ament_auto_package()
+ament_auto_package(INSTALL_TO_SHARE launch)

@@ -15,6 +15,8 @@
     <depend>rclcpp</depend>
     <depend>sensor_msgs</depend>
     <depend>std_msgs</depend>
+    <exec_depend>launch_ros</exec_depend>
+    <exec_depend>launch_yaml</exec_depend>
     <test_depend>ament_cmake_gtest</test_depend>
     <test_depend>rosgraph_msgs</test_depend>
     <export>

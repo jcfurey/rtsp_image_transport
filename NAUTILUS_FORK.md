@@ -364,20 +364,25 @@ system clock for receive timestamps; callers on 6.4+ should explicitly select
 `timestamp_source:=1` when receiver timestamps are wanted. The FLIR A700 launch
 does this by default.
 
-Simulated time cannot be honoured on that path at all, and used to fail
-quietly: `ros_time_is_active()` is false on a plain system clock whatever the
-node is configured for, so the automatic `timestamp_source` resolved to sender
-time and every image carried a wall clock stamp in a simulated time base. The
-subscriber now checks `use_sim_time` through the parameters interface — which
-`RequiredInterfaces` does provide — and says outright that stamps will not
-follow `/clock` on this image_transport version.
+Newer rclcpp throws if `ros_time_is_active()` is queried on that system clock;
+the automatic timestamp path now checks the clock type first. This matters even
+without simulated time: the first decoded frame otherwise terminated a 6.4+
+subscriber process after the newly enabled publisher completed its RTSP hop.
 
-The image_transport publisher plugin remains unavailable on 6.4+ because its
-subscriber-graph monitoring cannot be recreated from the provided interfaces.
-This does not affect camera reception through `publish_rtsp_stream`, which
-publishes the RTSP URL directly and is the pattern used by the Deep Trekker and
-FLIR adapters. End-to-end tests that require the publisher plugin still skip on
-these versions.
+Simulated time cannot be honoured on that path at all, and used to fail
+quietly: the automatic `timestamp_source` resolves to sender time on a system
+clock whatever the node is configured for, so every image carried a wall clock
+stamp in a simulated time base. The subscriber now checks `use_sim_time`
+through the parameters interface — which `RequiredInterfaces` does provide —
+and says outright that stamps will not follow `/clock` on this image_transport
+version.
+
+The publisher now supports the node-interface API too. It can configure and
+serve the stream from the base, parameter, logging, timer and topic interfaces
+that `RequiredInterfaces` does provide. Its former graph monitor was only an
+encoder-shutdown optimization; the server's own active-stream state provides a
+more accurate signal and works without a graph interface. Non-simulated
+end-to-end transport tests therefore run on 6.4+ instead of skipping.
 
 6.4 and 7.0 are separate boundaries, and conflating them is what kept Rolling
 from compiling. 6.4 added the node-interface entry points and stopped calling
@@ -390,6 +395,37 @@ now have their own macros in `init.h`:
 does the work, and `RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API` (< 7.0) decides
 whether the legacy one may be declared at all. Rolling now builds and passes
 the suite, with the subscriber on its node-interface path.
+
+## ROS image topic to native RTSP clients
+
+`image_transport republish` is lazy: its matched callback subscribes to the raw
+input only while the selected output transport has a ROS subscriber. A native
+ffplay, ffprobe, VLC, or GStreamer RTSP client is not a ROS graph endpoint. The
+client could complete RTSP SETUP and PLAY while the republisher remained
+unsubscribed forever, so the server never received a frame to encode.
+
+The publisher plugin now preserves the republisher's matched callback and adds
+one virtual match while Live555 has an active native stream. It combines that
+with the real ROS subscriber count, so either kind of client keeps the input
+alive and only the last departure releases it. A 10 ms wall timer performs the
+check only when a caller supplied a matched callback (the republisher case),
+and also provides a fallback for RMW implementations that do not deliver
+publisher-matched events reliably; ordinary camera publishers create no timer.
+Idle relays have no raw image subscription, no colour conversion, and no
+encoder allocation.
+
+The regression test starts the real `image_transport republish` executable,
+uses a temporary ROS subscriber only to retrieve its URL, proves the raw input
+was released, then connects a `StreamClient` directly. That native connection
+must re-create the raw subscription, receive H.264 NAL units, and release the
+subscription again on disconnect.
+
+Two installable launch YAMLs make the path usable without reconstructing the
+command line: `ros_to_rtsp_h264.launch.yaml` and
+`ros_to_rtsp_h265.launch.yaml`. Their raw input is best-effort depth 1 (which is
+also compatible with reliable publishers), hardware encoding is preferred,
+and the output remap names `out/rtsp` exactly. Only the input and output topic
+arguments normally need changing.
 
 ## Build system
 
