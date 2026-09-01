@@ -473,12 +473,23 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
         {
             /* RTP and RTCP need wall clock presentation times. ROS time is not
                that: under simulation it starts near zero, and a looping bag
-               sends it backwards. */
+               sends it backwards.
+
+               Mapped once per image, and every packet of the image gets the
+               result. One picture leaves the encoder as several NAL units —
+               parameter sets ahead of a key frame, one per slice under x264's
+               slice-max-size — all carrying the image stamp, and StreamClock
+               takes a repeated stamp for a clock jump and steps a millisecond
+               past it. Mapping each NAL unit on its own therefore ran the RTP
+               timeline ahead of real time by a millisecond per extra NAL unit,
+               and players, which pace display by those time stamps, fell
+               further behind the longer they watched. */
             const rclcpp::Time wall_now = system_clock_->now();
             const std::uint64_t reanchors_before = stream_clock_.reanchorCount();
+            const rclcpp::Time presentation = stream_clock_.toWallClock(rclcpp::Time(image.header.stamp), wall_now);
             while (FrameDataPtr data = encoder_->nextPacket())
             {
-                data->setStamp(stream_clock_.toWallClock(data->stamp(), wall_now));
+                data->setStamp(presentation);
                 server_->sendFrame(data);
             }
             if (stream_clock_.reanchorCount() != reanchors_before)

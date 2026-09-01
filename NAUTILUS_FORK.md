@@ -521,6 +521,30 @@ than failing. Asking for the pool explicitly (`pools=`) avoids it everywhere.
 - The RTSP server's Live555 scheduler runs at 1 ms granularity instead of
   10 ms, which is what bounds how long a frame handed over by the ROS publisher
   thread waits before it is sent.
+- Every NAL unit of a picture now carries the same RTP presentation time. The
+  publisher mapped each NAL unit onto the wall clock timeline on its own, and
+  `StreamClock` takes a repeated stamp for a clock jump and steps
+  `MIN_STEP_NS` (1 ms) past it. A picture is several NAL units — the parameter
+  sets ahead of every key frame, and under the `slice-max-size` the publisher
+  derives from `udp_packet_size` one per slice — so every NAL unit after the
+  first added a millisecond that no real time had passed for.
+
+  A receiver anchors the RTP timeline to its own clock once and then displays
+  each frame at that offset, so a sender clock running fast is latency that
+  accumulates for as long as the session lasts. Measured end to end at
+  320x240 and 1 Mbit/s, decoded images arrived 36.5-37.5 ms apart where the
+  source stamped them 33.3 ms apart: 10% adrift, about 12 s after two minutes,
+  with "image time stamps jumped, re-anchoring the RTP timeline" in the log on
+  every single frame. Counting NAL units per picture at the 1080p 8 Mbit/s
+  settings of the launch file gives 6.2 on average and 67 on a key frame,
+  i.e. 15.6% — and that is on a synthetic gradient, which compresses far
+  better than camera video and so understates the slice count real content
+  produces.
+
+  Hardware encoders emit one slice per picture, so there it was only the
+  parameter sets on each key frame and the drift stayed small. Guarded by a
+  transport test that checks decoded images arrive a whole number of frame
+  intervals apart; it fails on every one of 99 intervals before the fix.
 - The client stops iterating subsessions once one is playing, so PLAY is sent
   a round trip earlier.
 
