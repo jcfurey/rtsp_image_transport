@@ -223,9 +223,32 @@ see frames arriving out of order; you trade a few frames of latency for correct
 presentation order. Live IP camera streams almost never need this.
 
 When the decoder cannot keep up, the subscriber progressively drops frames
-before decoding them: non-intra frames once the queue spans 0.5 s, non-key
-frames at 1 s, and everything at 2 s, so the pipeline catches up instead of
-drifting further behind.
+before decoding them, so the pipeline catches up instead of drifting further
+behind. ``max_latency`` (float, default ``0.2`` s) is the budget that ladder
+works to: non-intra frames are dropped once the queue spans ``max_latency``,
+non-key frames at twice that, and everything at four times.
+
+Because the queue settles on whichever rung matches the shortfall, this
+parameter is what steady-state latency converges to whenever the decoder is
+short of CPU — it is a latency budget, not a rarely-reached safety net. Lower
+it for a tighter bound at the cost of more dropped frames, raise it to favour
+smooth video over freshness, or set it to ``0`` to never drop and let latency
+grow instead::
+
+  ros2 run image_transport republish --ros-args \
+      -p in_transport:=rtsp -p out_transport:=raw \
+      -p in.rtsp.max_latency:=0.1 \
+      -r in/rtsp:=/camera/image_h264/rtsp -r out:=/camera/image_raw
+
+The publisher side is bounded the same way, per connected client: a client
+whose link cannot carry the stream backs up its own send queue, and once that
+queue spans more than 200 ms the oldest whole pictures are dropped rather than
+letting that client fall ever further behind. Other clients are unaffected,
+since each has its own queue.
+
+The encoder's VBV buffer is a quarter of the target bitrate, which bounds how
+far a single picture may overshoot its share of the link and therefore how
+long one frame can occupy it.
 
 
 RTP transport and packet loss

@@ -166,6 +166,11 @@ struct RTSP_IMAGE_TRANSPORT_NO_EXPORT SubscriberPlugin::Config
     std::chrono::milliseconds timeout = 2s;
     std::chrono::milliseconds reconnect_minwait = 100ms;
     std::chrono::milliseconds reconnect_maxwait = 30s;
+    /* How far the decoder may fall behind before frames start being dropped.
+       This is what bounds steady-state latency once the decoder cannot keep
+       up: the queue settles at the rung that matches the shortfall, so the
+       number is a latency budget, not a failure threshold. */
+    std::chrono::milliseconds max_latency = 200ms;
 };
 
 using SuperClass = image_transport::SimpleSubscriberPlugin<std_msgs::msg::String>;
@@ -489,6 +494,16 @@ void SubscriberPlugin::setupParameters(
                               "everything the machine has")
             .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(64)}));
     declareParameter(
+        node_parameters, param_base_name_ + ".max_latency",
+        rclcpp::ParameterValue(1e-3 * config_->max_latency.count()),
+        ParameterDescriptor()
+            .set__description("how far the decoder may fall behind before frames are dropped [s]; this is the "
+                              "latency budget the queue settles at when the decoder cannot keep up. Non-intra "
+                              "frames go first, non-key frames at twice this, everything at four times "
+                              "(0 = never drop, and let latency grow instead)")
+            .set__floating_point_range(
+                {rcl_interfaces::msg::FloatingPointRange().set__from_value(0).set__to_value(10)}));
+    declareParameter(
         node_parameters, param_base_name_ + ".reconnect_policy",
         rclcpp::ParameterValue(static_cast<int>(config_->reconnect_policy)),
         ParameterDescriptor()
@@ -542,6 +557,8 @@ void SubscriberPlugin::updateParameters()
         np->get_parameter(param_base_name_ + ".drop_corrupt_frames").as_bool();
     new_config.decoder.sws_threads =
         static_cast<int>(np->get_parameter(param_base_name_ + ".sws_threads").as_int());
+    new_config.max_latency = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
+        1000 * np->get_parameter(param_base_name_ + ".max_latency").as_double()));
     new_config.reconnect_policy =
         static_cast<ReconnectPolicy>(np->get_parameter(param_base_name_ + ".reconnect_policy").as_int());
     new_config.timeout = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
@@ -613,32 +630,44 @@ void SubscriberPlugin::processFrame()
         return;
     try
     {
+        /* The rungs of the drop ladder, derived from the latency budget. The
+           queue settles on whichever one matches how far the decoder is
+           behind, so these thresholds are what steady-state latency converges
+           to under sustained overload — not a rarely-reached safety net.
+           max_latency of zero switches dropping off entirely. */
+        const bool may_drop = config_->max_latency > 0ms;
+        const rclcpp::Duration drop_non_intra{config_->max_latency};
+        const rclcpp::Duration drop_non_key{2 * config_->max_latency};
+        const rclcpp::Duration drop_all{4 * config_->max_latency};
         while (FrameDataPtr frame = popFrame())
         {
             rclcpp::Duration lag = frameLag();
-            if (lag >= 2s)
+            if (may_drop && lag >= drop_all)
             {
-                if (old_lag_ < 2s)
+                if (old_lag_ < drop_all)
                 {
-                    RCLCPP_WARN(logger_, "[%s] decoder is too slow; discarding all frames", topic_name_.c_str());
+                    RCLCPP_WARN(logger_, "[%s] decoder is %.0f ms behind; discarding all frames",
+                                topic_name_.c_str(), 1e-6 * lag.nanoseconds());
                     old_lag_ = lag;
                 }
                 decoder->setDecodeFrames(StreamDecoder::DecodeFrames::None);
             }
-            else if (lag >= 1s)
+            else if (may_drop && lag >= drop_non_key)
             {
-                if (old_lag_ < 1s)
+                if (old_lag_ < drop_non_key)
                 {
-                    RCLCPP_WARN(logger_, "[%s] decoder is too slow; discarding non-key frames", topic_name_.c_str());
+                    RCLCPP_WARN(logger_, "[%s] decoder is %.0f ms behind; discarding non-key frames",
+                                topic_name_.c_str(), 1e-6 * lag.nanoseconds());
                     old_lag_ = lag;
                 }
                 decoder->setDecodeFrames(StreamDecoder::DecodeFrames::Key);
             }
-            else if (lag >= 500ms)
+            else if (may_drop && lag >= drop_non_intra)
             {
-                if (old_lag_ < 500ms)
+                if (old_lag_ < drop_non_intra)
                 {
-                    RCLCPP_WARN(logger_, "[%s] decoder is too slow; discarding non-intra frames", topic_name_.c_str());
+                    RCLCPP_WARN(logger_, "[%s] decoder is %.0f ms behind; discarding non-intra frames",
+                                topic_name_.c_str(), 1e-6 * lag.nanoseconds());
                     old_lag_ = lag;
                 }
                 decoder->setDecodeFrames(StreamDecoder::DecodeFrames::Intra);

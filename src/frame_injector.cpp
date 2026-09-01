@@ -56,7 +56,37 @@ void FrameInjector::injectFrame(const FrameDataPtr& frame)
     if (is_shutdown_)
         return;
     frame_queue_.push_back(frame);
+    trimQueue();
     envir().taskScheduler().triggerEvent(deliver_frame_trigger_, this);
+}
+
+/* All the NAL units of one picture carry that picture's stamp, so dropping
+   every unit that shares the front stamp drops a whole access unit. Anything
+   less would hand Live555 half a picture. */
+void FrameInjector::trimQueue()
+{
+    while (frame_queue_.size() > MAX_QUEUE_LENGTH
+           || (frame_queue_.size() > 1
+               && (frame_queue_.back()->stamp() - frame_queue_.front()->stamp()).nanoseconds()
+                      > MAX_QUEUE_SPAN_NS))
+    {
+        const rclcpp::Time oldest = frame_queue_.front()->stamp();
+        do
+        {
+            frame_queue_.pop_front();
+            ++dropped_;
+        } while (!frame_queue_.empty() && frame_queue_.front()->stamp() == oldest);
+        /* A single access unit larger than the whole budget would otherwise
+           spin here with nothing left to drop. */
+        if (frame_queue_.size() <= 1)
+            break;
+    }
+}
+
+std::size_t FrameInjector::droppedFrames() const
+{
+    std::lock_guard<std::mutex> lock{frame_queue_mutex_};
+    return dropped_;
 }
 
 void FrameInjector::doGetNextFrame()

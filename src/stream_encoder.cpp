@@ -51,6 +51,22 @@ namespace
    rather than as real elapsed time. */
 constexpr double MAX_FRAME_GAP_SECONDS = 5.0;
 
+/* The VBV buffer bounds how far a single picture may exceed its share of the
+   bitrate, and so how long the packets of one frame occupy the link — latency
+   a receiver cannot buffer its way out of. A quarter second is the usual
+   low-latency compromise: tight enough that no frame stalls the link for long,
+   loose enough that a key frame is not crushed.
+
+   Deriving it from the bitrate matters because setBitrate() is called after
+   the context is set up. It used to leave rc_buffer_size at twice the default
+   1 Mbit/s, so the VBV was 2 Mbit whatever the stream was actually configured
+   for: ten seconds of buffer at 200 kbit/s, and nothing like the intended two
+   seconds at 8 Mbit/s. */
+std::int64_t vbvBufferSize(std::int64_t bit_rate)
+{
+    return std::max<std::int64_t>(bit_rate / 4, 16384);
+}
+
 void set_codec_option(std::shared_ptr<AVCodecContext> ctx, const std::string& option, const std::string& value,
                       bool silent = false, const rclcpp::Logger& logger = rclcpp::get_logger("ffmpeg"))
 {
@@ -306,7 +322,7 @@ void StreamEncoder::setupEncoder(const AVCodec* encoder, bool silent)
     ctx_->framerate = AVRational{30, 1};
     ctx_->rc_min_rate = 0;
     ctx_->rc_max_rate = ctx_->bit_rate;
-    ctx_->rc_buffer_size = 2 * ctx_->bit_rate;
+    ctx_->rc_buffer_size = vbvBufferSize(ctx_->bit_rate);
     ctx_->flags &= ~AV_CODEC_FLAG_GLOBAL_HEADER;
     ctx_->flags |= AV_CODEC_FLAG_CLOSED_GOP;
     if (codec_ == VideoCodec::H264 || codec_ == VideoCodec::H265)
@@ -374,6 +390,7 @@ void StreamEncoder::setBitrate(unsigned long bit_rate)
         throw StreamingError("cannot modify bitrate after encoding has started");
     ctx_->bit_rate = bit_rate;
     ctx_->rc_max_rate = bit_rate;
+    ctx_->rc_buffer_size = vbvBufferSize(bit_rate);
 }
 
 void StreamEncoder::setFramerate(unsigned fps)

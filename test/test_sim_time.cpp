@@ -286,6 +286,11 @@ TEST(Transport, PluginsAreActuallyDrivenByImageTransport)
         << "the subscriber plugin never declared its correctly scoped parameters";
     EXPECT_TRUE(fixture.node_->has_parameter("alive.image.rtsp.frame_id"))
         << "the subscriber plugin did not expose decoded-image frame stamping";
+    EXPECT_TRUE(fixture.node_->has_parameter("alive.image.rtsp.max_latency"))
+        << "the subscriber plugin did not expose its latency budget";
+    /* The drop ladder is what bounds latency once the decoder cannot keep up,
+       so its budget has to be reachable from a launch file. */
+    EXPECT_NEAR(fixture.node_->get_parameter("alive.image.rtsp.max_latency").as_double(), 0.2, 1e-9);
     EXPECT_FALSE(fixture.node_->has_parameter("live.image.rtsp.use_hw_decoder"))
         << "the relative topic lost its first character while constructing parameter names";
 }

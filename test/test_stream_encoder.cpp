@@ -179,6 +179,30 @@ TEST(StreamEncoder, SettingsAreLockedOnceEncodingStarted)
     EXPECT_THROW(encoder->setPackageSizeHint(1000), StreamingError);
 }
 
+TEST(StreamEncoder, VbvBufferTracksTheConfiguredBitrate)
+{
+    /* Regression guard. setBitrate() used to change bit_rate and rc_max_rate
+       but not rc_buffer_size, which stayed at twice the 1 Mbit/s default the
+       context was built with. The VBV was therefore 2 Mbit whatever the stream
+       was configured for: ten seconds of buffer at 200 kbit/s. The VBV bounds
+       how far one picture may overshoot its share of the bitrate, and so how
+       long a single frame can occupy the link. */
+    for (unsigned long bitrate : {200000UL, 1000000UL, 8000000UL, 25000000UL})
+    {
+        auto encoder = makeEncoder();
+        if (!encoder)
+            GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+        SCOPED_TRACE(bitrate);
+        encoder->setBitrate(bitrate);
+        ASSERT_NE(encoder->context(), nullptr);
+        EXPECT_EQ(encoder->context()->bit_rate, static_cast<std::int64_t>(bitrate));
+        EXPECT_EQ(encoder->context()->rc_max_rate, static_cast<std::int64_t>(bitrate));
+        /* A quarter second of buffer, so the number scales with the stream */
+        EXPECT_EQ(encoder->context()->rc_buffer_size, static_cast<int>(bitrate / 4))
+            << "the VBV does not follow the configured bitrate";
+    }
+}
+
 TEST(StreamEncoder, ReportsUnsupportedCodec)
 {
     /* Decode-only codecs have no encoder table entry and must say so rather
