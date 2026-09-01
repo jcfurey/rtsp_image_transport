@@ -28,7 +28,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -209,6 +212,56 @@ TEST(Transport, DeliversImagesEndToEnd)
         EXPECT_EQ(img.encoding, "bgr8");
         EXPECT_EQ(img.data.size(), static_cast<std::size_t>(3) * 320 * 240);
     }
+}
+
+TEST(Transport, PresentationTimesKeepTheSpacingOfTheImageStamps)
+{
+    /* Regression guard. A picture leaves the encoder as several NAL units —
+       parameter sets ahead of every key frame, one per slice under x264's
+       slice-max-size — and the publisher used to map each of them onto the
+       RTP timeline separately. StreamClock takes a repeated stamp for a clock
+       jump and steps a millisecond past it, so every extra NAL unit pushed the
+       timeline that much ahead of real time. Players pace display by those
+       time stamps and fell steadily behind the longer they watched: tens of
+       seconds after a couple of minutes on a multi-slice software stream.
+
+       The sender's time stamps come back on the decoded images (the default
+       timestamp_source on a node running wall clock time), so the check is
+       that consecutive images are a whole number of frame intervals apart.
+       Dropped frames keep the spacing a multiple, a constant offset does not
+       show up at all, and rounding through the 90 kHz RTP clock costs tens of
+       microseconds. One discontinuity is allowed: the client re-synchronises
+       its presentation clock on the first RTCP sender report after PLAY. */
+    TransportFixture fixture("rtsp_transport_pacing", /*use_sim_time=*/false);
+    if (!fixture.start("pacing/image"))
+        GTEST_SKIP() << "rtsp transport plugin not loadable: " << fixture.failure_;
+
+    rclcpp::Clock wall(RCL_SYSTEM_TIME);
+    /* Enough images to span several key frames, whose parameter sets make the
+       extra NAL units a certainty whatever encoder this machine picked */
+    const std::size_t got = fixture.pump(100, 60s, nullptr, wall.now().nanoseconds(), FRAME_INTERVAL_NS);
+    ASSERT_GE(got, 70u) << "too few images made it through the rtsp transport to judge their pacing";
+
+    constexpr std::int64_t TOLERANCE_NS = 500000;  // 0.5 ms; the bug costs at least 1 ms per key frame
+    const std::vector<sensor_msgs::msg::Image> received = fixture.received();
+    unsigned discontinuities = 0;
+    std::ostringstream details;
+    for (std::size_t i = 1; i < received.size(); ++i)
+    {
+        const std::int64_t delta = rclcpp::Time(received[i].header.stamp).nanoseconds()
+                                   - rclcpp::Time(received[i - 1].header.stamp).nanoseconds();
+        const std::int64_t frames = std::llround(static_cast<double>(delta) / FRAME_INTERVAL_NS);
+        const std::int64_t residual = std::llabs(delta - frames * FRAME_INTERVAL_NS);
+        if (residual > TOLERANCE_NS)
+        {
+            ++discontinuities;
+            details << " #" << i << ": " << delta / 1000 << " us";
+        }
+    }
+    EXPECT_LE(discontinuities, 1u) << "the RTP timeline does not keep the spacing of the image stamps; "
+                                   << discontinuities << " of " << received.size() - 1
+                                   << " intervals are off by more than " << TOLERANCE_NS / 1000
+                                   << " us:" << details.str();
 }
 
 TEST(Transport, PluginsAreActuallyDrivenByImageTransport)

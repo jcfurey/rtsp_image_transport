@@ -40,6 +40,11 @@ namespace rtsp_image_transport
  * The mapping is an offset that is re-anchored whenever the input goes
  * backwards or lands implausibly far from real time. Between re-anchors the
  * spacing of the stamps is preserved exactly, so genuine frame timing survives.
+ *
+ * Call it once per image and give every packet of that image the result. A
+ * stamp equal to the previous one is taken for a repeated image and
+ * deliberately stepped past, so mapping the NAL units of one picture one by
+ * one would push the timeline ahead of real time with every one of them.
  */
 class StreamClock
 {
