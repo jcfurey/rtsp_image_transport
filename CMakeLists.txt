@@ -273,6 +273,7 @@ if(BUILD_TESTING)
         test_time_handling
         test_frame_data
         test_frame_fill
+        test_frame_injector
         test_stream_decoder
         test_stream_encoder
         test_roundtrip

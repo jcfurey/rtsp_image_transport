@@ -545,6 +545,33 @@ than failing. Asking for the pool explicitly (`pools=`) avoids it everywhere.
   parameter sets on each key frame and the drift stayed small. Guarded by a
   transport test that checks decoded images arrive a whole number of frame
   intervals apart; it fails on every one of 99 intervals before the fix.
+- The subscriber's drop ladder is now a budget rather than three hardcoded
+  numbers. It stood at 0.5 s / 1 s / 2 s, and since the queue settles on
+  whichever rung matches how far the decoder is behind, those numbers *were*
+  the steady-state latency of any stream the machine could not quite keep up
+  with. New `max_latency` parameter (default 0.2 s) sets the first rung, with
+  the other two at two and four times it; 0 disables dropping. Measured in
+  process on a four-core container encoding 720p30 in software — a deliberate
+  overload — end-to-end latency went from p50 766 ms / max 1115 ms to p50
+  366 ms / max 555 ms, and stopped growing over the run (+146 ms across the
+  run before, -37 ms after).
+- `FrameInjector`'s queue is bounded. Live555 pulls NAL units only as fast as
+  it can put them on one client's link, so a client slower than the encoder
+  used to back up a queue that nothing ever trimmed: unbounded memory, and
+  latency that grew for as long as it stayed connected. Past 200 ms of queued
+  stream time (or 4096 NAL units, for a source whose stamps do not advance)
+  the oldest *whole access units* are dropped — every NAL unit of a picture
+  carries that picture's stamp, so dropping by stamp cannot hand Live555 the
+  tail of a picture whose first slices are gone. Each client has its own
+  injector, so a slow one degrades only itself.
+- `setBitrate()` did not touch `rc_buffer_size`, which kept twice the 1 Mbit/s
+  the context was built with. The VBV was 2 Mbit whatever the stream was
+  configured for — ten seconds of buffer at 200 kbit/s, and a quarter second
+  rather than the intended two at 8 Mbit/s. It is now a quarter of the actual
+  bitrate, which is the usual low-latency compromise and, unlike the old
+  value, scales with the stream. This one is reasoned rather than measured:
+  the effect it bounds is transmission time on a bandwidth-limited link, which
+  an in-process loopback cannot exhibit.
 - The client stops iterating subsessions once one is playing, so PLAY is sent
   a round trip earlier.
 
