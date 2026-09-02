@@ -262,6 +262,33 @@ target_link_libraries(
 install(TARGETS ${PROJECT_NAME} LIBRARY DESTINATION lib)
 install(FILES plugin.xml DESTINATION share/${PROJECT_NAME})
 
+# Measurement programs. Off by default: they take minutes, some need a lossy
+# link and NET_ADMIN, and their output is numbers to read rather than
+# assertions. See benchmark/README.md.
+option(BUILD_BENCHMARKS "Build the transport and latency measurement programs" OFF)
+if(BUILD_BENCHMARKS)
+    find_package(ament_cmake_gtest REQUIRED)
+    set(benchmarks
+        latency_bench
+        loss_bench
+        soak
+        nalscope
+        dropbisect
+        measure_nals
+    )
+    foreach(bench IN LISTS benchmarks)
+        add_executable(${bench} benchmark/${bench}.cpp)
+        target_include_directories(
+            ${bench} PRIVATE src test ${CMAKE_CURRENT_BINARY_DIR} ${FFMPEG_INCLUDE_DIRS}
+        )
+        target_link_libraries(${bench} ${PROJECT_NAME}_core ${FFMPEG_LIBRARIES})
+        # image_transport only for the one that drives the real plugins
+        if(bench STREQUAL "latency_bench")
+            target_link_libraries(${bench} image_transport::image_transport)
+        endif()
+    endforeach()
+endif()
+
 # Tests
 if(BUILD_TESTING)
     ament_auto_find_test_dependencies()

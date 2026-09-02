@@ -673,6 +673,57 @@ Measured through the real plugin stack, frames delivered over a 13 s run:
 
 3% sustained uniform loss is a thoroughly broken link, and 38% of frames is
 still bad video; the point is that it recovers rather than staying dead.
+
+### What the stall actually is
+
+The watchdog was built before the mechanism was understood, and the mechanism
+turns out not to be what its name suggests. Four measurements, in the order
+they settled it:
+
+1. `nalscope` prints the NAL types delivered against the pictures produced.
+   Through 22 seconds of a dead stream it shows `SPS=1 PPS=1 IDR=13-15` every
+   single second — a complete key frame, parameter sets and all, arriving once
+   a second while nothing comes out. So key frames are not the missing piece.
+2. It then replays the captured buffers into a decoder that has never seen
+   anything. Live 62 pictures, replay 62. Identical. Whatever is wrong is in
+   the *bytes*, not in accumulated decoder state — which means "the decoder is
+   wedged" was the wrong description all along.
+3. Counting frames out of `avcodec_receive_frame` directly: libavcodec itself
+   produces about as many pictures as reach the subscriber. The key-frame gate
+   and the corrupt-frame check discard almost nothing, so the loss is not in
+   this package's own filtering either.
+4. `dropbisect` damages exactly one NAL unit offline, with no network. Neither
+   a missing NAL unit nor one truncated to half its length is fatal: 0 of 41
+   for each, reproducibly, over a 150 frame clip.
+
+Which leaves the framing. `FrameExtractor` hands the decoder its buffer
+whenever it exceeds 48 bytes — a size threshold, with no relation to picture
+boundaries — so a multi-slice picture arrives as several separate calls and
+libavcodec has to infer where each picture starts, from `first_mb_in_slice`.
+Lose the slice that carries the boundary and it cannot: pictures merge, which
+is exactly what `Frame num change from 7 to ...` reports for every value of N.
+3176 delivered buffers, roughly 750 pictures' worth of slices, decoded into
+78 pictures. H.265 is untouched by this because x265 emits one slice per
+picture, so every NAL unit is its own access unit already.
+
+### Two attempted fixes, neither shipped
+
+Grouping NAL units into access units by RTP timestamp works, mechanically —
+deliveries drop from ~3200 to 749, one per picture — and lifts H.264 over UDP
+at 1% loss from 30% to 84.7% of frames. It costs a frame of latency, because a
+picture can only be closed when the next one starts: p50 went 11-12 ms to
+39-46 ms. Against an explicit low-latency goal, for a fix that still leaves 2%
+loss at 1.2%, that is the wrong trade.
+
+Closing the access unit on the RTP marker bit instead should avoid the delay.
+It does not group at all here — deliveries stay at 3239, and the robustness
+gain goes with them — so live555 is not surfacing the bit the way this
+assumed.
+
+Both are reverted. The stall watchdog stays, because it is measured to help
+and costs nothing when the stream is healthy. The real fix is access-unit
+framing done without the added frame of latency, and it needs the marker bit
+question answered first.
 - `setBitrate()` did not touch `rc_buffer_size`, which kept twice the 1 Mbit/s
   the context was built with. The VBV was 2 Mbit whatever the stream was
   configured for — ten seconds of buffer at 200 kbit/s, and a quarter second
