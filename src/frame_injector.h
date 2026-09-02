@@ -63,6 +63,18 @@ public:
     /* How many NAL units have been dropped to keep the queue inside its
        bounds, for the publisher to report */
     std::size_t droppedFrames() const;
+    /* True when the NAL unit just delivered was the last of its access unit.
+     *
+     * Live555 has to guess this — H264or5VideoStreamDiscreteFramer assumes
+     * every VCL NAL unit ends a picture, which its own comment notes is wrong
+     * for a stream with more than one slice per picture, and ours has as many
+     * slices as slice-max-size makes. The guess decides the RTP marker bit, so
+     * getting it wrong tells every receiver that each slice is a whole frame.
+     *
+     * Here it needs no guessing: all the NAL units of one picture carry that
+     * picture's stamp, so the next one queued either shares the stamp or
+     * begins the next picture. */
+    bool lastDeliveryEndedAccessUnit() const noexcept;
 
 private:
     FrameInjector(UsageEnvironment& env);
@@ -78,6 +90,10 @@ private:
     mutable std::mutex frame_queue_mutex_;
     std::deque<FrameDataPtr> frame_queue_;
     std::size_t dropped_ = 0;
+    /* Whether the most recent deliverFrame() emptied its access unit. Written
+       on the Live555 thread in deliverFrame and read from the framer's
+       nalUnitEndsAccessUnit on that same thread, immediately afterwards. */
+    bool last_ended_access_unit_ = true;
 };
 
 }  // namespace rtsp_image_transport

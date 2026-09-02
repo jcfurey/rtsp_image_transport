@@ -56,6 +56,11 @@ private:
 
     /* Copies the out-of-band parameter sets to the front of an empty buffer */
     void seedParameterSets();
+    /* Hands over whatever access unit is still buffered. Called when the source
+       closes: the last picture of a stream has no successor to close it, and
+       without this it would be held until the extractor was destroyed. */
+    void flushPending();
+    static void sourceClosed(void* obj);
 
     std::weak_ptr<StreamClient> stream_client_;
     MediaSubsession* subsession_;
@@ -70,6 +75,15 @@ private:
        the decoder at all. */
     std::vector<unsigned char> parameter_sets_;
     bool warned_at_limit_;
+    /* Presentation time of the NAL units currently in the buffer. Every NAL
+       unit of one picture carries the same RTP timestamp, so a change of it
+       ends an access unit — the fallback boundary for a sender whose marker
+       bit cannot be trusted. */
+    struct timeval buffer_time_
+    {
+        0, 0
+    };
+    bool have_buffer_time_ = false;
 };
 
 }  // namespace rtsp_image_transport
