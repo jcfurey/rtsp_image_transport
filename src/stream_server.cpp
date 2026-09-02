@@ -105,15 +105,54 @@ VideoRTPSink* createVideoRTPSink(VideoCodec codec, UsageEnvironment& env, Groups
     }
 }
 
-FramedSource* createDiscreteFramer(VideoCodec codec, UsageEnvironment& env, FramedSource* source)
+/* Live555 decides the RTP marker bit from nalUnitEndsAccessUnit(), whose base
+   implementation assumes every VCL NAL unit ends a picture. Its own comment
+   says that is wrong for more than one slice per picture, and invites exactly
+   this subclass. Our streams do have several slices per picture whenever
+   slice-max-size applies, so without this every slice is marked as a complete
+   frame — a receiver following RFC 6184 is then told the picture ends 25 times
+   per picture, and has no way to find the real boundaries.
+
+   The injector knows the answer without guessing, because all the NAL units of
+   a picture carry that picture's stamp. */
+template<class Framer>
+class AccessUnitFramer : public Framer
+{
+public:
+    static AccessUnitFramer* createNew(UsageEnvironment& env, FramedSource* source, FrameInjector* injector)
+    {
+        return new AccessUnitFramer(env, source, injector);
+    }
+
+protected:
+    AccessUnitFramer(UsageEnvironment& env, FramedSource* source, FrameInjector* injector)
+        : Framer(env, source, False, False), injector_(injector)
+    {
+    }
+
+    Boolean nalUnitEndsAccessUnit(u_int8_t nal_unit_type) override
+    {
+        if (!injector_)
+            return Framer::nalUnitEndsAccessUnit(nal_unit_type);
+        /* Parameter sets and other non-VCL units never end a picture, whatever
+           follows them; beyond that the queue decides. */
+        return Framer::nalUnitEndsAccessUnit(nal_unit_type) && injector_->lastDeliveryEndedAccessUnit();
+    }
+
+private:
+    FrameInjector* injector_;
+};
+
+FramedSource* createDiscreteFramer(VideoCodec codec, UsageEnvironment& env, FramedSource* source,
+                                   FrameInjector* injector)
 {
     switch (codec)
     {
         case VideoCodec::H264:
-            return H264VideoStreamDiscreteFramer::createNew(env, source);
+            return AccessUnitFramer<H264VideoStreamDiscreteFramer>::createNew(env, source, injector);
 #ifdef LIVE555_HAS_H265_SUPPORT
         case VideoCodec::H265:
-            return H265VideoStreamDiscreteFramer::createNew(env, source);
+            return AccessUnitFramer<H265VideoStreamDiscreteFramer>::createNew(env, source, injector);
 #endif
         case VideoCodec::MPEG4:
             return MPEG4VideoStreamDiscreteFramer::createNew(env, source);
@@ -233,7 +272,7 @@ FramedSource* UnicastServerMediaSubsession::createNewStreamSource(unsigned clien
     {
         estBitrate = ESTIMATED_BITRATE;
         FrameInjector* injector = FrameInjector::createNew(envir());
-        source = createDiscreteFramer(s->codec(), envir(), injector);
+        source = createDiscreteFramer(s->codec(), envir(), injector, injector);
         if (source)
         {
             if (!dummy_session_)
@@ -334,7 +373,7 @@ void StreamServer::startOnLoop(VideoCodec codec, bool use_multicast)
         sms_->addSubsession(MulticastServerMediaSubsession::createNew(*sink_, rtcp));
         rtsp_->addServerMediaSession(sms_);
         FrameInjector* injector = FrameInjector::createNew(loop_->env());
-        FramedSource* source = createDiscreteFramer(codec_, loop_->env(), injector);
+        FramedSource* source = createDiscreteFramer(codec_, loop_->env(), injector, injector);
         if (!source)
             throw StreamingError(std::format("cannot instantiate FramedSource for {}", videoCodecName(codec_)));
         /* Unlike the unicast case, Live555 does not take ownership of these

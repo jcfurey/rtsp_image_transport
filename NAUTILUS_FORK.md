@@ -720,10 +720,61 @@ It does not group at all here — deliveries stay at 3239, and the robustness
 gain goes with them — so live555 is not surfacing the bit the way this
 assumed.
 
-Both are reverted. The stall watchdog stays, because it is measured to help
-and costs nothing when the stream is healthy. The real fix is access-unit
-framing done without the added frame of latency, and it needs the marker bit
-question answered first.
+### The marker bit was ours to get wrong
+
+Reading live555 rather than guessing at it answered the question immediately.
+`H264or5VideoStreamDiscreteFramer::nalUnitEndsAccessUnit()` returns
+`isVCL(nal_unit_type)`, above this comment:
+
+    // This will be wrong if you are streaming multiple 'slices' per picture.
+    // In that case, you can define a subclass that reimplements this virtual
+    // function to do the right thing.
+
+That return value is what `H264or5VideoRTPSink` uses to decide the RTP marker
+bit. Our publisher splits every picture into slices via `slice-max-size`, so
+the server was setting the marker on *every slice* — telling every receiver,
+RFC 6184 conformant or not, that each slice was a complete picture. The client
+experiment that "proved the marker bit unusable" had been measuring our own
+malformed output.
+
+Both ends are fixed:
+
+- `AccessUnitFramer` subclasses the discrete framer and answers
+  `nalUnitEndsAccessUnit()` from the injector rather than by guessing. The
+  injector needs no guess: every NAL unit of a picture carries that picture's
+  stamp, so the next one queued either shares it or begins the next picture.
+- `FrameExtractor` assembles access units, closing one on the marker bit and
+  falling back to a change of presentation time for senders that get the
+  marker wrong. The fallback is a frame late by construction; the marker is
+  not.
+- The last access unit of a stream has nothing after it to close it, so the
+  source-closure handler flushes what is buffered. The frame extractor tests
+  caught that omission — they script a few NAL units and nothing came out at
+  all.
+
+This is worth carrying upstream: the malformed marker bit affects every client
+of this publisher, not just this one.
+
+Measured, 640x480 H.264, frames delivered and p50 latency:
+
+| | before | after |
+| --- | --- | --- |
+| clean link | 100%, 11.2 ms | 100%, **5.8 ms** |
+| 1% loss | 30%, 12.5 ms | **71%**, 6.0 ms |
+| 2% loss | 9% | 9-22% |
+| 5% loss | 5% | 5-7% |
+
+The latency halved because the decoder now receives one packet per picture
+instead of four to fifteen. Deliveries went from 3239 to 600 for 600 frames —
+exactly one access unit each.
+
+What this does not fix is H.264 above about 1% loss, and that part is not a
+bug. A damaged picture corrupts every P frame referencing it until the next
+key frame, which at `gop_size = fps` is a second away; the fix for that is a
+shorter GOP, intra refresh, or a transport that does not lose packets. H.265
+is unaffected throughout (89-99%) because x265 emits one slice per picture.
+The stall watchdog stays as a backstop, though it no longer fires on this
+path: the failure is now dropped frames rather than a stopped decoder.
 - `setBitrate()` did not touch `rc_buffer_size`, which kept twice the 1 Mbit/s
   the context was built with. The VBV was 2 Mbit whatever the stream was
   configured for — ten seconds of buffer at 200 kbit/s, and a quarter second

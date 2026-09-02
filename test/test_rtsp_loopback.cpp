@@ -344,6 +344,73 @@ TEST_P(RtspTransport, StreamDecodesBackToImages)
 /* Switching transport is a reconnect, which is how the subscriber applies a
    changed rtp_over_tcp: the session is torn down and set up again with the
    other one. Both directions have to end up delivering video. */
+TEST_P(RtspTransport, DeliversOneAccessUnitPerPicture)
+{
+    /* The decoder is handed whole pictures, not individual slices.
+
+       Two things have to be right for that. The server has to set the RTP
+       marker bit on the last NAL unit of a picture and nowhere else —
+       live555's discrete framer guesses that every VCL NAL unit ends a
+       picture, which is wrong the moment slice-max-size splits one — and the
+       client has to assemble by that boundary rather than by buffer size.
+
+       Get either wrong and the decoder sees one delivery per slice, has to
+       infer picture boundaries from first_mb_in_slice, and merges pictures
+       whenever loss takes a boundary away. The encoder here is configured
+       exactly as the publisher configures it, so a regression shows up as
+       several deliveries per frame. */
+    if (!haveEncoderFor(VideoCodec::H264))
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    /* Large enough that slice-max-size splits every picture into several NAL
+       units; at 320x240 a frame may fit in one and prove nothing. */
+    LoopbackServer server(VideoCodec::H264, 1280, 720);
+
+    ClientObserver observer;
+    std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", server.url());
+    client->setRtpOverTcp(rtpOverTcp());
+    observer.attach(client);
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_TRUE(observer.waitForNals(40)) << "not enough video data arrived over " << transportName();
+    client->disconnect();
+
+    std::size_t nals = 0;
+    std::vector<FrameDataPtr> captured;
+    {
+        std::lock_guard<std::mutex> lock{observer.mutex_};
+        nals = observer.nal_count_;
+        captured = observer.nals_;
+    }
+    const unsigned pictures = server.framesPushed();
+    ASSERT_GT(pictures, 10u) << "the server pushed too few pictures to judge";
+
+    /* One delivery per picture, give or take: parameter sets ride with the key
+       frame, and the count is sampled across a live session. Before the marker
+       bit was fixed this ran at four to fifteen deliveries per picture. */
+    EXPECT_LT(nals, pictures * 2)
+        << "got " << nals << " deliveries for " << pictures << " pictures over " << transportName()
+        << "; the stream is being delivered slice by slice rather than picture by picture";
+
+    /* And a delivery really is a whole access unit: with slice-max-size in
+       force a 720p picture is several NAL units, so most deliveries must carry
+       more than one start code. */
+    std::size_t multi_nal = 0;
+    for (const FrameDataPtr& frame : captured)
+    {
+        std::size_t starts = 0;
+        const unsigned char* d = frame->data();
+        for (std::size_t i = 0; i + 3 < frame->length(); ++i)
+        {
+            if (d[i] == 0 && d[i + 1] == 0 && (d[i + 2] == 1 || (d[i + 2] == 0 && d[i + 3] == 1)))
+                starts++;
+        }
+        if (starts > 1)
+            multi_nal++;
+    }
+    EXPECT_GT(multi_nal, captured.size() / 4)
+        << "only " << multi_nal << " of " << captured.size()
+        << " deliveries carried more than one NAL unit; slices are not being grouped";
+}
+
 TEST(RtspLoopback, SwitchingTransportBetweenSessionsWorks)
 {
     if (!haveEncoderFor(VideoCodec::H264))

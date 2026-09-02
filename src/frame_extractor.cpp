@@ -20,6 +20,8 @@
  ****************************************************************************/
 #include "frame_extractor.h"
 
+#include <cstring>
+
 #include "frame_data.h"
 #include "stream_client.h"
 #include "streaming_error.h"
@@ -125,8 +127,33 @@ Boolean FrameExtractor::continuePlaying()
         }
     }
     fSource->getNextFrame(buffer_.data() + buffer_length_, buffer_.size() - buffer_length_, newFrameCallback, this,
-                          onSourceClosure, this);
+                          sourceClosed, this);
     return True;
+}
+
+/* The last access unit of a stream has nothing after it to mark its end, so
+   without this it would sit in the buffer while the session shut down. */
+void FrameExtractor::flushPending()
+{
+    std::shared_ptr<StreamClient> sc = stream_client_.lock();
+    if (!sc || buffer_length_ == 0)
+        return;
+    /* continuePlaying() leaves a trailing start code waiting for a NAL unit
+       that will now never arrive; it is not part of the picture. */
+    const std::size_t length =
+        buffer_length_ >= sizeof(MPEG_START_CODE) ? buffer_length_ - sizeof(MPEG_START_CODE) : buffer_length_;
+    if (length == 0)
+        return;
+    const rclcpp::Time ts(buffer_time_.tv_sec, 1000ull * buffer_time_.tv_usec);
+    sc->receiveStreamData(codec_, subsession_, std::make_shared<FrameData>(buffer_.data(), length, ts));
+    buffer_length_ = 0;
+    have_buffer_time_ = false;
+}
+
+void FrameExtractor::sourceClosed(void* obj)
+{
+    static_cast<FrameExtractor*>(obj)->flushPending();
+    MediaSink::onSourceClosure(obj);
 }
 
 void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes, struct timeval presentationTime,
@@ -159,12 +186,52 @@ void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes
             continuePlaying();
             return;
         }
-        buffer_length_ += frameSize;
-        rclcpp::Time ts(presentationTime.tv_sec, 1000ull * presentationTime.tv_usec);
-        if (buffer_length_ > 48)
+        /* Hand the decoder whole access units rather than individual NAL units.
+           Fed one NAL unit at a time it has to infer where each picture begins,
+           from first_mb_in_slice, and a lost slice takes that boundary with it:
+           pictures then merge instead of degrading, and a multi-slice stream
+           losing packets decodes a small fraction of its frames.
+
+           Two things close an access unit. The RTP marker bit says so directly
+           (RFC 6184), which costs nothing in latency. A change of presentation
+           time says so too, but only once the next picture has started, so it
+           arrives a frame late; it is the fallback for a sender whose marker
+           bit is wrong — as ours was until it stopped letting live555 guess. */
+        const std::size_t prefix_length =
+            buffer_length_ >= sizeof(MPEG_START_CODE) ? buffer_length_ - sizeof(MPEG_START_CODE) : buffer_length_;
+        const bool time_changed = have_buffer_time_
+                                  && (presentationTime.tv_sec != buffer_time_.tv_sec
+                                      || presentationTime.tv_usec != buffer_time_.tv_usec);
+        if (time_changed && prefix_length > 0)
         {
-            sc->receiveStreamData(codec_, subsession_, std::make_shared<FrameData>(buffer_.data(), buffer_length_, ts));
+            /* Everything sharing the old stamp has arrived; send it, then start
+               the new picture with the NAL unit that just came in. */
+            const rclcpp::Time ts(buffer_time_.tv_sec, 1000ull * buffer_time_.tv_usec);
+            sc->receiveStreamData(codec_, subsession_,
+                                  std::make_shared<FrameData>(buffer_.data(), prefix_length, ts));
+            const std::size_t carried = sizeof(MPEG_START_CODE) + frameSize;
+            std::memmove(buffer_.data(), buffer_.data() + prefix_length, carried);
+            buffer_length_ = carried;
+        }
+        else
+        {
+            buffer_length_ += frameSize;
+        }
+        buffer_time_ = presentationTime;
+        have_buffer_time_ = true;
+
+        RTPSource* rtp = subsession_ ? subsession_->rtpSource() : nullptr;
+        const bool marker = rtp && rtp->curPacketMarkerBit();
+        /* A buffer with no room for another NAL unit has to go now whatever the
+           boundaries say, or the next getNextFrame() has nowhere to write. */
+        const bool buffer_full = buffer_length_ + sizeof(MPEG_START_CODE) >= buffer_.size();
+        if ((marker || buffer_full) && buffer_length_ > 0)
+        {
+            const rclcpp::Time ts(buffer_time_.tv_sec, 1000ull * buffer_time_.tv_usec);
+            sc->receiveStreamData(codec_, subsession_,
+                                  std::make_shared<FrameData>(buffer_.data(), buffer_length_, ts));
             buffer_length_ = 0;
+            have_buffer_time_ = false;
         }
         continuePlaying();
     }

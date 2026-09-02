@@ -89,6 +89,16 @@ std::size_t FrameInjector::droppedFrames() const
     return dropped_;
 }
 
+/* Deliberately unlocked. deliverFrame() sets this while holding the queue
+   mutex and then calls FramedSource::afterGetting(), from which live555 asks
+   the framer whether the NAL unit ended an access unit — so this runs inside
+   that same call, on the same thread, with the mutex still held. Taking it
+   again would deadlock on the first frame. */
+bool FrameInjector::lastDeliveryEndedAccessUnit() const noexcept
+{
+    return last_ended_access_unit_;
+}
+
 void FrameInjector::doGetNextFrame()
 {
     if (!is_shutdown_)
@@ -110,6 +120,10 @@ void FrameInjector::deliverFrame()
         return;
     FrameDataPtr frame = frame_queue_.front();
     frame_queue_.pop_front();
+    /* The picture is finished when nothing behind it shares its stamp. An
+       empty queue counts as finished: the publisher enqueues a whole picture
+       in one go, so having drained it means the last slice has gone. */
+    last_ended_access_unit_ = frame_queue_.empty() || frame_queue_.front()->stamp() != frame->stamp();
     if (frame->length() <= fMaxSize)
     {
         fFrameSize = frame->length();

@@ -346,16 +346,25 @@ because RTP is still arriving normally; only the pictures have stopped.
 
 ``decoder_stall_timeout`` (float, default ``2.0`` s) is the watchdog for it: if
 the decoder has been fed for that long without producing an image, it is
-flushed and resumes at the next key frame. Set it to ``0`` to disable. Measured
-on a 640x480 H.264 stream over UDP, frames delivered over a 13 s run::
+flushed and resumes at the next key frame. Set it to ``0`` to disable.
 
-    packet loss    without watchdog    with watchdog
-    1%                          18%              70%
-    3%                          16%              38%
+The underlying cause was that the decoder had to guess where pictures began.
+Both ends now mark access units properly — the server sets the RTP marker bit
+on the last NAL unit of a picture rather than on every slice, and the
+subscriber assembles whole access units before decoding — so the decoder is
+handed one picture per packet and never has to infer a boundary. On a 640x480
+H.264 stream that also halved latency, because a picture arrives in one
+delivery rather than four to fifteen::
 
-H.265 does not show this failure — one slice per picture means a lost packet
-costs the whole picture and nothing downstream of it — and delivers 96-99% at
-the same loss rates either way.
+    packet loss    frames delivered    p50 latency
+    none                       100%         5.8 ms
+    1%                          71%         6.0 ms
+
+Above roughly 1% loss H.264 still degrades sharply, and that part is not a
+defect: a damaged picture corrupts every frame referencing it until the next
+key frame, a second away at the default GOP. Shorten the GOP, or use TCP, or
+use H.265 — which is unaffected throughout, since one slice per picture means
+a lost packet costs that picture and nothing after it.
 
 
 Quality of Service
