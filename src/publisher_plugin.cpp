@@ -70,6 +70,10 @@ struct RTSP_IMAGE_TRANSPORT_NO_EXPORT PublisherPlugin::Config
        This is the recovery time of a lossy stream: a lost packet damages every
        picture referencing the one it belonged to, until the next key frame. */
     unsigned keyframe_interval = 0;
+    /* Rolling intra refresh instead of periodic key frames. Off by default: it
+       costs bitrate for the same quality, and on a bandwidth-limited link more
+       bits mean more lost packets, which is the problem it exists to solve. */
+    bool intra_refresh = false;
     bool use_hw_encoder = true;
     unsigned udp_port = 0;
     unsigned udp_packet_size = 1396;
@@ -325,6 +329,13 @@ void PublisherPlugin::setupParameters(
                               "lossy link, at the cost of bandwidth")
             .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(600)}));
     declareParameter(
+        node_parameters, param_base_name_ + ".intra_refresh", rclcpp::ParameterValue(config_->intra_refresh),
+        ParameterDescriptor().set__description(
+            "sweep a band of intra macroblocks across the picture instead of sending periodic key frames. "
+            "On a lossy link this removes the single large indispensable picture whose loss corrupts "
+            "everything after it, at the cost of bitrate; a client joining mid-stream also has no key "
+            "frame to start from and must wait out a sweep"));
+    declareParameter(
         node_parameters, param_base_name_ + ".use_hw_encoder", rclcpp::ParameterValue(config_->use_hw_encoder),
         ParameterDescriptor().set__description("use NVENC or VAAPI hardware acceleration if possible"));
     declareParameter(
@@ -383,6 +394,7 @@ void PublisherPlugin::updateParameters()
     new_config.target_bitrate = np->get_parameter(param_base_name_ + ".target_bitrate").as_int();
     new_config.expected_framerate = np->get_parameter(param_base_name_ + ".expected_framerate").as_int();
     new_config.keyframe_interval = np->get_parameter(param_base_name_ + ".keyframe_interval").as_int();
+    new_config.intra_refresh = np->get_parameter(param_base_name_ + ".intra_refresh").as_bool();
     new_config.use_hw_encoder = np->get_parameter(param_base_name_ + ".use_hw_encoder").as_bool();
     new_config.udp_port = np->get_parameter(param_base_name_ + ".udp_port").as_int();
     new_config.udp_packet_size = np->get_parameter(param_base_name_ + ".udp_packet_size").as_int();
@@ -400,6 +412,7 @@ void PublisherPlugin::updateParameters()
     if (config_->target_bitrate != new_config.target_bitrate
         || config_->expected_framerate != new_config.expected_framerate
         || config_->keyframe_interval != new_config.keyframe_interval
+        || config_->intra_refresh != new_config.intra_refresh
         || config_->use_hw_encoder != new_config.use_hw_encoder)
         changelevel |= LVL_CODEC;
 
@@ -476,11 +489,14 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
             encoder_->setBitrate(config_->target_bitrate);
             encoder_->setFramerate(config_->expected_framerate);
             encoder_->setKeyframeInterval(config_->keyframe_interval);
+            const bool intra_refresh = config_->intra_refresh && encoder_->setIntraRefresh(true);
             encoder_->setPackageSizeHint(server_->maxPacketSize() - 24);
-            RCLCPP_INFO(logger_, "[%s] start encoding (%s; %sbit/s; %u fps; key frame every %d) for %s",
-                        topic_name_.c_str(), encoder_->context()->codec->name,
-                        withSI(config_->target_bitrate).c_str(), config_->expected_framerate,
-                        encoder_->context()->gop_size, server_->url().c_str());
+            RCLCPP_INFO(logger_, "[%s] start encoding (%s; %sbit/s; %u fps; %s) for %s", topic_name_.c_str(),
+                        encoder_->context()->codec->name, withSI(config_->target_bitrate).c_str(),
+                        config_->expected_framerate,
+                        intra_refresh ? "intra refresh"
+                                      : std::format("key frame every {}", encoder_->context()->gop_size).c_str(),
+                        server_->url().c_str());
         }
         if (image.header.stamp.sec == 0 && image.header.stamp.nanosec == 0)
             RCLCPP_WARN_THROTTLE(logger_, *steady_clock_, 10000,

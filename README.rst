@@ -51,7 +51,34 @@ H.265 examples default to ports 8555 and 8556, respectively, and also accept
 bandwidth and lets a client that joins mid-stream start sooner. It is *not* a
 remedy for packet loss: measured against uniform random loss it made no
 reliable difference, plausibly because a key frame spans many packets and a
-damaged one poisons the whole group that follows. Both request a
+damaged one poisons the whole group that follows.
+
+``intra_refresh`` (bool, default ``false``) is the setting that does help
+there. It sweeps a band of intra macroblocks across the picture instead of
+sending periodic key frames, so there is no single large indispensable frame
+whose loss corrupts everything after it. Measured on a 640x480 H.264 stream,
+frames delivered per run::
+
+    packet loss    intra_refresh off    intra_refresh on
+    1%              median 24%           median 79%
+    2%              median 18%           median 57%
+
+The medians understate it. Without intra refresh the runs at 2% loss ranged
+from 3% to 88% of frames — the stream either survived or died depending on
+where an unlucky packet landed; with it, every run landed between 53% and 72%.
+
+It is off by default because it costs bitrate for the same quality, and on a
+bandwidth-limited link more bits mean more lost packets. Turn it on when the
+link loses packets and has headroom to spare::
+
+  ros2 launch rtsp_image_transport ros_to_rtsp_h264.launch.yaml \
+      input_topic:=/camera/image_raw intra_refresh:=true
+
+One caveat: with no periodic key frame, a client joining an established stream
+has nothing to start from and waits out a sweep. The lazy relay mostly hides
+this, since encoding begins when a client connects and the first picture is
+still a key frame; it applies to multicast and to a second client joining a
+running unicast session. Both request a
 hardware encoder and transparently fall back to software when the machine has
 no usable one. On NVIDIA hardware the selected encoder is logged as
 ``h264_nvenc`` or ``hevc_nvenc``.
