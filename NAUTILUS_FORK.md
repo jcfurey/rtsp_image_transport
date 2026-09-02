@@ -799,6 +799,49 @@ therefore likely to be damaged, and a damaged key frame poisons the whole GOP
 that follows it. Six times as many key frames is six times as many chances to
 lose the picture everything else depends on. Whatever the mechanism, the
 honest statement is that this lever was tried and did not pay.
+
+### Intra refresh does, and by a lot
+
+If the problem is that one large picture is indispensable, the answer is not
+to send that picture more often but to stop having one. `intra_refresh` sweeps
+a band of intra macroblocks across the frame instead, so recovery is
+continuous and no single loss is unrecoverable.
+
+Ten runs per arm at 1% loss, eight at 2%, frames delivered:
+
+| loss | intra refresh | runs | median |
+| --- | --- | --- | --- |
+| 1% | off | 7.1 14.7 21.6 22.7 23.3 24.7 26.2 28.9 42.9 100.0 | 24% |
+| 1% | **on** | 39.1 63.8 66.0 71.6 78.7 78.7 78.7 85.8 92.9 92.9 | **79%** |
+| 2% | off | 3.1 6.4 10.4 17.8 18.4 23.3 32.2 88.4 | 18% |
+| 2% | **on** | 52.7 54.7 56.7 57.3 57.3 64.2 64.4 71.6 | **57%** |
+
+The medians are the smaller half of it. What matters more is the spread: at 2%
+loss the runs without it range from 3% to 88%, and with it from 53% to 72%.
+The bimodal failure — a run either survives or dies depending on where an
+unlucky packet lands — is what disappears. Every single run with intra refresh
+beat six of the eight without it.
+
+Two things were needed to get this working, and both are the kind that fail
+silently:
+
+- x264 refuses intra refresh when more than one reference frame is allowed,
+  and reports it only as a log line while carrying on without it. The first
+  measurement showed no effect at all for exactly this reason. `refs` is now
+  set to 1 alongside it, which is what a rolling refresh wants anyway: the
+  guarantee only holds if nothing references back further than the sweep.
+- `AV_CODEC_FLAG_CLOSED_GOP` is cleared with it, a closed GOP being a
+  statement about boundaries that a rolling refresh does not have.
+
+It is **off by default**, for one reason: it costs bitrate for the same
+quality — 100 kB against 156 kB over 120 frames of the synthetic clip — and on
+a bandwidth-limited link more bits mean more lost packets, which is the
+problem it exists to solve. Turn it on when the link loses packets and has
+headroom. There is a second cost: with no periodic key frame, a client joining
+an established stream has nothing to start from and waits out a sweep. The
+lazy relay mostly hides that, since encoding starts when a client connects and
+the first picture is still a key frame; it applies to multicast and to a
+second client joining a running unicast session.
 - `setBitrate()` did not touch `rc_buffer_size`, which kept twice the 1 Mbit/s
   the context was built with. The VBV was 2 Mbit whatever the stream was
   configured for — ten seconds of buffer at 200 kbit/s, and a quarter second

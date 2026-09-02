@@ -414,6 +414,39 @@ void StreamEncoder::setKeyframeInterval(unsigned frames)
     ctx_->gop_size = static_cast<int>(frames);
 }
 
+bool StreamEncoder::setIntraRefresh(bool enable)
+{
+    if (initialized_)
+        throw StreamingError("cannot modify intra refresh after encoding has started");
+    if (!enable)
+        return true;
+    const char* name = ctx_->codec ? ctx_->codec->name : "";
+    /* Only ask encoders that have the option; av_opt_set on one that does not
+       would report a failure that says nothing useful. */
+    const bool supported = strstr(name, "x264") || strstr(name, "nvenc") || strstr(name, "vaapi")
+                           || strstr(name, "qsv");
+    if (!supported)
+    {
+        RCLCPP_WARN(logger_, "[%s] has no intra refresh; keeping periodic key frames", name);
+        return false;
+    }
+    /* x264 refuses intra refresh with more than one reference frame, and says
+       so only as a log line while carrying on without it — so the setting
+       looks applied and is not. One reference is the right answer here anyway:
+       a rolling refresh only guarantees recovery if nothing reaches back
+       further than the sweep. */
+    ctx_->refs = 1;
+    /* x265 spells it inside x265-params rather than as its own option */
+    if (strstr(name, "x265"))
+        set_codec_option(ctx_, "x265-params", "intra-refresh=1:ref=1", false, logger_);
+    else
+        set_codec_option(ctx_, "intra-refresh", 1, false, logger_);
+    /* A closed GOP is a statement about boundaries between groups, and a
+       rolling refresh has none. */
+    ctx_->flags &= ~AV_CODEC_FLAG_CLOSED_GOP;
+    return true;
+}
+
 void StreamEncoder::setPackageSizeHint(unsigned size)
 {
     if (initialized_)

@@ -64,6 +64,19 @@ public:
        otherwise derives the interval from the frame rate. 0 restores that
        default of one key frame per second. */
     void setKeyframeInterval(unsigned frames);
+    /* Replaces periodic key frames with a band of intra macroblocks that
+       sweeps across the picture, so recovery from packet loss is continuous
+       instead of arriving all at once.
+     *
+     * The point for a lossy link is that there is no longer one large, wholly
+       indispensable picture to lose: a key frame spans many packets, is
+       therefore likely to be damaged, and a damaged one poisons everything
+       referencing it. It also removes the bitrate spike a key frame causes.
+     *
+     * The cost is that a client joining mid-stream has no key frame to start
+       from and must wait out a full sweep. Returns false when this encoder
+       does not support it, leaving periodic key frames in place. */
+    bool setIntraRefresh(bool enable);
     bool hwAccel() const noexcept;
     VideoCodec codec() const noexcept;
     std::size_t encodeVideo(const sensor_msgs::msg::Image& image);

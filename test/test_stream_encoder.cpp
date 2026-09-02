@@ -258,6 +258,73 @@ TEST(StreamEncoder, ShorterKeyframeIntervalProducesMoreKeyFrames)
     EXPECT_GT(dense, sparse) << "a shorter key frame interval produced no extra key frames";
 }
 
+TEST(StreamEncoder, IntraRefreshReplacesPeriodicKeyFrames)
+{
+    /* The setting has to reach the bitstream, and x264 makes that easy to get
+       wrong: it refuses intra refresh when more than one reference frame is
+       allowed and says so only in a log line, carrying on without it. Counting
+       IDR NAL units is what catches that — with a rolling refresh there should
+       be the one at the start of the stream and no more. */
+    auto count_idr = [](bool intra_refresh, bool* supported)
+    {
+        auto encoder = makeEncoder();
+        if (!encoder)
+            return std::size_t{0};
+        encoder->setBitrate(2000000);
+        encoder->setFramerate(30);
+        if (intra_refresh)
+            *supported = encoder->setIntraRefresh(true);
+        encoder->setPackageSizeHint(1330);
+        std::size_t idr = 0;
+        for (unsigned i = 0; i < 90; ++i)
+        {
+            encoder->encodeVideo(makeTestImage(320, 240, i));
+            while (FrameDataPtr packet = encoder->nextPacket())
+            {
+                if (packet->length() > 0 && (packet->data()[0] & 0x1F) == 5)
+                    idr++;
+            }
+        }
+        return idr;
+    };
+    bool supported = true, unused = true;
+    const std::size_t periodic = count_idr(false, &unused);
+    if (periodic == 0)
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    const std::size_t rolling = count_idr(true, &supported);
+    if (!supported)
+        GTEST_SKIP() << "this encoder has no intra refresh";
+    EXPECT_LT(rolling, periodic)
+        << "intra refresh produced " << rolling << " IDR NAL units against " << periodic
+        << " for periodic key frames; the setting did not reach the encoder";
+}
+
+TEST(StreamEncoder, IntraRefreshIsLockedOnceEncodingStarted)
+{
+    auto encoder = makeEncoder();
+    if (!encoder)
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    ASSERT_NO_THROW(encoder->encodeVideo(makeTestImage(160, 120, 0)));
+    EXPECT_THROW(encoder->setIntraRefresh(true), StreamingError);
+}
+
+TEST(StreamEncoder, IntraRefreshStreamStillDecodes)
+{
+    /* A rolling refresh has no key frame after the first, so a decoder that
+       waits for one has to be able to start from what it is given. */
+    auto encoder = makeEncoder();
+    if (!encoder)
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    encoder->setBitrate(2000000);
+    encoder->setFramerate(30);
+    if (!encoder->setIntraRefresh(true))
+        GTEST_SKIP() << "this encoder has no intra refresh";
+    std::vector<FrameDataPtr> packets;
+    encodeClip(*encoder, 320, 240, 60, &packets);
+    ASSERT_FALSE(packets.empty());
+    EXPECT_GT(packets.size(), 30u) << "intra refresh produced far too little output";
+}
+
 TEST(StreamEncoder, ReportsUnsupportedCodec)
 {
     /* Decode-only codecs have no encoder table entry and must say so rather
