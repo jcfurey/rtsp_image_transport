@@ -303,10 +303,11 @@ with. Zero-filled YUV converts to BGR (0, 135, 0).
 
 Three changes:
 
-- New `rtp_over_tcp` subscriber parameter, **on by default**. RTP is interleaved
-  over the RTSP connection, which removes the loss rather than tuning around it.
-  For a camera on one Ethernet link this is close to strictly better: no loss, no
-  reordering, no buffer sizing.
+- New `rtp_over_tcp` subscriber parameter. It shipped **on**, interleaving RTP
+  over the RTSP connection, which removes the loss rather than tuning around
+  it. It is now **off** — see "UDP by default" below; the reasoning that
+  originally justified TCP weighed artefacts above latency, and for a live
+  viewer that is the wrong way round.
 - New `rtp_buffer_size` parameter (2 MB default), applied to the RTP socket
   between `initiate()` and SETUP when UDP is selected. The kernel caps the
   request at `net.core.rmem_max` and the subscriber logs a warning when it does.
@@ -564,6 +565,38 @@ than failing. Asking for the pool explicitly (`pools=`) avoids it everywhere.
   carries that picture's stamp, so dropping by stamp cannot hand Live555 the
   tail of a picture whose first slices are gone. Each client has its own
   injector, so a slow one degrades only itself.
+- **UDP by default.** `rtp_over_tcp` now defaults to off, reversing the choice
+  made in "RTP transport and lossy links" above. That section optimised for
+  the picture being intact; this one optimises for it being current, and the
+  two want opposite transports.
+
+  TCP cannot drop. A lost segment stalls every byte queued behind it until the
+  retransmission arrives, and a live viewer spends that wait on data it is
+  already too late to display — so on a link that keeps losing packets an
+  interleaved session does not degrade, it falls progressively further behind
+  live and stays there. UDP loses a slice and continues, which bounds latency
+  by the link rather than by its worst recent loss.
+
+  The loss handling that was built for the UDP path is what makes this
+  affordable: concealment for H.264 and the mpegvideo family, the frame
+  pre-fill and damage detection for H.265/VP8/VP9/AV1 so loss reads as black
+  rather than fluorescent green, and the 2 MB RTP receive buffer so the kernel
+  is not the thing dropping datagrams. `rtp_over_tcp:=true` is still there for
+  a link lossy enough that artefacts outweigh delay, and for servers that will
+  not serve UDP.
+
+  A third launch file, `rtsp_to_ros.launch.yaml`, is the receiving counterpart
+  of the two `ros_to_rtsp_*` ones and carries these defaults: UDP, the 2 MB
+  receive buffer, `low_latency` decoding, the `max_latency` budget, and
+  best-effort depth-1 QoS on the decoded image topic, because a consumer
+  behind on live video wants the newest frame and not a replay of the one it
+  missed. Verified as a round trip — synthetic 30 Hz source, the H.264 relay,
+  and this receiver — at 29.94 Hz output with 1.1 ms of jitter and no loss.
+
+  What is *not* measured here is the case the change exists for. netem is
+  unavailable in the test kernel, so no lossy link could be simulated; the
+  loopback numbers only establish that UDP costs nothing on a clean one
+  (p50 7.9 ms against 8.0 for TCP at 320x240, with a shorter tail).
 - `setBitrate()` did not touch `rc_buffer_size`, which kept twice the 1 Mbit/s
   the context was built with. The VBV was 2 Mbit whatever the stream was
   configured for — ten seconds of buffer at 200 kbit/s, and a quarter second

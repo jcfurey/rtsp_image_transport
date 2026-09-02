@@ -160,7 +160,7 @@ struct RTSP_IMAGE_TRANSPORT_NO_EXPORT SubscriberPlugin::Config
     std::string frame_id;
     TimestampSource timestamp_source = TimestampAuto;
     int video_subsession = 0;
-    bool rtp_over_tcp = true;
+    bool rtp_over_tcp = false;
     int rtp_buffer_size = static_cast<int>(DEFAULT_RTP_BUFFER_SIZE);
     ReconnectPolicy reconnect_policy = ReconnectOnTimeout;
     std::chrono::milliseconds timeout = 2s;
@@ -470,8 +470,10 @@ void SubscriberPlugin::setupParameters(
     declareParameter(
         node_parameters, param_base_name_ + ".rtp_over_tcp", rclcpp::ParameterValue(config_->rtp_over_tcp),
         ParameterDescriptor().set__description(
-            "carry RTP interleaved over the RTSP TCP connection instead of separate UDP sockets; "
-            "avoids the packet loss that shows up as green bands in the decoded image"));
+            "carry RTP interleaved over the RTSP TCP connection instead of its own UDP sockets. Off by "
+            "default: TCP retransmits and reorders, and a live viewer waits behind data it will never "
+            "use, so a lost packet costs latency rather than a frame. Turn it on for a lossy link where "
+            "artefacts matter more than delay, or for a server that will not do UDP"));
     declareParameter(
         node_parameters, param_base_name_ + ".rtp_buffer_size",
         rclcpp::ParameterValue(config_->rtp_buffer_size),

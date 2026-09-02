@@ -79,6 +79,25 @@ child transport topic::
       -r in:=/camera/image_raw \
       -r out/rtsp:=/camera/image_h264/rtsp
 
+RTSP to ROS Image Topic
+=======================
+
+The receiving counterpart, decoding a stream back onto a
+``sensor_msgs/Image`` topic::
+
+  ros2 launch rtsp_image_transport rtsp_to_ros.launch.yaml \
+      input_topic:=/camera/image_h264/rtsp \
+      output_topic:=/camera/image_raw
+
+It is configured for latency throughout: RTP over UDP with a 2 MB receive
+buffer, minimal decoder buffering, and best-effort depth-1 output QoS, since a
+consumer that has fallen behind on live video wants the newest frame rather
+than a replay of the one it missed. ``max_latency`` and ``rtp_over_tcp`` are
+launch arguments; see `Latency`_ and `RTP transport and packet loss`_.
+
+The input is the URL topic, so it works equally with a stream advertised by
+``publish_rtsp_stream`` from an IP camera.
+
 Multiple Video Subsessions
 ==========================
 
@@ -254,21 +273,33 @@ long one frame can occupy it.
 RTP transport and packet loss
 =============================
 
-The subscriber interleaves RTP over the RTSP TCP connection by default
-(``rtp_over_tcp``, on). The alternative — RTP on its own UDP sockets — drops
-whole datagrams whenever the socket receive buffer overruns, and a lost datagram
-costs a slice. With ``AV_CODEC_FLAG2_CHUNKS`` set, the decoder emits the picture
-anyway, built from the slices that did arrive; the macroblocks the missing slice
-covered are never written. An all-zero YUV block converts to BGR (0, 135, 0), so
-the damage shows up as flat green bands across part of the image.
+The subscriber runs RTP on its own UDP sockets by default (``rtp_over_tcp``,
+off), because for live video a late frame is worth less than a missing one.
+TCP cannot drop: a lost segment stalls every byte queued behind it until the
+retransmission arrives, and the viewer waits through that for data it is
+already too late to display. Loss on UDP costs a slice of one picture and the
+stream carries on at once, so latency stays bounded by the link rather than by
+its worst recent loss.
 
-Set ``-p in.rtsp.rtp_over_tcp:=false`` for a server that cannot interleave.
-On UDP the subscriber asks for a 2 MB receive buffer on the RTP socket
-(``rtp_buffer_size``), since the kernel default holds well under one HD frame.
-The kernel silently caps the request at ``net.core.rmem_max``, and the log says
-so when it does::
+The subscriber asks for a 2 MB receive buffer on the RTP socket
+(``rtp_buffer_size``), since the kernel default holds well under one HD frame
+and would otherwise be the thing dropping datagrams. The kernel silently caps
+the request at ``net.core.rmem_max``, and the log says so when it does::
 
     sysctl -w net.core.rmem_max=4194304
+
+Set ``-p in.rtsp.rtp_over_tcp:=true`` to interleave RTP over the RTSP
+connection instead. That is the right choice when artefacts cost more than
+delay — a link losing enough packets to make the picture unusable, or a
+recording — and for servers that will not serve RTP over UDP at all. It
+removes loss outright, at the price of unbounded latency growth on a link that
+keeps retransmitting.
+
+A lost datagram costs a slice. With ``AV_CODEC_FLAG2_CHUNKS`` set, the decoder
+emits the picture anyway, built from the slices that did arrive; the
+macroblocks the missing slice covered are never written. An all-zero YUV block
+converts to BGR (0, 135, 0), so undamaged-looking loss would show up as flat
+green bands across part of the image — see below for what is done about that.
 
 What happens to residual loss depends on the codec, because libavcodec's error
 concealment only covers some of them. For H.264, MPEG-2, MPEG-4 and H.263 the

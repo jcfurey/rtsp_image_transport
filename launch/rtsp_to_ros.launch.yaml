@@ -1,0 +1,106 @@
+# Copyright © 2026 Nautilus project contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Low-latency RTSP -> ROS image topic relay, the receiving counterpart of
+# ros_to_rtsp_h264.launch.yaml.
+#
+# Usually only input_topic and output_topic need changing:
+#   ros2 launch rtsp_image_transport rtsp_to_ros.launch.yaml \
+#     input_topic:=/camera/image_h264/rtsp \
+#     output_topic:=/camera/image_raw
+#
+# The input topic is the std_msgs/String URL topic a publisher advertises, or
+# the one publish_rtsp_stream puts an IP camera's URL on. Point it at a camera
+# directly with:
+#   ros2 run rtsp_image_transport publish_rtsp_stream rtsp://<url> \
+#     --ros-args --remap image:=/camera/image
+
+launch:
+  - arg:
+      name: input_topic
+      default: /camera/image_h264/rtsp
+      description: std_msgs/String topic carrying the RTSP URL
+  - arg:
+      name: output_topic
+      default: /camera/image_raw
+      description: sensor_msgs/Image topic the decoded video is published on
+  - arg:
+      name: max_latency
+      default: '0.2'
+      description: >-
+        How far the decoder may fall behind before frames are dropped [s].
+        This is the latency the queue settles at when the decoder cannot keep
+        up, so lower it to trade smoothness for freshness (0 = never drop).
+  - arg:
+      name: rtp_over_tcp
+      default: 'false'
+      description: >-
+        Interleave RTP over the RTSP TCP connection. Off by default: TCP
+        cannot drop, so a lost segment stalls the viewer behind a retransmit
+        of data it is already too late to show. Turn on for a link lossy
+        enough that artefacts cost more than delay.
+  - arg:
+      name: video_subsession
+      default: '0'
+      description: Zero-based index over the server's video subsessions
+
+  - node:
+      pkg: image_transport
+      exec: republish
+      name: rtsp_to_image
+      output: screen
+      param:
+        - name: in_transport
+          value: rtsp
+        - name: out_transport
+          value: raw
+
+        # RTP on its own UDP sockets, with a receive buffer big enough that
+        # the kernel is not the thing dropping datagrams. The kernel caps the
+        # request at net.core.rmem_max and the node logs when it does:
+        #   sysctl -w net.core.rmem_max=4194304
+        - name: in.rtsp.rtp_over_tcp
+          value: $(var rtp_over_tcp)
+          type: bool
+        - name: in.rtsp.rtp_buffer_size
+          value: 2097152
+          type: int
+        - name: in.rtsp.max_latency
+          value: $(var max_latency)
+          type: float
+        - name: in.rtsp.video_subsession
+          value: $(var video_subsession)
+          type: int
+
+        # Emit each picture as soon as it is complete rather than holding it
+        # in the reordering buffer. Turn off only for a source with B-frames.
+        - name: in.rtsp.low_latency
+          value: true
+          type: bool
+        - name: in.rtsp.use_hw_decoder
+          value: true
+          type: bool
+        # Publish what was decoded rather than dropping damaged pictures: on
+        # a lossy link stutter is usually worse than a briefly wrong region.
+        - name: in.rtsp.drop_corrupt_frames
+          value: false
+          type: bool
+
+        # Best effort, depth 1 on the decoded images. This is live video, so a
+        # consumer that has fallen behind wants the newest frame, not a
+        # replay of the one it missed.
+        - name: qos_overrides.$(var output_topic).publisher.reliability
+          value: best_effort
+        - name: qos_overrides.$(var output_topic).publisher.history
+          value: keep_last
+        - name: qos_overrides.$(var output_topic).publisher.depth
+          value: 1
+        - name: qos_overrides.$(var output_topic).publisher.durability
+          value: volatile
+      remap:
+        # Remap the full transport topic. Remapping only "in" does not remap
+        # its "in/rtsp" child in ROS 2.
+        - from: in/rtsp
+          to: $(var input_topic)
+        - from: out
+          to: $(var output_topic)

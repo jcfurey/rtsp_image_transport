@@ -368,19 +368,23 @@ TEST(RtspLoopback, H265SessionDecodesBackToImages)
     EXPECT_GE(images, 3u) << "received H.265 stream did not decode into images";
 }
 
-TEST(RtspLoopback, RtpIsInterleavedOverTcpByDefault)
+TEST(RtspLoopback, RtpRunsOverUdpByDefault)
 {
-    /* UDP loses whole datagrams when the receive buffer overruns, and a lost
-       slice leaves its macroblocks unwritten — green bands in the decoded
-       image. Interleaving RTP over the RTSP connection removes the failure
-       mode outright, so it is what a fresh client asks for. */
+    /* Latency is the thing being optimised, and TCP cannot drop. A lost
+       segment stalls everything queued behind it until it is retransmitted,
+       so on a lossy link an interleaved viewer falls progressively further
+       behind live rather than losing a slice and carrying on. UDP is
+       therefore what a fresh client asks for, with a receive buffer big
+       enough that the kernel is not the thing dropping datagrams. */
     std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", "rtsp://localhost:8554/test");
-    EXPECT_TRUE(client->rtpOverTcp());
+    EXPECT_FALSE(client->rtpOverTcp());
     EXPECT_EQ(client->rtpBufferSize(), DEFAULT_RTP_BUFFER_SIZE);
 }
 
 TEST(RtspLoopback, TcpInterleavedSessionDeliversVideo)
 {
+    /* Interleaving stays supported, and has to keep working, for lossy links
+       where artefacts cost more than delay and for servers that refuse UDP. */
     if (!haveEncoderFor(VideoCodec::H264))
         GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
     LoopbackServer server(VideoCodec::H264, 320, 240);
@@ -402,7 +406,7 @@ TEST(RtspLoopback, TcpInterleavedSessionDeliversVideo)
 
 TEST(RtspLoopback, UdpSessionStillDeliversVideo)
 {
-    /* The UDP path stays supported for servers that cannot interleave. */
+    /* The default path: RTP on its own UDP sockets. */
     if (!haveEncoderFor(VideoCodec::H264))
         GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
     LoopbackServer server(VideoCodec::H264, 320, 240);

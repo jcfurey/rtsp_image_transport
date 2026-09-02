@@ -498,7 +498,7 @@ std::shared_ptr<StreamClient> StreamClient::create(const std::string& topic_name
 
 StreamClient::StreamClient(const std::string& topic_name, const std::string& url, const rclcpp::Logger& logger) noexcept
     : topic_name_(topic_name), url_(url), logger_(logger), codec_(VideoCodec::Unknown), video_subsession_(0),
-      rtp_over_tcp_(true), rtp_buffer_size_(DEFAULT_RTP_BUFFER_SIZE), retried_on_454_error_(false), timeout_(0),
+      rtp_over_tcp_(false), rtp_buffer_size_(DEFAULT_RTP_BUFFER_SIZE), retried_on_454_error_(false), timeout_(0),
       loop_(EventLoop::create()), client_(nullptr)
 {
 }
