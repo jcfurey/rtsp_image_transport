@@ -280,6 +280,8 @@ TEST(Transport, PluginsAreActuallyDrivenByImageTransport)
     }
     EXPECT_TRUE(fixture.node_->has_parameter("alive.image.rtsp.codec"))
         << "the publisher plugin never declared its correctly scoped parameters";
+    EXPECT_TRUE(fixture.node_->has_parameter("alive.image.rtsp.keyframe_interval"))
+        << "the publisher plugin did not expose the key frame interval";
     EXPECT_TRUE(fixture.node_->has_parameter("alive.image.rtsp.use_hw_decoder"))
         << "the subscriber plugin never declared its correctly scoped parameters";
     EXPECT_TRUE(fixture.node_->has_parameter("alive.image.rtsp.timestamp_source"))

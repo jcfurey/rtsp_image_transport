@@ -31,6 +31,13 @@ launch:
       name: framerate
       default: '30'
       description: Expected source frame rate
+  - arg:
+      name: keyframe_interval
+      default: '0'
+      description: >-
+        Frames between key frames (0 = one per second, from framerate).
+        Shortening it costs bandwidth and lets a client joining mid-stream
+        start sooner; it is not a remedy for packet loss.
 
   - node:
       pkg: image_transport
@@ -49,6 +56,9 @@ launch:
           type: int
         - name: out.rtsp.expected_framerate
           value: $(var framerate)
+          type: int
+        - name: out.rtsp.keyframe_interval
+          value: $(var keyframe_interval)
           type: int
         - name: out.rtsp.use_hw_encoder
           value: true
