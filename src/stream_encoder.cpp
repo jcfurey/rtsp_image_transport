@@ -401,6 +401,19 @@ void StreamEncoder::setFramerate(unsigned fps)
     ctx_->framerate = AVRational{static_cast<int>(fps), 1};
 }
 
+void StreamEncoder::setKeyframeInterval(unsigned frames)
+{
+    if (initialized_)
+        throw StreamingError("cannot modify the key frame interval after encoding has started");
+    if (frames == 0)
+    {
+        /* Back to the frame-rate-derived default: one key frame a second. */
+        ctx_->gop_size = ctx_->framerate.num > 0 ? ctx_->framerate.num / std::max(1, ctx_->framerate.den) : 30;
+        return;
+    }
+    ctx_->gop_size = static_cast<int>(frames);
+}
+
 void StreamEncoder::setPackageSizeHint(unsigned size)
 {
     if (initialized_)

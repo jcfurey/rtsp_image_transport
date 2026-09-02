@@ -203,6 +203,61 @@ TEST(StreamEncoder, VbvBufferTracksTheConfiguredBitrate)
     }
 }
 
+TEST(StreamEncoder, KeyframeIntervalOverridesTheFrameRateDefault)
+{
+    auto encoder = makeEncoder();
+    if (!encoder)
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    /* setFramerate() derives one key frame per second, which is the default */
+    encoder->setFramerate(25);
+    EXPECT_EQ(encoder->context()->gop_size, 25);
+    encoder->setKeyframeInterval(8);
+    EXPECT_EQ(encoder->context()->gop_size, 8);
+    /* Zero means "follow the frame rate again" rather than "never" — a gop of
+       zero would ask the encoder for an unbounded interval. */
+    encoder->setKeyframeInterval(0);
+    EXPECT_EQ(encoder->context()->gop_size, 25);
+}
+
+TEST(StreamEncoder, KeyframeIntervalIsLockedOnceEncodingStarted)
+{
+    auto encoder = makeEncoder();
+    if (!encoder)
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    ASSERT_NO_THROW(encoder->encodeVideo(makeTestImage(160, 120, 0)));
+    EXPECT_THROW(encoder->setKeyframeInterval(10), StreamingError);
+}
+
+TEST(StreamEncoder, ShorterKeyframeIntervalProducesMoreKeyFrames)
+{
+    /* The parameter has to reach the bitstream, not just the context. Counting
+       IDR NAL units is the check: type 5 in the H.264 NAL header. */
+    auto count_idr = [](unsigned interval)
+    {
+        auto encoder = makeEncoder();
+        if (!encoder)
+            return std::size_t{0};
+        encoder->setFramerate(30);
+        encoder->setKeyframeInterval(interval);
+        std::size_t idr = 0;
+        for (unsigned i = 0; i < 60; ++i)
+        {
+            encoder->encodeVideo(makeTestImage(160, 120, i));
+            while (FrameDataPtr packet = encoder->nextPacket())
+            {
+                if (packet->length() > 0 && (packet->data()[0] & 0x1F) == 5)
+                    idr++;
+            }
+        }
+        return idr;
+    };
+    const std::size_t sparse = count_idr(30);
+    const std::size_t dense = count_idr(6);
+    if (sparse == 0 && dense == 0)
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    EXPECT_GT(dense, sparse) << "a shorter key frame interval produced no extra key frames";
+}
+
 TEST(StreamEncoder, ReportsUnsupportedCodec)
 {
     /* Decode-only codecs have no encoder table entry and must say so rather

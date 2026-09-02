@@ -755,26 +755,50 @@ Both ends are fixed:
 This is worth carrying upstream: the malformed marker bit affects every client
 of this publisher, not just this one.
 
-Measured, 640x480 H.264, frames delivered and p50 latency:
+On a clean link, reproducibly: deliveries went from 3239 to 600 for 600
+frames, exactly one access unit each; delivery stays at 100%; and p50 latency
+halved, 11.2 ms to **5.8 ms**, because the decoder now receives one packet per
+picture instead of four to fifteen. That is the solid result, and it needs no
+loss to demonstrate.
 
-| | before | after |
-| --- | --- | --- |
-| clean link | 100%, 11.2 ms | 100%, **5.8 ms** |
-| 1% loss | 30%, 12.5 ms | **71%**, 6.0 ms |
-| 2% loss | 9% | 9-22% |
-| 5% loss | 5% | 5-7% |
+**A number reported earlier for the lossy case does not survive scrutiny.**
+"1% loss: 30% -> 71% of frames delivered" was one run of each, and the
+run-to-run spread turns out to be enormous. Six runs of one unchanged
+configuration at 1% loss delivered 2.5%, 8.0%, 16.8%, 43.7%, 54.8% and 61.8%
+of frames — a 25-fold range. The failure is bimodal: whether a run dies early
+or late depends on when an unlucky packet lands, so a single 20 second run
+samples a heavy tail. Any single-run comparison across that, in either
+direction, is noise. Treat the lossy figures in earlier notes as
+order-of-magnitude only.
 
-The latency halved because the decoder now receives one packet per picture
-instead of four to fifteen. Deliveries went from 3239 to 600 for 600 frames —
-exactly one access unit each.
+What is unambiguous is that H.264 degrades badly above about 1% loss and H.265
+does not (89-99% throughout), because a lost packet costs H.265 one picture
+and nothing after it. The stall watchdog stays as a backstop, though it no
+longer fires on this path: the failure is dropped frames rather than a stopped
+decoder.
 
-What this does not fix is H.264 above about 1% loss, and that part is not a
-bug. A damaged picture corrupts every P frame referencing it until the next
-key frame, which at `gop_size = fps` is a second away; the fix for that is a
-shorter GOP, intra refresh, or a transport that does not lose packets. H.265
-is unaffected throughout (89-99%) because x265 emits one slice per picture.
-The stall watchdog stays as a backstop, though it no longer fires on this
-path: the failure is now dropped frames rather than a stopped decoder.
+### Shortening the GOP does not help, measurably
+
+The obvious lever for the loss case is the key frame interval, on the
+reasoning that a damaged picture corrupts everything referencing it until the
+next key frame. `keyframe_interval` now exposes it (0 keeps one key frame per
+second, derived from `expected_framerate`), because it is a control worth
+having for bandwidth and for recovery time in principle.
+
+It does not measurably improve delivery under uniform random loss. Six runs
+each at 1% loss:
+
+| key frame interval | frames delivered per run |
+| --- | --- |
+| 30 (default) | 2.5% 8.0% 16.8% 43.7% 54.8% 61.8% — median ~30% |
+| 5 | 2.3% 3.0% 6.3% 10.2% 14.3% 52.3% — median ~8% |
+
+Shorter is, if anything, worse, and the distributions overlap far too much to
+claim either way. The explanation that fits: a key frame is many packets and
+therefore likely to be damaged, and a damaged key frame poisons the whole GOP
+that follows it. Six times as many key frames is six times as many chances to
+lose the picture everything else depends on. Whatever the mechanism, the
+honest statement is that this lever was tried and did not pay.
 - `setBitrate()` did not touch `rc_buffer_size`, which kept twice the 1 Mbit/s
   the context was built with. The VBV was 2 Mbit whatever the stream was
   configured for — ten seconds of buffer at 200 kbit/s, and a quarter second

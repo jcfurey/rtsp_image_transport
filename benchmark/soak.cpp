@@ -61,6 +61,8 @@ int main(int argc, char** argv)
         encoder = std::make_unique<StreamEncoder>(codec, false);
         encoder->setBitrate(2000000);
         encoder->setFramerate(30);
+        if (const char* gop = std::getenv("RTSP_BENCH_GOP"))
+            encoder->setKeyframeInterval(static_cast<unsigned>(std::atoi(gop)));
         if (!std::getenv("RTSP_BENCH_NO_SLICE"))
             encoder->setPackageSizeHint(server->maxPacketSize() - 24);
     }

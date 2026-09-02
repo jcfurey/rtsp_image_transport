@@ -57,6 +57,13 @@ public:
     void setBitrate(unsigned long bit_rate);
     void setFramerate(unsigned fps);
     void setPackageSizeHint(unsigned size);
+    /* Frames between key frames. Sets how long a receiver stays damaged after
+       losing a packet: everything referencing the lost picture is wrong until
+       the next key frame arrives, so this is the recovery time of a lossy
+       stream, not merely a bandwidth setting. Call after setFramerate(), which
+       otherwise derives the interval from the frame rate. 0 restores that
+       default of one key frame per second. */
+    void setKeyframeInterval(unsigned frames);
     bool hwAccel() const noexcept;
     VideoCodec codec() const noexcept;
     std::size_t encodeVideo(const sensor_msgs::msg::Image& image);

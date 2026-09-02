@@ -66,6 +66,10 @@ struct RTSP_IMAGE_TRANSPORT_NO_EXPORT PublisherPlugin::Config
     VideoCodec codec = VideoCodec::Unknown;
     unsigned target_bitrate = 1000000;
     unsigned expected_framerate = 30;
+    /* Frames between key frames; 0 follows the frame rate, one per second.
+       This is the recovery time of a lossy stream: a lost packet damages every
+       picture referencing the one it belonged to, until the next key frame. */
+    unsigned keyframe_interval = 0;
     bool use_hw_encoder = true;
     unsigned udp_port = 0;
     unsigned udp_packet_size = 1396;
@@ -312,6 +316,15 @@ void PublisherPlugin::setupParameters(
             .set__description("expected video frame rate [frames/s]")
             .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(1).set__to_value(100)}));
     declareParameter(
+        node_parameters, param_base_name_ + ".keyframe_interval",
+        rclcpp::ParameterValue(static_cast<int>(config_->keyframe_interval)),
+        ParameterDescriptor()
+            .set__description("frames between key frames (0 = one per second, from expected_framerate). This is "
+                              "how long a receiver stays damaged after losing a packet, since every picture "
+                              "referencing the lost one is wrong until the next key frame; shorten it for a "
+                              "lossy link, at the cost of bandwidth")
+            .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(600)}));
+    declareParameter(
         node_parameters, param_base_name_ + ".use_hw_encoder", rclcpp::ParameterValue(config_->use_hw_encoder),
         ParameterDescriptor().set__description("use NVENC or VAAPI hardware acceleration if possible"));
     declareParameter(
@@ -369,6 +382,7 @@ void PublisherPlugin::updateParameters()
     }
     new_config.target_bitrate = np->get_parameter(param_base_name_ + ".target_bitrate").as_int();
     new_config.expected_framerate = np->get_parameter(param_base_name_ + ".expected_framerate").as_int();
+    new_config.keyframe_interval = np->get_parameter(param_base_name_ + ".keyframe_interval").as_int();
     new_config.use_hw_encoder = np->get_parameter(param_base_name_ + ".use_hw_encoder").as_bool();
     new_config.udp_port = np->get_parameter(param_base_name_ + ".udp_port").as_int();
     new_config.udp_packet_size = np->get_parameter(param_base_name_ + ".udp_packet_size").as_int();
@@ -385,6 +399,7 @@ void PublisherPlugin::updateParameters()
         changelevel |= LVL_SESSION;
     if (config_->target_bitrate != new_config.target_bitrate
         || config_->expected_framerate != new_config.expected_framerate
+        || config_->keyframe_interval != new_config.keyframe_interval
         || config_->use_hw_encoder != new_config.use_hw_encoder)
         changelevel |= LVL_CODEC;
 
@@ -460,10 +475,12 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
             stream_clock_.reset();
             encoder_->setBitrate(config_->target_bitrate);
             encoder_->setFramerate(config_->expected_framerate);
+            encoder_->setKeyframeInterval(config_->keyframe_interval);
             encoder_->setPackageSizeHint(server_->maxPacketSize() - 24);
-            RCLCPP_INFO(logger_, "[%s] start encoding (%s; %sbit/s; %u fps) for %s", topic_name_.c_str(),
-                        encoder_->context()->codec->name, withSI(config_->target_bitrate).c_str(),
-                        config_->expected_framerate, server_->url().c_str());
+            RCLCPP_INFO(logger_, "[%s] start encoding (%s; %sbit/s; %u fps; key frame every %d) for %s",
+                        topic_name_.c_str(), encoder_->context()->codec->name,
+                        withSI(config_->target_bitrate).c_str(), config_->expected_framerate,
+                        encoder_->context()->gop_size, server_->url().c_str());
         }
         if (image.header.stamp.sec == 0 && image.header.stamp.nanosec == 0)
             RCLCPP_WARN_THROTTLE(logger_, *steady_clock_, 10000,

@@ -44,7 +44,14 @@ The HEVC example uses less bandwidth at comparable quality::
 
 Those topic arguments are normally the only values to change. The H.264 and
 H.265 examples default to ports 8555 and 8556, respectively, and also accept
-``rtsp_port``, ``bitrate`` and ``framerate`` launch arguments. Both request a
+``rtsp_port``, ``bitrate`` and ``framerate`` launch arguments.
+
+``keyframe_interval`` (int, default ``0``) sets the frames between key frames,
+``0`` meaning one per second from ``expected_framerate``. Shortening it costs
+bandwidth and lets a client that joins mid-stream start sooner. It is *not* a
+remedy for packet loss: measured against uniform random loss it made no
+reliable difference, plausibly because a key frame spans many packets and a
+damaged one poisons the whole group that follows. Both request a
 hardware encoder and transparently fall back to software when the machine has
 no usable one. On NVIDIA hardware the selected encoder is logged as
 ``h264_nvenc`` or ``hevc_nvenc``.
@@ -353,18 +360,19 @@ Both ends now mark access units properly — the server sets the RTP marker bit
 on the last NAL unit of a picture rather than on every slice, and the
 subscriber assembles whole access units before decoding — so the decoder is
 handed one picture per packet and never has to infer a boundary. On a 640x480
-H.264 stream that also halved latency, because a picture arrives in one
-delivery rather than four to fifteen::
+H.264 stream that also halved p50 latency, from 11.2 ms to 5.8 ms, because a
+picture arrives in one delivery rather than four to fifteen.
 
-    packet loss    frames delivered    p50 latency
-    none                       100%         5.8 ms
-    1%                          71%         6.0 ms
+Above roughly 1% packet loss H.264 still degrades badly, and that part is not
+a defect: a damaged picture corrupts every frame referencing it until the next
+key frame. Use TCP, or use H.265 — which holds 89-99% of frames throughout,
+since one slice per picture means a lost packet costs that picture and nothing
+after it.
 
-Above roughly 1% loss H.264 still degrades sharply, and that part is not a
-defect: a damaged picture corrupts every frame referencing it until the next
-key frame, a second away at the default GOP. Shorten the GOP, or use TCP, or
-use H.265 — which is unaffected throughout, since one slice per picture means
-a lost packet costs that picture and nothing after it.
+Be careful reading any single measurement of a lossy H.264 stream. The failure
+is bimodal rather than gradual, so runs of one unchanged configuration at 1%
+loss delivered anywhere from 2.5% to 62% of frames. Comparisons there need
+many repetitions to mean anything.
 
 
 Quality of Service
