@@ -563,12 +563,17 @@ void StreamDecoder::openCandidate(const DecoderCandidate& candidate)
     ctx_->pkt_timebase = NANOSECOND_TIME_BASE;
     if (codec_ == VideoCodec::H264 || codec_ == VideoCodec::H265)
     {
-        ctx_->flags2 |= AV_CODEC_FLAG2_CHUNKS;
-        /* AV_CODEC_FLAG2_CHUNKS lets the decoder emit a picture assembled from
-           whatever slices arrived rather than waiting for a complete access
-           unit, so a lost RTP packet leaves its macroblocks at the value the
-           buffer was allocated with. An all-zero YUV block converts to bright
-           green, which is where the green bands in a lossy stream come from.
+        /* FrameExtractor hands over one complete access unit per packet. Do
+           not set AV_CODEC_FLAG2_CHUNKS here: that flag says packets may end
+           between picture boundaries, which was true when the extractor
+           forwarded one NAL at a time but is the opposite of its current
+           contract. Leaving it set makes libavcodec infer boundaries again;
+           on multi-slice streams that can merge adjacent pictures and make
+           their presentation appear out of order.
+
+           A lost RTP packet may still leave a slice missing inside an access
+           unit. The packet boundary closes that damaged picture, allowing the
+           decoder to emit or conceal it without CHUNKS.
 
            Error concealment has to stay on for two reasons: it repairs those
            macroblocks from the reference frame, and ff_er_frame_end() is what

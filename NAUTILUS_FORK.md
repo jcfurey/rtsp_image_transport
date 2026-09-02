@@ -296,10 +296,11 @@ default receive buffer — well under one HD frame. On the Nautilus tether this
 showed up as flat green bands over part of the decoded image, and the system UDP
 counters attributed every input error to receive-buffer overflow.
 
-The green is the tell. A lost datagram costs a slice; `AV_CODEC_FLAG2_CHUNKS`
-makes the decoder emit the picture from the slices that did arrive, and the
-macroblocks the missing one covered keep the value their buffer was allocated
-with. Zero-filled YUV converts to BGR (0, 135, 0).
+The green is the tell. A lost datagram costs a slice; the RTP marker still
+closes the damaged access unit, so the decoder emits the picture from the
+slices that did arrive, and the macroblocks the missing one covered keep the
+value their buffer was allocated with. Zero-filled YUV converts to BGR
+(0, 135, 0).
 
 Three changes:
 
@@ -749,6 +750,11 @@ Both ends are fixed:
   falling back to a change of presentation time for senders that get the
   marker wrong. The fallback is a frame late by construction; the marker is
   not.
+- The decoder no longer sets `AV_CODEC_FLAG2_CHUNKS`. That flag describes an
+  input packet ending between picture boundaries, which was the old
+  one-NAL-per-call path. Keeping it after assembling whole access units made
+  libavcodec infer the boundary again and could merge adjacent multi-slice
+  pictures, making playback appear out of order.
 - The last access unit of a stream has nothing after it to close it, so the
   source-closure handler flushes what is buffered. The frame extractor tests
   caught that omission — they script a few NAL units and nothing came out at

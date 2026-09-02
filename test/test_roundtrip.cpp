@@ -34,16 +34,32 @@ using namespace rtsp_image_transport::test;
 namespace
 {
 
-/* Reassembles the Annex B stream the way the RTSP client does: the encoder
-   hands out bare NAL units, the receiving side prefixes each with a start code
-   before feeding the decoder. */
-FrameDataPtr toAnnexB(const FrameDataPtr& nal)
+std::vector<FrameDataPtr> takePackets(StreamEncoder& encoder)
+{
+    std::vector<FrameDataPtr> packets;
+    while (FrameDataPtr packet = encoder.nextPacket())
+        packets.push_back(std::move(packet));
+    return packets;
+}
+
+/* Reassembles one Annex B access unit the way the RTSP path does: the encoder
+   hands out bare NAL units, the server marks the final one, and FrameExtractor
+   joins all NAL units through that marker before feeding the decoder. */
+FrameDataPtr toAnnexB(const std::vector<FrameDataPtr>& nals)
 {
     static const unsigned char start_code[] = {0x00, 0x00, 0x00, 0x01};
-    std::vector<unsigned char> buffer(sizeof(start_code) + nal->length());
-    std::copy_n(start_code, sizeof(start_code), buffer.data());
-    std::copy_n(nal->data(), nal->length(), buffer.data() + sizeof(start_code));
-    return std::make_shared<FrameData>(buffer.data(), buffer.size(), nal->stamp());
+    std::size_t size = nals.size() * sizeof(start_code);
+    for (const FrameDataPtr& nal : nals)
+        size += nal->length();
+
+    std::vector<unsigned char> buffer;
+    buffer.reserve(size);
+    for (const FrameDataPtr& nal : nals)
+    {
+        buffer.insert(buffer.end(), start_code, start_code + sizeof(start_code));
+        buffer.insert(buffer.end(), nal->data(), nal->data() + nal->length());
+    }
+    return std::make_shared<FrameData>(buffer.data(), buffer.size(), nals.front()->stamp());
 }
 
 }  // namespace
@@ -82,13 +98,27 @@ TEST_P(RoundTripTest, EncodedImagesComeBackRecognisable)
     {
         sensor_msgs::msg::Image img = makeTestImage(width, height, i);
         sent.push_back(img);
-        ASSERT_NO_THROW(encoder->encodeVideo(img));
-        while (FrameDataPtr packet = encoder->nextPacket())
+        std::size_t encoded = 0;
+        ASSERT_NO_THROW(encoded = encoder->encodeVideo(img));
+        if (encoded == 0)
+            continue;
+
+        std::vector<FrameDataPtr> packets = takePackets(*encoder);
+        ASSERT_EQ(packets.size(), encoded);
+        if (annex_b)
         {
-            FrameDataPtr input = annex_b ? toAnnexB(packet) : packet;
-            ASSERT_NO_THROW(decoder.decodeVideo(input));
+            ASSERT_NO_THROW(decoder.decodeVideo(toAnnexB(packets)));
             while (sensor_msgs::msg::Image::UniquePtr out = decoder.nextFrame())
                 received.push_back(std::move(out));
+        }
+        else
+        {
+            for (const FrameDataPtr& packet : packets)
+            {
+                ASSERT_NO_THROW(decoder.decodeVideo(packet));
+                while (sensor_msgs::msg::Image::UniquePtr out = decoder.nextFrame())
+                    received.push_back(std::move(out));
+            }
         }
     }
 
@@ -141,13 +171,16 @@ TEST(RoundTrip, GrayscaleInputSurvivesTheTrip)
     for (unsigned i = 0; i < 8; ++i)
     {
         sensor_msgs::msg::Image img = makeTestImage(160, 120, i, sensor_msgs::image_encodings::MONO8);
-        ASSERT_NO_THROW(encoder->encodeVideo(img));
-        while (FrameDataPtr packet = encoder->nextPacket())
-        {
-            ASSERT_NO_THROW(decoder.decodeVideo(toAnnexB(packet)));
-            while (sensor_msgs::msg::Image::UniquePtr out = decoder.nextFrame())
-                received.push_back(std::move(out));
-        }
+        std::size_t encoded = 0;
+        ASSERT_NO_THROW(encoded = encoder->encodeVideo(img));
+        if (encoded == 0)
+            continue;
+
+        std::vector<FrameDataPtr> packets = takePackets(*encoder);
+        ASSERT_EQ(packets.size(), encoded);
+        ASSERT_NO_THROW(decoder.decodeVideo(toAnnexB(packets)));
+        while (sensor_msgs::msg::Image::UniquePtr out = decoder.nextFrame())
+            received.push_back(std::move(out));
     }
     ASSERT_FALSE(received.empty());
     /* Mono input still comes back as BGR8, with the three channels near equal */
