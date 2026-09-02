@@ -288,12 +288,27 @@ the request at ``net.core.rmem_max``, and the log says so when it does::
 
     sysctl -w net.core.rmem_max=4194304
 
+Measured on a 640x480 H.264 stream at 2 Mbit/s with packet loss injected below
+TCP, latency from the sender's stamp to arrival:
+
+===========  ==========  ========  =========  =========
+Packet loss  Transport   p50 [ms]  p90 [ms]   max [ms]
+===========  ==========  ========  =========  =========
+1%           UDP              4.2      38-41    138-141
+1%           TCP              4.5     80-112    253-256
+5%           UDP              5.4        105        140
+5%           TCP            47-75    211-228    423-616
+===========  ==========  ========  =========  =========
+
+UDP's worst case barely moves between 1% and 5% loss; what changes is how much
+it drops (1% and 4.5% of NAL units). TCP delivers every byte at both rates and
+pays entirely in time — at 5% even the median frame is tens of milliseconds
+late, and the tail runs past half a second.
+
 Set ``-p in.rtsp.rtp_over_tcp:=true`` to interleave RTP over the RTSP
 connection instead. That is the right choice when artefacts cost more than
 delay — a link losing enough packets to make the picture unusable, or a
-recording — and for servers that will not serve RTP over UDP at all. It
-removes loss outright, at the price of unbounded latency growth on a link that
-keeps retransmitting.
+recording — and for servers that will not serve RTP over UDP at all.
 
 A lost datagram costs a slice. With ``AV_CODEC_FLAG2_CHUNKS`` set, the decoder
 emits the picture anyway, built from the slices that did arrive; the

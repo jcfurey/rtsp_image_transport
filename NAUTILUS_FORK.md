@@ -593,10 +593,36 @@ than failing. Asking for the pool explicitly (`pools=`) avoids it everywhere.
   missed. Verified as a round trip — synthetic 30 Hz source, the H.264 relay,
   and this receiver — at 29.94 Hz output with 1.1 ms of jitter and no loss.
 
-  What is *not* measured here is the case the change exists for. netem is
-  unavailable in the test kernel, so no lossy link could be simulated; the
-  loopback numbers only establish that UDP costs nothing on a clean one
-  (p50 7.9 ms against 8.0 for TCP at 320x240, with a shorter tail).
+  Measured on a lossy link, which is the case the change exists for. Loss was
+  injected below TCP with netfilter — `iptables -A INPUT -i lo -m statistic
+  --mode random --probability P -j DROP` — so TCP genuinely retransmits and
+  UDP genuinely loses datagrams, rather than either being simulated above the
+  socket. `StreamServer` and `StreamClient` were driven directly, with no ROS
+  graph, so every packet crossing the interface belonged to the stream.
+  640x480 H.264 at 2 Mbit/s, 30 Hz, 20 s per run, latency taken as arrival
+  time minus the sender's presentation stamp; two repetitions each.
+
+  | loss | transport | p50 | p90 | p99 | max | NAL units |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 0% | UDP | 4.3 | 5.6 | 7.2 | 56 | 1879 |
+  | 0% | TCP | 4.3 | 46 | 48 | 48 | 1879 |
+  | 1% | UDP | 4.2-4.3 | 38-41 | 137 | 138-141 | 2498-2505 |
+  | 1% | TCP | 4.5 | 80-112 | 214-216 | 253-256 | 2528 |
+  | 5% | UDP | 5.4 | 105 | 138-139 | 140 | 2413-2418 |
+  | 5% | TCP | 47-75 | 211-228 | 323-483 | 423-616 | 2528 |
+
+  The shape is the point rather than any single number. UDP's worst case is
+  flat at about 140 ms whether the link loses 1% or 5%, and it pays for that
+  by not delivering 1% and 4.5% of NAL units respectively. TCP delivers every
+  byte at both loss rates — 2528 of 2528, always — and the cost lands entirely
+  on time: at 5% even the *median* access unit is 47-75 ms late and the worst
+  runs past half a second. That is head-of-line blocking, and it gets worse
+  with loss while UDP's ceiling does not move.
+
+  These figures understate the TCP penalty. Loopback RTT is effectively zero,
+  so retransmission happens as fast as the stack can manage — fast retransmit,
+  or the 200 ms RTO floor visible in the 1% tail. A real tether with real RTT
+  recovers more slowly than this.
 - `setBitrate()` did not touch `rc_buffer_size`, which kept twice the 1 Mbit/s
   the context was built with. The VBV was 2 Mbit whatever the stream was
   configured for — ten seconds of buffer at 200 kbit/s, and a quarter second
