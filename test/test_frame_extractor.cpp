@@ -104,7 +104,11 @@ private:
             fFrameSize = fMaxSize;
         }
         std::memcpy(fTo, nal.data(), fFrameSize);
-        gettimeofday(&fPresentationTime, nullptr);
+        /* Give every scripted unit a deterministic access-unit timestamp so
+           tests exercise the timestamp-change fallback without depending on
+           scheduler timing or wall-clock resolution. */
+        fPresentationTime.tv_sec = 1700000000;
+        fPresentationTime.tv_usec = static_cast<suseconds_t>(1000 * index_);
         fDurationInMicroseconds = 0;
         /* Counted before handing over, so a test can wait for the whole script
            to have been consumed rather than for a delivery count it would have
@@ -476,4 +480,47 @@ TEST(FrameExtractorH264, PrependsCombinedSpropParameterSets)
     }
     EXPECT_TRUE(startsWith(delivered.front(), expected))
         << "H.264 parameter sets were not taken from sprop-parameter-sets";
+}
+
+TEST(FrameExtractorMpeg4, ClosureDoesNotRemoveBytesFromAnUnframedPicture)
+{
+    /* MPEG-4, VP8/9, AV1 and JPEG are handed over without Annex B start
+       codes. The source-closing fallback used to remove four bytes anyway,
+       truncating the last picture of every markerless stream. */
+    const std::string sdp = "v=0\r\n"
+                            "o=- 1 1 IN IP4 127.0.0.1\r\n"
+                            "s=frame extractor test\r\n"
+                            "t=0 0\r\n"
+                            "m=video 0 RTP/AVP 96\r\n"
+                            "c=IN IP4 0.0.0.0\r\n"
+                            "a=rtpmap:96 MP4V-ES/90000\r\n"
+                            "a=control:track1\r\n";
+    ExtractorHarness harness(sdp);
+    ASSERT_TRUE(harness.usable());
+
+    const std::vector<std::uint8_t> picture{0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0};
+    const auto delivered = harness.run({picture});
+    ASSERT_EQ(delivered.size(), 1u);
+    EXPECT_EQ(delivered.front(), picture);
+}
+
+TEST(FrameExtractorMpeg4, TimestampFallbackPreservesAdjacentUnframedPictures)
+{
+    const std::string sdp = "v=0\r\n"
+                            "o=- 1 1 IN IP4 127.0.0.1\r\n"
+                            "s=frame extractor test\r\n"
+                            "t=0 0\r\n"
+                            "m=video 0 RTP/AVP 96\r\n"
+                            "c=IN IP4 0.0.0.0\r\n"
+                            "a=rtpmap:96 MP4V-ES/90000\r\n"
+                            "a=control:track1\r\n";
+    ExtractorHarness harness(sdp);
+    ASSERT_TRUE(harness.usable());
+
+    const std::vector<std::uint8_t> first{0x10, 0x11, 0x12, 0x13, 0x14, 0x15};
+    const std::vector<std::uint8_t> second{0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26};
+    const auto delivered = harness.run({first, second});
+    ASSERT_EQ(delivered.size(), 2u);
+    EXPECT_EQ(delivered[0], first);
+    EXPECT_EQ(delivered[1], second);
 }

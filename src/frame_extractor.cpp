@@ -45,6 +45,11 @@ const unsigned char MPEG_START_CODE[] = {0x00, 0x00, 0x00, 0x01};
 constexpr std::size_t INITIAL_FRAME_BUFFER_SIZE = 262144;
 constexpr std::size_t MAXIMUM_FRAME_BUFFER_SIZE = 16777216;
 
+std::size_t annexBPrefixSize(VideoCodec codec)
+{
+    return codec == VideoCodec::H264 || codec == VideoCodec::H265 ? sizeof(MPEG_START_CODE) : 0;
+}
+
 }
 
 FrameExtractor* FrameExtractor::createNew(const std::weak_ptr<StreamClient>& stream_client, UsageEnvironment& env,
@@ -118,12 +123,13 @@ VideoCodec FrameExtractor::codec() const
 
 Boolean FrameExtractor::continuePlaying()
 {
-    if (codec_ == VideoCodec::H264 || codec_ == VideoCodec::H265)
+    const std::size_t prefix_size = annexBPrefixSize(codec_);
+    if (prefix_size > 0)
     {
-        if (buffer_.size() - sizeof(MPEG_START_CODE) >= buffer_length_)
+        if (buffer_.size() - prefix_size >= buffer_length_)
         {
-            std::copy_n(MPEG_START_CODE, sizeof(MPEG_START_CODE), buffer_.data() + buffer_length_);
-            buffer_length_ += sizeof(MPEG_START_CODE);
+            std::copy_n(MPEG_START_CODE, prefix_size, buffer_.data() + buffer_length_);
+            buffer_length_ += prefix_size;
         }
     }
     fSource->getNextFrame(buffer_.data() + buffer_length_, buffer_.size() - buffer_length_, newFrameCallback, this,
@@ -138,10 +144,11 @@ void FrameExtractor::flushPending()
     std::shared_ptr<StreamClient> sc = stream_client_.lock();
     if (!sc || buffer_length_ == 0)
         return;
-    /* continuePlaying() leaves a trailing start code waiting for a NAL unit
-       that will now never arrive; it is not part of the picture. */
-    const std::size_t length =
-        buffer_length_ >= sizeof(MPEG_START_CODE) ? buffer_length_ - sizeof(MPEG_START_CODE) : buffer_length_;
+    /* For Annex B codecs continuePlaying() leaves a trailing start code waiting
+       for a NAL unit that will now never arrive; other codecs have no prefix to
+       remove. */
+    const std::size_t prefix_size = annexBPrefixSize(codec_);
+    const std::size_t length = buffer_length_ >= prefix_size ? buffer_length_ - prefix_size : buffer_length_;
     if (length == 0)
         return;
     const rclcpp::Time ts(buffer_time_.tv_sec, 1000ull * buffer_time_.tv_usec);
@@ -197,8 +204,9 @@ void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes
            time says so too, but only once the next picture has started, so it
            arrives a frame late; it is the fallback for a sender whose marker
            bit is wrong — as ours was until it stopped letting live555 guess. */
+        const std::size_t prefix_size = annexBPrefixSize(codec_);
         const std::size_t prefix_length =
-            buffer_length_ >= sizeof(MPEG_START_CODE) ? buffer_length_ - sizeof(MPEG_START_CODE) : buffer_length_;
+            buffer_length_ >= prefix_size ? buffer_length_ - prefix_size : buffer_length_;
         const bool time_changed = have_buffer_time_
                                   && (presentationTime.tv_sec != buffer_time_.tv_sec
                                       || presentationTime.tv_usec != buffer_time_.tv_usec);
@@ -209,7 +217,7 @@ void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes
             const rclcpp::Time ts(buffer_time_.tv_sec, 1000ull * buffer_time_.tv_usec);
             sc->receiveStreamData(codec_, subsession_,
                                   std::make_shared<FrameData>(buffer_.data(), prefix_length, ts));
-            const std::size_t carried = sizeof(MPEG_START_CODE) + frameSize;
+            const std::size_t carried = prefix_size + frameSize;
             std::memmove(buffer_.data(), buffer_.data() + prefix_length, carried);
             buffer_length_ = carried;
         }
@@ -224,7 +232,7 @@ void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes
         const bool marker = rtp && rtp->curPacketMarkerBit();
         /* A buffer with no room for another NAL unit has to go now whatever the
            boundaries say, or the next getNextFrame() has nowhere to write. */
-        const bool buffer_full = buffer_length_ + sizeof(MPEG_START_CODE) >= buffer_.size();
+        const bool buffer_full = buffer_length_ + prefix_size >= buffer_.size();
         if ((marker || buffer_full) && buffer_length_ > 0)
         {
             const rclcpp::Time ts(buffer_time_.tv_sec, 1000ull * buffer_time_.tv_usec);

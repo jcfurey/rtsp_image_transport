@@ -983,4 +983,9 @@ bool StreamDecoder::isHardwareAccelerated() const noexcept
     return hardware_;
 }
 
+bool StreamDecoder::awaitingKeyframe() const noexcept
+{
+    return awaiting_keyframe_;
+}
+
 }  // namespace rtsp_image_transport

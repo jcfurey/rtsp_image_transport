@@ -214,11 +214,13 @@ int main(int argc, char** argv)
                 if (encoder->encodeVideo(img) > 0)
                 {
                     const rclcpp::Time stamp(img.header.stamp);
+                    std::vector<FrameDataPtr> access_unit;
                     while (FrameDataPtr packet = encoder->nextPacket())
                     {
                         packet->setStamp(stamp);
-                        server->sendFrame(packet);
+                        access_unit.push_back(std::move(packet));
                     }
+                    server->sendAccessUnit(access_unit);
                     sent++;
                 }
             }

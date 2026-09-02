@@ -514,9 +514,10 @@ void SubscriberPlugin::setupParameters(
         node_parameters, param_base_name_ + ".decoder_stall_timeout",
         rclcpp::ParameterValue(1e-3 * config_->decoder_stall_timeout.count()),
         ParameterDescriptor()
-            .set__description("flush the decoder when it has been fed for this long [s] without producing an "
-                              "image; packet loss can leave a decoder rejecting every slice while RTP keeps "
-                              "arriving, which the session timeout cannot detect (0 = never flush)")
+            .set__description("after startup key-frame acquisition, flush the decoder when it has been fed for "
+                              "this long [s] without producing an image; packet loss can leave a decoder "
+                              "rejecting every slice while RTP keeps arriving, which the session timeout cannot "
+                              "detect (0 = never flush)")
             .set__floating_point_range(
                 {rcl_interfaces::msg::FloatingPointRange().set__from_value(0).set__to_value(60)}));
     declareParameter(
@@ -708,26 +709,41 @@ void SubscriberPlugin::processFrame()
                 }
             }
             const auto now = std::chrono::steady_clock::now();
-            if (produced || last_image_out_.time_since_epoch().count() == 0)
+            bool stalled = false;
+            std::size_t stall_count = 0;
             {
-                last_image_out_ = now;
+                std::lock_guard<std::mutex> lock{stall_mutex_};
+                /* Let the decoder's bounded startup gate finish before judging
+                   its lack of output as a stall. This is especially important
+                   for a late join to an intra-refresh stream: it has no future
+                   IDR, and repeatedly flushing here would reset the bounded
+                   key-frame fallback before it could ever be reached. */
+                if (produced || decoder->awaitingKeyframe() || last_image_out_.time_since_epoch().count() == 0)
+                {
+                    last_image_out_ = now;
+                }
+                else if (config_->decoder_stall_timeout > 0ms
+                         && now - last_image_out_ > config_->decoder_stall_timeout)
+                {
+                    /* Frames are still arriving — this loop is running on them —
+                       but nothing has come out of the decoder for long enough that
+                       it is not simply between key frames. Lost packets can leave
+                       an H.264 decoder rejecting every subsequent slice, and the
+                       session watchdog cannot see it because the transport is
+                       healthy. Flushing gives up the broken reference chain and
+                       restarts at the next key frame. */
+                    decoder->flush();
+                    last_image_out_ = now;
+                    stall_count = ++decoder_stalls_;
+                    stalled = true;
+                }
             }
-            else if (config_->decoder_stall_timeout > 0ms && now - last_image_out_ > config_->decoder_stall_timeout)
+            if (stalled)
             {
-                /* Frames are still arriving — this loop is running on them —
-                   but nothing has come out of the decoder for long enough that
-                   it is not simply between key frames. Lost packets can leave
-                   an H.264 decoder rejecting every subsequent slice, and the
-                   session watchdog cannot see it because the transport is
-                   healthy. Flushing gives up the broken reference chain and
-                   restarts at the next key frame. */
-                decoder->flush();
-                last_image_out_ = now;
-                ++decoder_stalls_;
                 RCLCPP_WARN(logger_,
                             "[%s] decoder produced no image for %.1f s while still receiving data; "
                             "flushing it and resuming at the next key frame (%zu so far)",
-                            topic_name_.c_str(), 1e-3 * config_->decoder_stall_timeout.count(), decoder_stalls_);
+                            topic_name_.c_str(), 1e-3 * config_->decoder_stall_timeout.count(), stall_count);
             }
         }
     }
@@ -857,10 +873,13 @@ rclcpp::Duration SubscriberPlugin::frameLag() const noexcept
 
 void SubscriberPlugin::clearQueuedFrames()
 {
-    std::lock_guard<std::mutex> lock{queue_mutex_};
-    queue_.clear();
+    {
+        std::lock_guard<std::mutex> lock{queue_mutex_};
+        queue_.clear();
+    }
     /* A new session starts its own stall window; the old one's silence says
        nothing about the decoder that is about to be fed. */
+    std::lock_guard<std::mutex> lock{stall_mutex_};
     last_image_out_ = {};
 }
 

@@ -36,6 +36,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace rtsp_image_transport
 {
@@ -52,7 +53,7 @@ public:
     StreamServer(StreamServer&&) = delete;
     StreamServer& operator=(const StreamServer&) = delete;
     StreamServer& operator=(StreamServer&&) = delete;
-    void sendFrame(const FrameDataPtr& frame) noexcept;
+    void sendAccessUnit(const std::vector<FrameDataPtr>& frames) noexcept;
     bool hasActiveStreams() const noexcept;
     VideoCodec codec() const noexcept;
     unsigned preferredPacketSize() const noexcept;

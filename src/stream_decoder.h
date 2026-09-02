@@ -108,6 +108,9 @@ public:
     /* Human readable description of the decoder in use, e.g. "hevc + CUDA" */
     const std::string& description() const noexcept;
     bool isHardwareAccelerated() const noexcept;
+    /* True while decoded pictures are intentionally withheld because this
+       session has not reached a key frame (or the bounded fallback) yet. */
+    bool awaitingKeyframe() const noexcept;
     void setDecodeFrames(DecodeFrames which) noexcept;
     /* Throws away the decoder's reference frames and starts again at the next
        key frame.

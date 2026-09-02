@@ -136,6 +136,7 @@ TEST(StreamDecoder, FlushRecoversAndResumesAtTheNextKeyFrame)
     options.use_hw_decoder = false;
     options.hw_device = "none";
     StreamDecoder decoder(VideoCodec::H264, options);
+    EXPECT_TRUE(decoder.awaitingKeyframe());
 
     auto feed = [&](std::size_t from, std::size_t to)
     {
@@ -161,8 +162,11 @@ TEST(StreamDecoder, FlushRecoversAndResumesAtTheNextKeyFrame)
 
     const std::size_t half = packets.size() / 2;
     ASSERT_GT(feed(0, half), 0u) << "nothing decoded before the flush";
+    EXPECT_FALSE(decoder.awaitingKeyframe());
     decoder.flush();
+    EXPECT_TRUE(decoder.awaitingKeyframe());
     EXPECT_GT(feed(half, packets.size()), 0u) << "the decoder never recovered after being flushed";
+    EXPECT_FALSE(decoder.awaitingKeyframe());
 }
 
 TEST(StreamDecoder, FlushIsSafeBeforeAnythingHasBeenDecoded)

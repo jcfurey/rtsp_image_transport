@@ -28,6 +28,8 @@
 
 #include <rclcpp/clock.hpp>
 
+#include <vector>
+
 namespace rtsp_image_transport
 {
 
@@ -520,11 +522,13 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
             const rclcpp::Time wall_now = system_clock_->now();
             const std::uint64_t reanchors_before = stream_clock_.reanchorCount();
             const rclcpp::Time presentation = stream_clock_.toWallClock(rclcpp::Time(image.header.stamp), wall_now);
+            std::vector<FrameDataPtr> access_unit;
             while (FrameDataPtr data = encoder_->nextPacket())
             {
                 data->setStamp(presentation);
-                server_->sendFrame(data);
+                access_unit.push_back(std::move(data));
             }
+            server_->sendAccessUnit(access_unit);
             if (stream_clock_.reanchorCount() != reanchors_before)
                 RCLCPP_INFO(logger_, "[%s] image time stamps jumped, re-anchoring the RTP timeline",
                             topic_name_.c_str());

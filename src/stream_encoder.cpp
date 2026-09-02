@@ -67,20 +67,27 @@ std::int64_t vbvBufferSize(std::int64_t bit_rate)
     return std::max<std::int64_t>(bit_rate / 4, 16384);
 }
 
-void set_codec_option(std::shared_ptr<AVCodecContext> ctx, const std::string& option, const std::string& value,
+bool set_codec_option(std::shared_ptr<AVCodecContext> ctx, const std::string& option, const std::string& value,
                       bool silent = false, const rclcpp::Logger& logger = rclcpp::get_logger("ffmpeg"))
 {
     int result = av_opt_set(ctx->priv_data, option.c_str(), value.c_str(), 0);
     if (result != 0 && !silent)
         RCLCPP_WARN(logger, "[%s] cannot set codec option %s=\"%s\"", ctx->codec->name, option.c_str(), value.c_str());
+    return result == 0;
 }
 
-void set_codec_option(std::shared_ptr<AVCodecContext> ctx, const std::string& option, int value, bool silent = false,
+bool set_codec_option(std::shared_ptr<AVCodecContext> ctx, const std::string& option, int value, bool silent = false,
                       const rclcpp::Logger& logger = rclcpp::get_logger("ffmpeg"))
 {
     int result = av_opt_set_int(ctx->priv_data, option.c_str(), value, 0);
     if (result != 0 && !silent)
         RCLCPP_WARN(logger, "[%s] cannot set codec option %s=%d", ctx->codec->name, option.c_str(), value);
+    return result == 0;
+}
+
+bool has_codec_option(const std::shared_ptr<AVCodecContext>& ctx, const char* option)
+{
+    return ctx && ctx->priv_data && av_opt_find(ctx->priv_data, option, nullptr, 0, 0) != nullptr;
 }
 
 void free_context(AVCodecContext* ctx)
@@ -421,26 +428,42 @@ bool StreamEncoder::setIntraRefresh(bool enable)
     if (!enable)
         return true;
     const char* name = ctx_->codec ? ctx_->codec->name : "";
-    /* Only ask encoders that have the option; av_opt_set on one that does not
-       would report a failure that says nothing useful. */
-    const bool supported = strstr(name, "x264") || strstr(name, "nvenc") || strstr(name, "vaapi")
-                           || strstr(name, "qsv");
-    if (!supported)
+    bool applied = false;
+
+    /* Most encoders, including x264 and NVENC, expose the common spelling.
+       x265 accepts it through its parameter dictionary, while QSV exposes the
+       native oneVPL controls instead. Probe the actual AVOptions rather than
+       inferring support from the encoder name: VAAPI, for example, has no
+       intra-refresh control in current FFmpeg builds. */
+    if (strstr(name, "x265") && has_codec_option(ctx_, "x265-params"))
     {
-        RCLCPP_WARN(logger_, "[%s] has no intra refresh; keeping periodic key frames", name);
+        applied = set_codec_option(ctx_, "x265-params", "intra-refresh=1:ref=1", false, logger_);
+    }
+    else if (strstr(name, "qsv") && has_codec_option(ctx_, "int_ref_type")
+             && has_codec_option(ctx_, "int_ref_cycle_size"))
+    {
+        /* Set the inert cycle length first, so a surprising failure in the
+           type control cannot leave a half-enabled refresh behind. */
+        applied = set_codec_option(ctx_, "int_ref_cycle_size", std::max(1, ctx_->gop_size), false, logger_)
+                  && set_codec_option(ctx_, "int_ref_type", 1, false, logger_);
+    }
+    else if (has_codec_option(ctx_, "intra-refresh"))
+    {
+        applied = set_codec_option(ctx_, "intra-refresh", 1, false, logger_);
+    }
+    if (!applied)
+    {
+        RCLCPP_WARN(logger_, "[%s] has no usable intra refresh; keeping periodic key frames", name);
         return false;
     }
+
     /* x264 refuses intra refresh with more than one reference frame, and says
        so only as a log line while carrying on without it — so the setting
        looks applied and is not. One reference is the right answer here anyway:
        a rolling refresh only guarantees recovery if nothing reaches back
        further than the sweep. */
     ctx_->refs = 1;
-    /* x265 spells it inside x265-params rather than as its own option */
-    if (strstr(name, "x265"))
-        set_codec_option(ctx_, "x265-params", "intra-refresh=1:ref=1", false, logger_);
-    else
-        set_codec_option(ctx_, "intra-refresh", 1, false, logger_);
+    ctx_->max_b_frames = 0;
     /* A closed GOP is a statement about boundaries between groups, and a
        rolling refresh has none. */
     ctx_->flags &= ~AV_CODEC_FLAG_CLOSED_GOP;

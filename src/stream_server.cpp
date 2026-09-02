@@ -113,8 +113,8 @@ VideoRTPSink* createVideoRTPSink(VideoCodec codec, UsageEnvironment& env, Groups
    frame — a receiver following RFC 6184 is then told the picture ends 25 times
    per picture, and has no way to find the real boundaries.
 
-   The injector knows the answer without guessing, because all the NAL units of
-   a picture carry that picture's stamp. */
+   The injector knows the answer without guessing, because the publisher hands
+   it each complete access unit atomically. */
 template<class Framer>
 class AccessUnitFramer : public Framer
 {
@@ -134,9 +134,10 @@ protected:
     {
         if (!injector_)
             return Framer::nalUnitEndsAccessUnit(nal_unit_type);
-        /* Parameter sets and other non-VCL units never end a picture, whatever
-           follows them; beyond that the queue decides. */
-        return Framer::nalUnitEndsAccessUnit(nal_unit_type) && injector_->lastDeliveryEndedAccessUnit();
+        /* The producer supplied the boundary explicitly. Do not filter it
+           through the base class's VCL-only guess: suffix SEI and other
+           non-VCL units are allowed to be the last NAL unit of an access unit. */
+        return injector_->lastDeliveryEndedAccessUnit();
     }
 
 private:
@@ -473,12 +474,14 @@ bool StreamServer::hasActiveStreams() const noexcept
     return !streams_.empty();
 }
 
-void StreamServer::sendFrame(const FrameDataPtr& frame) noexcept
+void StreamServer::sendAccessUnit(const std::vector<FrameDataPtr>& frames) noexcept
 {
+    if (frames.empty())
+        return;
     std::lock_guard<std::mutex> lock{streams_mutex_};
     for (auto& stream : streams_)
     {
-        stream.second->injectFrame(frame);
+        stream.second->injectAccessUnit(frames);
     }
 }
 
