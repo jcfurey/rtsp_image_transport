@@ -353,11 +353,12 @@ connection instead. That is the right choice when artefacts cost more than
 delay — a link losing enough packets to make the picture unusable, or a
 recording — and for servers that will not serve RTP over UDP at all.
 
-A lost datagram costs a slice. With ``AV_CODEC_FLAG2_CHUNKS`` set, the decoder
-emits the picture anyway, built from the slices that did arrive; the
-macroblocks the missing slice covered are never written. An all-zero YUV block
-converts to BGR (0, 135, 0), so undamaged-looking loss would show up as flat
-green bands across part of the image — see below for what is done about that.
+A lost datagram costs a slice. The subscriber still closes the access unit at
+the RTP marker, and the decoder emits the damaged picture from the slices that
+did arrive; the macroblocks the missing slice covered are never written. An
+all-zero YUV block converts to BGR (0, 135, 0), so undamaged-looking loss would
+show up as flat green bands across part of the image — see below for what is
+done about that.
 
 What happens to residual loss depends on the codec, because libavcodec's error
 concealment only covers some of them. For H.264, MPEG-2, MPEG-4 and H.263 the
@@ -399,6 +400,11 @@ subscriber assembles whole access units before decoding — so the decoder is
 handed one picture per packet and never has to infer a boundary. On a 640x480
 H.264 stream that also halved p50 latency, from 11.2 ms to 5.8 ms, because a
 picture arrives in one delivery rather than four to fifteen.
+
+The decoder therefore does not set ``AV_CODEC_FLAG2_CHUNKS``. That flag means
+an input packet may end between picture boundaries; retaining it after the
+access-unit change made libavcodec infer boundaries again and could merge
+adjacent multi-slice pictures, making them appear out of order.
 
 Above roughly 1% packet loss H.264 still degrades badly, and that part is not
 a defect: a damaged picture corrupts every frame referencing it until the next
