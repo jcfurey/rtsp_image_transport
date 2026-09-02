@@ -171,6 +171,11 @@ struct RTSP_IMAGE_TRANSPORT_NO_EXPORT SubscriberPlugin::Config
        up: the queue settles at the rung that matches the shortfall, so the
        number is a latency budget, not a failure threshold. */
     std::chrono::milliseconds max_latency = 200ms;
+    /* How long the decoder may be fed without producing a picture before it is
+       flushed and restarted at the next key frame. See StreamDecoder::flush().
+       Comfortably longer than a key frame interval, so an ordinary GOP is
+       never mistaken for a stall. */
+    std::chrono::milliseconds decoder_stall_timeout = 2s;
 };
 
 using SuperClass = image_transport::SimpleSubscriberPlugin<std_msgs::msg::String>;
@@ -506,6 +511,15 @@ void SubscriberPlugin::setupParameters(
             .set__floating_point_range(
                 {rcl_interfaces::msg::FloatingPointRange().set__from_value(0).set__to_value(10)}));
     declareParameter(
+        node_parameters, param_base_name_ + ".decoder_stall_timeout",
+        rclcpp::ParameterValue(1e-3 * config_->decoder_stall_timeout.count()),
+        ParameterDescriptor()
+            .set__description("flush the decoder when it has been fed for this long [s] without producing an "
+                              "image; packet loss can leave a decoder rejecting every slice while RTP keeps "
+                              "arriving, which the session timeout cannot detect (0 = never flush)")
+            .set__floating_point_range(
+                {rcl_interfaces::msg::FloatingPointRange().set__from_value(0).set__to_value(60)}));
+    declareParameter(
         node_parameters, param_base_name_ + ".reconnect_policy",
         rclcpp::ParameterValue(static_cast<int>(config_->reconnect_policy)),
         ParameterDescriptor()
@@ -561,6 +575,8 @@ void SubscriberPlugin::updateParameters()
         static_cast<int>(np->get_parameter(param_base_name_ + ".sws_threads").as_int());
     new_config.max_latency = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
         1000 * np->get_parameter(param_base_name_ + ".max_latency").as_double()));
+    new_config.decoder_stall_timeout = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
+        1000 * np->get_parameter(param_base_name_ + ".decoder_stall_timeout").as_double()));
     new_config.reconnect_policy =
         static_cast<ReconnectPolicy>(np->get_parameter(param_base_name_ + ".reconnect_policy").as_int());
     new_config.timeout = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
@@ -680,14 +696,38 @@ void SubscriberPlugin::processFrame()
                 if (lag == 0s)
                     old_lag_ = 0s;
             }
+            bool produced = false;
             if (decoder->decodeVideo(frame) > 0)
             {
                 while (sensor_msgs::msg::Image::UniquePtr decoded = decoder->nextFrame())
                 {
                     decoded->header.frame_id = config_->frame_id;
                     sensor_msgs::msg::Image::ConstSharedPtr img(std::move(decoded));
+                    produced = true;
                     callback_(img);
                 }
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (produced || last_image_out_.time_since_epoch().count() == 0)
+            {
+                last_image_out_ = now;
+            }
+            else if (config_->decoder_stall_timeout > 0ms && now - last_image_out_ > config_->decoder_stall_timeout)
+            {
+                /* Frames are still arriving — this loop is running on them —
+                   but nothing has come out of the decoder for long enough that
+                   it is not simply between key frames. Lost packets can leave
+                   an H.264 decoder rejecting every subsequent slice, and the
+                   session watchdog cannot see it because the transport is
+                   healthy. Flushing gives up the broken reference chain and
+                   restarts at the next key frame. */
+                decoder->flush();
+                last_image_out_ = now;
+                ++decoder_stalls_;
+                RCLCPP_WARN(logger_,
+                            "[%s] decoder produced no image for %.1f s while still receiving data; "
+                            "flushing it and resuming at the next key frame (%zu so far)",
+                            topic_name_.c_str(), 1e-3 * config_->decoder_stall_timeout.count(), decoder_stalls_);
             }
         }
     }
@@ -819,6 +859,9 @@ void SubscriberPlugin::clearQueuedFrames()
 {
     std::lock_guard<std::mutex> lock{queue_mutex_};
     queue_.clear();
+    /* A new session starts its own stall window; the old one's silence says
+       nothing about the decoder that is about to be fed. */
+    last_image_out_ = {};
 }
 
 }  // namespace rtsp_image_transport

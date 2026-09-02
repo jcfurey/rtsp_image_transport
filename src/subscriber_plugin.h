@@ -108,6 +108,13 @@ private:
     Callback callback_;
     std::shared_ptr<StreamClient> client_;
     std::shared_ptr<StreamDecoder> decoder_;
+    /* Watchdog for a decoder that is being fed but produces nothing. The
+       session timeout cannot see this: it watches for RTP arriving, and here
+       RTP arrives normally while the decoder rejects every slice. Wall clock
+       deliberately, like the reconnect timers: a stalled decoder is a real
+       time problem whether or not a simulation is paused. */
+    std::chrono::steady_clock::time_point last_image_out_{};
+    std::size_t decoder_stalls_ = 0;
 
     mutable std::mutex queue_mutex_;
     std::deque<FrameDataPtr> queue_;
