@@ -94,8 +94,10 @@ private:
                 {
                     if (encoder_->encodeVideo(img) > 0)
                     {
+                        std::vector<FrameDataPtr> access_unit;
                         while (FrameDataPtr packet = encoder_->nextPacket())
-                            server_->sendFrame(packet);
+                            access_unit.push_back(std::move(packet));
+                        server_->sendAccessUnit(access_unit);
                         frames_pushed_++;
                     }
                 }

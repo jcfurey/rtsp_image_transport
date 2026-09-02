@@ -79,15 +79,18 @@ link loses packets and has headroom to spare::
    With no periodic key frame, a client joining a stream that is *already
    running* has nothing to start from and must wait out a full sweep before
    its picture is complete. Encoding begins when the first client connects, so
-   that client still gets a key frame and is unaffected. The untested case is a
-   **second simultaneous viewer**, or any **multicast** receiver.
+   that client still gets a key frame and is unaffected. A decoder-level late
+   join after the initial IDR is covered by the regression suite; the untested
+   end-to-end case is a **second simultaneous RTSP viewer**, or any
+   **multicast** receiver.
 
-   This was reasoned from how the encoder behaves, not measured — every
-   intra-refresh measurement above used a single viewer. Verify it yourself
-   before relying on ``intra_refresh`` with more than one viewer at a time. Both request a
-hardware encoder and transparently fall back to software when the machine has
-no usable one. On NVIDIA hardware the selected encoder is logged as
-``h264_nvenc`` or ``hevc_nvenc``.
+   The loss measurements above still used a single viewer. Verify the actual
+   server and network path before relying on ``intra_refresh`` with more than
+   one viewer at a time.
+
+Both examples request a hardware encoder and transparently fall back to
+software when the machine has no usable one. On NVIDIA hardware the selected
+encoder is logged as ``h264_nvenc`` or ``hevc_nvenc``.
 
 The output ROS topic carries the URL, not the video. Read it once, then hand
 the value to ffplay, VLC, GStreamer, or another RTSP client::
@@ -384,9 +387,10 @@ libavcodec reports ``decode_slice_header error`` and no picture comes out — an
 it does not reliably recover on its own. The session timeout cannot see this,
 because RTP is still arriving normally; only the pictures have stopped.
 
-``decoder_stall_timeout`` (float, default ``2.0`` s) is the watchdog for it: if
-the decoder has been fed for that long without producing an image, it is
-flushed and resumes at the next key frame. Set it to ``0`` to disable.
+``decoder_stall_timeout`` (float, default ``2.0`` s) is the watchdog for it.
+After the decoder's bounded startup key-frame wait has finished, being fed for
+that long without producing an image makes it flush and resume at the next key
+frame. Set it to ``0`` to disable.
 
 The underlying cause was that the decoder had to guess where pictures began.
 Both ends now mark access units properly — the server sets the RTP marker bit

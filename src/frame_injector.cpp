@@ -48,38 +48,44 @@ void FrameInjector::shutdown()
     std::lock_guard<std::mutex> lock{frame_queue_mutex_};
     is_shutdown_ = true;
     frame_queue_.clear();
+    queued_nals_ = 0;
 }
 
-void FrameInjector::injectFrame(const FrameDataPtr& frame)
+void FrameInjector::injectAccessUnit(const std::vector<FrameDataPtr>& frames)
 {
+    if (frames.empty())
+        return;
     std::lock_guard<std::mutex> lock{frame_queue_mutex_};
     if (is_shutdown_)
         return;
-    frame_queue_.push_back(frame);
+    frame_queue_.push_back(AccessUnit{frames});
+    queued_nals_ += frames.size();
     trimQueue();
     envir().taskScheduler().triggerEvent(deliver_frame_trigger_, this);
 }
 
-/* All the NAL units of one picture carry that picture's stamp, so dropping
-   every unit that shares the front stamp drops a whole access unit. Anything
-   less would hand Live555 half a picture. */
+/* Drop only access units that Live555 has not started delivering. If the front
+   unit is in progress, preserve it and discard complete units behind it; the
+   newest unit is retained so the client catches up as soon as the active one
+   finishes. */
 void FrameInjector::trimQueue()
 {
-    while (frame_queue_.size() > MAX_QUEUE_LENGTH
-           || (frame_queue_.size() > 1
-               && (frame_queue_.back()->stamp() - frame_queue_.front()->stamp()).nanoseconds()
-                      > MAX_QUEUE_SPAN_NS))
+    while (frame_queue_.size() > 1)
     {
-        const rclcpp::Time oldest = frame_queue_.front()->stamp();
-        do
-        {
-            frame_queue_.pop_front();
-            ++dropped_;
-        } while (!frame_queue_.empty() && frame_queue_.front()->stamp() == oldest);
-        /* A single access unit larger than the whole budget would otherwise
-           spin here with nothing left to drop. */
-        if (frame_queue_.size() <= 1)
+        const std::size_t first_droppable = frame_queue_.front().next == 0 ? 0 : 1;
+        if (first_droppable >= frame_queue_.size() - 1)
             break;
+        const bool too_many = queued_nals_ > MAX_QUEUE_LENGTH;
+        const bool too_old =
+            (frame_queue_.back().stamp() - frame_queue_[first_droppable].stamp()).nanoseconds()
+            > MAX_QUEUE_SPAN_NS;
+        if (!too_many && !too_old)
+            break;
+
+        const std::size_t count = frame_queue_[first_droppable].remaining();
+        queued_nals_ -= count;
+        dropped_ += count;
+        frame_queue_.erase(frame_queue_.begin() + static_cast<std::ptrdiff_t>(first_droppable));
     }
 }
 
@@ -89,11 +95,8 @@ std::size_t FrameInjector::droppedFrames() const
     return dropped_;
 }
 
-/* Deliberately unlocked. deliverFrame() sets this while holding the queue
-   mutex and then calls FramedSource::afterGetting(), from which live555 asks
-   the framer whether the NAL unit ended an access unit — so this runs inside
-   that same call, on the same thread, with the mutex still held. Taking it
-   again would deadlock on the first frame. */
+/* Written and read on the Live555 loop thread: afterGetting() asks the framer
+   for this value synchronously after deliverFrame() sets it. */
 bool FrameInjector::lastDeliveryEndedAccessUnit() const noexcept
 {
     return last_ended_access_unit_;
@@ -115,15 +118,18 @@ void FrameInjector::deliverFrame()
 {
     if (!isCurrentlyAwaitingData())
         return;
-    std::lock_guard<std::mutex> lock{frame_queue_mutex_};
-    if (frame_queue_.empty())
-        return;
-    FrameDataPtr frame = frame_queue_.front();
-    frame_queue_.pop_front();
-    /* The picture is finished when nothing behind it shares its stamp. An
-       empty queue counts as finished: the publisher enqueues a whole picture
-       in one go, so having drained it means the last slice has gone. */
-    last_ended_access_unit_ = frame_queue_.empty() || frame_queue_.front()->stamp() != frame->stamp();
+    FrameDataPtr frame;
+    {
+        std::lock_guard<std::mutex> lock{frame_queue_mutex_};
+        if (frame_queue_.empty())
+            return;
+        AccessUnit& access_unit = frame_queue_.front();
+        frame = access_unit.frames[access_unit.next++];
+        --queued_nals_;
+        last_ended_access_unit_ = access_unit.next == access_unit.frames.size();
+        if (last_ended_access_unit_)
+            frame_queue_.pop_front();
+    }
     if (frame->length() <= fMaxSize)
     {
         fFrameSize = frame->length();

@@ -662,7 +662,9 @@ extradata parsed from the SDP, which is every parameter set a camera that
 never repeats them in band will ever send — precisely the camera this fork
 exists for. The subscriber drives it from a new `decoder_stall_timeout`
 parameter (default 2 s, 0 disables): fed for that long with no picture out,
-flush and resume at the next key frame.
+flush and resume at the next key frame. The watchdog starts after the decoder's
+bounded startup key-frame wait; flushing during that wait would keep a late
+join to an intra-refresh stream from ever reaching its fallback.
 
 Measured through the real plugin stack, frames delivered over a 13 s run:
 
@@ -741,8 +743,8 @@ Both ends are fixed:
 
 - `AccessUnitFramer` subclasses the discrete framer and answers
   `nalUnitEndsAccessUnit()` from the injector rather than by guessing. The
-  injector needs no guess: every NAL unit of a picture carries that picture's
-  stamp, so the next one queued either shares it or begins the next picture.
+  publisher enqueues each picture's NAL units as one atomic access unit, so the
+  injector knows its final NAL even when its consumer runs concurrently.
 - `FrameExtractor` assembles access units, closing one on the marker bit and
   falling back to a change of presentation time for senders that get the
   marker wrong. The fallback is a frame late by construction; the marker is
@@ -752,8 +754,10 @@ Both ends are fixed:
   caught that omission — they script a few NAL units and nothing came out at
   all.
 
-This is worth carrying upstream: the malformed marker bit affects every client
-of this publisher, not just this one.
+This belongs upstream in `rtsp_image_transport`, not in live555. Live555
+already documents this multi-slice limitation and supplies the virtual hook
+for a source that knows its access-unit boundaries; the transport publisher is
+the layer that has that knowledge and must override the default guess.
 
 On a clean link, reproducibly: deliveries went from 3239 to 600 for 600
 frames, exactly one access unit each; delivery stays at 100%; and p50 latency
@@ -839,17 +843,19 @@ a bandwidth-limited link more bits mean more lost packets, which is the
 problem it exists to solve. Turn it on when the link loses packets and has
 headroom.
 
-There is a second cost, and unlike everything else in this section it is
-**reasoned rather than measured**. With no periodic key frame, a client
-joining a stream that is already running has nothing to start from and must
-wait out a full sweep before its picture is complete. Encoding begins when the
-first client connects, so that client still receives a key frame and is
-unaffected — which is precisely why every measurement above missed this: they
-all used a single viewer. The untested cases are a second simultaneous viewer
-and any multicast receiver. Both are worth checking before intra refresh is
-relied on for a deployment that has more than one person watching, and the
-check is cheap: connect a second `StreamClient` to a running session and time
-how long its first complete picture takes.
+There is a second cost. With no periodic key frame, a client joining a stream
+that is already running has nothing to start from and must wait out a full
+sweep before its picture is complete. Encoding begins when the first client
+connects, so that client still receives a key frame and is unaffected — which
+is precisely why every loss measurement above missed this: they all used a
+single viewer. A decoder-level regression now joins after the initial IDR and
+verifies eventual image output, including the bounded no-key-frame fallback.
+The still-unmeasured cases are a second simultaneous RTSP viewer and any
+multicast receiver. Both are worth checking before intra refresh is relied on
+for a deployment that has more than one person watching: connect a second
+`StreamClient` to a running session and time how long its first complete
+picture takes.
+
 - `setBitrate()` did not touch `rc_buffer_size`, which kept twice the 1 Mbit/s
   the context was built with. The VBV was 2 Mbit whatever the stream was
   configured for — ten seconds of buffer at 200 kbit/s, and a quarter second

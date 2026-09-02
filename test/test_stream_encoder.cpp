@@ -19,6 +19,7 @@
  ****************************************************************************/
 #include "stream_encoder.h"
 
+#include "stream_decoder.h"
 #include "streaming_error.h"
 #include "test_helpers.h"
 
@@ -26,6 +27,8 @@
 
 #include <sensor_msgs/image_encodings.hpp>
 
+#include <cstring>
+#include <iterator>
 #include <vector>
 
 using namespace rtsp_image_transport;
@@ -310,8 +313,10 @@ TEST(StreamEncoder, IntraRefreshIsLockedOnceEncodingStarted)
 
 TEST(StreamEncoder, IntraRefreshStreamStillDecodes)
 {
-    /* A rolling refresh has no key frame after the first, so a decoder that
-       waits for one has to be able to start from what it is given. */
+    /* Join after the only IDR. The subscriber deliberately withholds startup
+       pictures while waiting for a key frame, but its bounded fallback must
+       eventually let a rolling-refresh stream through. This used to claim to
+       test decoding while only counting encoder packets. */
     auto encoder = makeEncoder();
     if (!encoder)
         GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
@@ -319,10 +324,70 @@ TEST(StreamEncoder, IntraRefreshStreamStillDecodes)
     encoder->setFramerate(30);
     if (!encoder->setIntraRefresh(true))
         GTEST_SKIP() << "this encoder has no intra refresh";
-    std::vector<FrameDataPtr> packets;
-    encodeClip(*encoder, 320, 240, 60, &packets);
-    ASSERT_FALSE(packets.empty());
-    EXPECT_GT(packets.size(), 30u) << "intra refresh produced far too little output";
+
+    StreamDecoder::Options options;
+    options.use_hw_decoder = false;
+    options.hw_device = "none";
+    StreamDecoder decoder(VideoCodec::H264, options);
+    std::vector<std::uint8_t> parameter_sets;
+    std::size_t images = 0;
+    constexpr unsigned JOIN_AT = 10;
+    /* Allow one partial sweep to be discarded before FFmpeg begins emitting
+       pictures, plus the decoder's 120-picture key-frame safety bound. */
+    constexpr unsigned FRAMES = 300;
+    const std::uint8_t start_code[] = {0, 0, 0, 1};
+
+    for (unsigned i = 0; i < FRAMES; ++i)
+    {
+        encoder->encodeVideo(makeTestImage(160, 120, i));
+        std::vector<std::uint8_t> access_unit;
+        while (FrameDataPtr packet = encoder->nextPacket())
+        {
+            const std::uint8_t type = packet->length() > 0 ? packet->data()[0] & 0x1f : 0;
+            if (i == 0 && (type == 7 || type == 8))
+            {
+                parameter_sets.insert(parameter_sets.end(), std::begin(start_code), std::end(start_code));
+                parameter_sets.insert(parameter_sets.end(), packet->data(), packet->data() + packet->length());
+            }
+            if (i >= JOIN_AT)
+            {
+                access_unit.insert(access_unit.end(), std::begin(start_code), std::end(start_code));
+                access_unit.insert(access_unit.end(), packet->data(), packet->data() + packet->length());
+            }
+        }
+        if (i < JOIN_AT || access_unit.empty())
+            continue;
+        if (i == JOIN_AT)
+            access_unit.insert(access_unit.begin(), parameter_sets.begin(), parameter_sets.end());
+        try
+        {
+            decoder.decodeVideo(std::make_shared<FrameData>(
+                access_unit.data(), access_unit.size(), rclcpp::Time(BASE_STAMP_NS + i * FRAME_INTERVAL_NS)));
+        }
+        catch (const DecodingError&)
+        {
+            /* Missing pre-join references are expected until the refresh sweep
+               has replaced them. */
+        }
+        while (decoder.nextFrame())
+            ++images;
+    }
+
+    ASSERT_FALSE(parameter_sets.empty()) << "the initial access unit carried no SPS/PPS";
+    EXPECT_GT(images, 0u) << "a late decoder never recovered from the intra-refresh sweep";
+    EXPECT_FALSE(decoder.awaitingKeyframe());
+}
+
+TEST(StreamEncoder, X265IntraRefreshUsesItsParameterDictionary)
+{
+    auto encoder = makeEncoder(VideoCodec::H265);
+    if (!encoder)
+        GTEST_SKIP() << "no H.265 encoder in this FFmpeg build";
+    if (!strstr(encoder->context()->codec->name, "x265"))
+        GTEST_SKIP() << "the selected software H.265 encoder is not x265";
+
+    EXPECT_TRUE(encoder->setIntraRefresh(true));
+    EXPECT_GT(encodeClip(*encoder, 160, 120, 5), 0u);
 }
 
 TEST(StreamEncoder, ReportsUnsupportedCodec)

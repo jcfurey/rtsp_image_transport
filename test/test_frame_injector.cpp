@@ -22,7 +22,9 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <memory>
+#include <utility>
 #include <vector>
 
 using namespace rtsp_image_transport;
@@ -57,11 +59,39 @@ protected:
     void injectPicture(std::int64_t stamp_ns, std::size_t nal_units = 1, std::size_t bytes = 64)
     {
         std::vector<unsigned char> payload(bytes, 0x42);
+        std::vector<FrameDataPtr> access_unit;
+        access_unit.reserve(nal_units);
         for (std::size_t i = 0; i < nal_units; ++i)
         {
-            injector_->injectFrame(
+            access_unit.push_back(
                 std::make_shared<FrameData>(payload.data(), payload.size(), rclcpp::Time(stamp_ns)));
         }
+        injector_->injectAccessUnit(access_unit);
+    }
+
+    std::pair<bool, bool> pullOne()
+    {
+        struct Result
+        {
+            FrameInjector* injector;
+            bool delivered = false;
+            bool ended_access_unit = false;
+        } result{injector_};
+        std::array<unsigned char, 256> buffer{};
+        loop_->post(
+            [&]
+            {
+                injector_->getNextFrame(
+                    buffer.data(), static_cast<unsigned>(buffer.size()),
+                    [](void* opaque, unsigned, unsigned, struct timeval, unsigned)
+                    {
+                        Result& r = *static_cast<Result*>(opaque);
+                        r.delivered = true;
+                        r.ended_access_unit = r.injector->lastDeliveryEndedAccessUnit();
+                    },
+                    &result, nullptr, nullptr);
+            });
+        return {result.delivered, result.ended_access_unit};
     }
 
     std::shared_ptr<EventLoop> loop_;
@@ -106,6 +136,28 @@ TEST_F(FrameInjectorTest, DropsWholeAccessUnitsRatherThanPartOfAPicture)
     ASSERT_GT(dropped, 0u);
     EXPECT_EQ(dropped % NALS_PER_PICTURE, 0u)
         << "dropped " << dropped << " NAL units, which is not a whole number of pictures";
+}
+
+TEST_F(FrameInjectorTest, FinishesAnAccessUnitAlreadyBeingDeliveredBeforeDroppingBacklog)
+{
+    injectPicture(BASE_NS, 3);
+    const auto first = pullOne();
+    ASSERT_TRUE(first.first);
+    EXPECT_FALSE(first.second);
+
+    /* Make the client far enough behind to trim while two NAL units of the
+       front picture have not yet been delivered. Those two must survive; only
+       complete access units behind the active one may be discarded. */
+    for (int i = 1; i < 120; ++i)
+        injectPicture(BASE_NS + i * static_cast<std::int64_t>(FRAME_NS));
+    ASSERT_GT(injector_->droppedFrames(), 0u);
+
+    const auto second = pullOne();
+    const auto third = pullOne();
+    ASSERT_TRUE(second.first);
+    ASSERT_TRUE(third.first);
+    EXPECT_FALSE(second.second);
+    EXPECT_TRUE(third.second);
 }
 
 TEST_F(FrameInjectorTest, BoundsTheQueueEvenWhenStampsNeverAdvance)

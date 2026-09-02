@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <vector>
 
 namespace rtsp_image_transport
 {
@@ -59,7 +60,10 @@ public:
     static FrameInjector* createNew(UsageEnvironment& env);
     ~FrameInjector();
     void shutdown();
-    void injectFrame(const FrameDataPtr& frame);
+    /* Enqueues one complete encoded picture atomically. Keeping this boundary
+       explicit is what lets the Live555 thread set the RTP marker bit without
+       racing the producer between two NAL units. */
+    void injectAccessUnit(const std::vector<FrameDataPtr>& frames);
     /* How many NAL units have been dropped to keep the queue inside its
        bounds, for the publisher to report */
     std::size_t droppedFrames() const;
@@ -71,12 +75,26 @@ public:
      * slices as slice-max-size makes. The guess decides the RTP marker bit, so
      * getting it wrong tells every receiver that each slice is a whole frame.
      *
-     * Here it needs no guessing: all the NAL units of one picture carry that
-     * picture's stamp, so the next one queued either shares the stamp or
-     * begins the next picture. */
+     * Here it needs no guessing: the producer enqueues a complete picture in
+     * one operation, and the injector records which NAL unit is its last. */
     bool lastDeliveryEndedAccessUnit() const noexcept;
 
 private:
+    struct AccessUnit
+    {
+        std::vector<FrameDataPtr> frames;
+        std::size_t next = 0;
+
+        std::size_t remaining() const noexcept
+        {
+            return frames.size() - next;
+        }
+        const rclcpp::Time& stamp() const noexcept
+        {
+            return frames.front()->stamp();
+        }
+    };
+
     FrameInjector(UsageEnvironment& env);
     void deliverFrame();
     void doGetNextFrame() override;
@@ -88,7 +106,8 @@ private:
     bool is_shutdown_;
     EventTriggerId deliver_frame_trigger_;
     mutable std::mutex frame_queue_mutex_;
-    std::deque<FrameDataPtr> frame_queue_;
+    std::deque<AccessUnit> frame_queue_;
+    std::size_t queued_nals_ = 0;
     std::size_t dropped_ = 0;
     /* Whether the most recent deliverFrame() emptied its access unit. Written
        on the Live555 thread in deliverFrame and read from the framer's

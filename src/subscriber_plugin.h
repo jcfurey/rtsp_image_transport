@@ -113,6 +113,7 @@ private:
        RTP arrives normally while the decoder rejects every slice. Wall clock
        deliberately, like the reconnect timers: a stalled decoder is a real
        time problem whether or not a simulation is paused. */
+    mutable std::mutex stall_mutex_;
     std::chrono::steady_clock::time_point last_image_out_{};
     std::size_t decoder_stalls_ = 0;
 
