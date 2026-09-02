@@ -837,11 +837,19 @@ It is **off by default**, for one reason: it costs bitrate for the same
 quality — 100 kB against 156 kB over 120 frames of the synthetic clip — and on
 a bandwidth-limited link more bits mean more lost packets, which is the
 problem it exists to solve. Turn it on when the link loses packets and has
-headroom. There is a second cost: with no periodic key frame, a client joining
-an established stream has nothing to start from and waits out a sweep. The
-lazy relay mostly hides that, since encoding starts when a client connects and
-the first picture is still a key frame; it applies to multicast and to a
-second client joining a running unicast session.
+headroom.
+
+There is a second cost, and unlike everything else in this section it is
+**reasoned rather than measured**. With no periodic key frame, a client
+joining a stream that is already running has nothing to start from and must
+wait out a full sweep before its picture is complete. Encoding begins when the
+first client connects, so that client still receives a key frame and is
+unaffected — which is precisely why every measurement above missed this: they
+all used a single viewer. The untested cases are a second simultaneous viewer
+and any multicast receiver. Both are worth checking before intra refresh is
+relied on for a deployment that has more than one person watching, and the
+check is cheap: connect a second `StreamClient` to a running session and time
+how long its first complete picture takes.
 - `setBitrate()` did not touch `rc_buffer_size`, which kept twice the 1 Mbit/s
   the context was built with. The VBV was 2 Mbit whatever the stream was
   configured for — ten seconds of buffer at 200 kbit/s, and a quarter second

@@ -74,11 +74,17 @@ link loses packets and has headroom to spare::
   ros2 launch rtsp_image_transport ros_to_rtsp_h264.launch.yaml \
       input_topic:=/camera/image_raw intra_refresh:=true
 
-One caveat: with no periodic key frame, a client joining an established stream
-has nothing to start from and waits out a sweep. The lazy relay mostly hides
-this, since encoding begins when a client connects and the first picture is
-still a key frame; it applies to multicast and to a second client joining a
-running unicast session. Both request a
+.. warning::
+
+   With no periodic key frame, a client joining a stream that is *already
+   running* has nothing to start from and must wait out a full sweep before
+   its picture is complete. Encoding begins when the first client connects, so
+   that client still gets a key frame and is unaffected. The untested case is a
+   **second simultaneous viewer**, or any **multicast** receiver.
+
+   This was reasoned from how the encoder behaves, not measured — every
+   intra-refresh measurement above used a single viewer. Verify it yourself
+   before relying on ``intra_refresh`` with more than one viewer at a time. Both request a
 hardware encoder and transparently fall back to software when the machine has
 no usable one. On NVIDIA hardware the selected encoder is logged as
 ``h264_nvenc`` or ``hevc_nvenc``.

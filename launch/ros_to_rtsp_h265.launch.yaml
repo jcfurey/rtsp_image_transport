@@ -38,7 +38,14 @@ launch:
         Sweep a band of intra macroblocks across the picture instead of
         sending periodic key frames. On a lossy link this removes the single
         large indispensable picture whose loss corrupts everything after it,
-        at the cost of bitrate.
+        at the cost of bitrate: measured medians of frames delivered went
+        24% -> 79% at 1% packet loss and 18% -> 57% at 2%.
+        CAVEAT, and it is not measured: with no periodic key frame a client
+        joining a stream that is already running has nothing to start from
+        and must wait out a full sweep. Encoding starts when the first client
+        connects, so that client is fine; a SECOND viewer, or any multicast
+        receiver, is the untested case. Verify before relying on this with
+        more than one simultaneous viewer.
   - arg:
       name: keyframe_interval
       default: '0'
