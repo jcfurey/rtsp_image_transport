@@ -291,6 +291,9 @@ TEST(Transport, PluginsAreActuallyDrivenByImageTransport)
     /* The drop ladder is what bounds latency once the decoder cannot keep up,
        so its budget has to be reachable from a launch file. */
     EXPECT_NEAR(fixture.node_->get_parameter("alive.image.rtsp.max_latency").as_double(), 0.2, 1e-9);
+    /* RTP goes over UDP unless asked otherwise: TCP cannot drop, so a lost
+       segment stalls the viewer behind a retransmit it has no use for. */
+    EXPECT_FALSE(fixture.node_->get_parameter("alive.image.rtsp.rtp_over_tcp").as_bool());
     EXPECT_FALSE(fixture.node_->has_parameter("live.image.rtsp.use_hw_decoder"))
         << "the relative topic lost its first character while constructing parameter names";
 }
