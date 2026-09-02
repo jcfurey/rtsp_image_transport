@@ -198,6 +198,58 @@ bool haveEncoderFor(VideoCodec codec)
     }
 }
 
+/* Feeds captured NAL units through a software decoder and counts the pictures
+   that come out, checking each is the size the server was serving. */
+std::size_t decodeAll(VideoCodec codec, const std::vector<FrameDataPtr>& nals, unsigned width, unsigned height)
+{
+    StreamDecoder::Options options;
+    options.use_hw_decoder = false;
+    options.hw_device = "none";
+    StreamDecoder decoder(codec, options);
+    std::size_t images = 0;
+    for (const FrameDataPtr& nal : nals)
+    {
+        try
+        {
+            decoder.decodeVideo(nal);
+        }
+        catch (const DecodingError&)
+        {
+            continue;  // a partial first access unit is expected
+        }
+        while (sensor_msgs::msg::Image::UniquePtr img = decoder.nextFrame())
+        {
+            EXPECT_EQ(img->width, width);
+            EXPECT_EQ(img->height, height);
+            EXPECT_EQ(img->data.size(), static_cast<std::size_t>(3) * width * height);
+            images++;
+        }
+    }
+    return images;
+}
+
+/* Both RTP transports have to work, and which one a bare client picks is a
+   default that has already changed once. Tests that simply took the default
+   therefore silently covered whichever transport was current and left the
+   other one untested; running them over both is what keeps that honest. */
+class RtspTransport : public ::testing::TestWithParam<bool>
+{
+protected:
+    bool rtpOverTcp() const
+    {
+        return GetParam();
+    }
+    const char* transportName() const
+    {
+        return GetParam() ? "interleaved TCP" : "UDP";
+    }
+};
+
+std::string transportSuffix(const ::testing::TestParamInfo<bool>& info)
+{
+    return info.param ? "Tcp" : "Udp";
+}
+
 }  // namespace
 
 TEST(RtspLoopback, ServerPublishesAUsableUrl)
@@ -241,7 +293,28 @@ TEST(RtspLoopback, ClientReceivesVideoFromServer)
     client->disconnect();
 }
 
-TEST(RtspLoopback, ReceivedStreamDecodesBackToImages)
+TEST_P(RtspTransport, SessionDeliversVideo)
+{
+    if (!haveEncoderFor(VideoCodec::H264))
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    LoopbackServer server(VideoCodec::H264, 320, 240);
+
+    ClientObserver observer;
+    std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", server.url());
+    client->setRtpOverTcp(rtpOverTcp());
+    observer.attach(client);
+    ASSERT_NO_THROW(client->connect());
+
+    ASSERT_TRUE(observer.waitFor([&] { return observer.started_ || observer.failed_; }))
+        << "session never started over " << transportName();
+    ASSERT_FALSE(observer.failed_) << "session failed: " << observer.failure_message_ << " ("
+                                   << observer.failure_code_ << ")";
+    ASSERT_TRUE(observer.waitForNals(30)) << "no video data arrived over " << transportName();
+    EXPECT_GT(observer.total_bytes_, 0u);
+    client->disconnect();
+}
+
+TEST_P(RtspTransport, StreamDecodesBackToImages)
 {
     /* The whole chain end to end: encode, packetise over RTP, receive,
        reassemble and decode. */
@@ -252,9 +325,10 @@ TEST(RtspLoopback, ReceivedStreamDecodesBackToImages)
 
     ClientObserver observer;
     std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", server.url());
+    client->setRtpOverTcp(rtpOverTcp());
     observer.attach(client);
     ASSERT_NO_THROW(client->connect());
-    ASSERT_TRUE(observer.waitForNals(60)) << "not enough video data arrived";
+    ASSERT_TRUE(observer.waitForNals(60)) << "not enough video data arrived over " << transportName();
 
     std::vector<FrameDataPtr> nals;
     {
@@ -263,33 +337,37 @@ TEST(RtspLoopback, ReceivedStreamDecodesBackToImages)
     }
     client->disconnect();
 
-    StreamDecoder::Options options;
-    options.use_hw_decoder = false;
-    options.hw_device = "none";
-    StreamDecoder decoder(VideoCodec::H264, options);
-    std::size_t images = 0;
-    for (const FrameDataPtr& nal : nals)
-    {
-        try
-        {
-            decoder.decodeVideo(nal);
-        }
-        catch (const DecodingError&)
-        {
-            continue;  // a partial first access unit is expected
-        }
-        while (sensor_msgs::msg::Image::UniquePtr img = decoder.nextFrame())
-        {
-            EXPECT_EQ(img->width, width);
-            EXPECT_EQ(img->height, height);
-            EXPECT_EQ(img->data.size(), static_cast<std::size_t>(3) * width * height);
-            images++;
-        }
-    }
-    EXPECT_GE(images, 3u) << "received stream did not decode into images";
+    EXPECT_GE(decodeAll(VideoCodec::H264, nals, width, height), 3u)
+        << "stream over " << transportName() << " did not decode into images";
 }
 
-TEST(RtspLoopback, H265SessionDecodesBackToImages)
+/* Switching transport is a reconnect, which is how the subscriber applies a
+   changed rtp_over_tcp: the session is torn down and set up again with the
+   other one. Both directions have to end up delivering video. */
+TEST(RtspLoopback, SwitchingTransportBetweenSessionsWorks)
+{
+    if (!haveEncoderFor(VideoCodec::H264))
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    LoopbackServer server(VideoCodec::H264, 320, 240);
+
+    for (bool tcp : {false, true, false})
+    {
+        SCOPED_TRACE(tcp ? "interleaved TCP" : "UDP");
+        ClientObserver observer;
+        std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", server.url());
+        client->setRtpOverTcp(tcp);
+        EXPECT_EQ(client->rtpOverTcp(), tcp);
+        observer.attach(client);
+        ASSERT_NO_THROW(client->connect());
+        ASSERT_TRUE(observer.waitFor([&] { return observer.started_ || observer.failed_; }))
+            << "session never started";
+        ASSERT_FALSE(observer.failed_) << observer.failure_message_;
+        EXPECT_TRUE(observer.waitForNals(20)) << "no video after switching transport";
+        client->disconnect();
+    }
+}
+
+TEST_P(RtspTransport, H265SessionDecodesBackToImages)
 {
     /* The deployed camera0 stream is HEVC, and the H.265 receive path —
        including the FrameExtractor's RFC 7798 sprop-vps/sps/pps SDP init —
@@ -310,6 +388,7 @@ TEST(RtspLoopback, H265SessionDecodesBackToImages)
 
     ClientObserver observer;
     std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", server->url());
+    client->setRtpOverTcp(rtpOverTcp());
     observer.attach(client);
     /* Replace the observer's subsession handler with one that ALSO captures
        the SDP sprop attributes, so the log shows whether this run exercised
@@ -329,7 +408,7 @@ TEST(RtspLoopback, H265SessionDecodesBackToImages)
             observer.cv_.notify_all();
         });
     ASSERT_NO_THROW(client->connect());
-    ASSERT_TRUE(observer.waitForNals(60)) << "not enough video data arrived";
+    ASSERT_TRUE(observer.waitForNals(60)) << "not enough video data arrived over " << transportName();
     EXPECT_EQ(observer.codec_, VideoCodec::H265);
     EXPECT_EQ(client->codec(), VideoCodec::H265);
     if (sprop_vps.empty() || sprop_sps.empty() || sprop_pps.empty())
@@ -343,30 +422,11 @@ TEST(RtspLoopback, H265SessionDecodesBackToImages)
     }
     client->disconnect();
 
-    StreamDecoder::Options options;
-    options.use_hw_decoder = false;
-    options.hw_device = "none";
-    StreamDecoder decoder(VideoCodec::H265, options);
-    std::size_t images = 0;
-    for (const FrameDataPtr& nal : nals)
-    {
-        try
-        {
-            decoder.decodeVideo(nal);
-        }
-        catch (const DecodingError&)
-        {
-            continue;  // a partial first access unit is expected
-        }
-        while (sensor_msgs::msg::Image::UniquePtr img = decoder.nextFrame())
-        {
-            EXPECT_EQ(img->width, width);
-            EXPECT_EQ(img->height, height);
-            images++;
-        }
-    }
-    EXPECT_GE(images, 3u) << "received H.265 stream did not decode into images";
+    EXPECT_GE(decodeAll(VideoCodec::H265, nals, width, height), 3u)
+        << "H.265 stream over " << transportName() << " did not decode into images";
 }
+
+INSTANTIATE_TEST_SUITE_P(RtspLoopback, RtspTransport, ::testing::Values(false, true), transportSuffix);
 
 TEST(RtspLoopback, RtpRunsOverUdpByDefault)
 {
@@ -379,96 +439,6 @@ TEST(RtspLoopback, RtpRunsOverUdpByDefault)
     std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", "rtsp://localhost:8554/test");
     EXPECT_FALSE(client->rtpOverTcp());
     EXPECT_EQ(client->rtpBufferSize(), DEFAULT_RTP_BUFFER_SIZE);
-}
-
-TEST(RtspLoopback, TcpInterleavedSessionDeliversVideo)
-{
-    /* Interleaving stays supported, and has to keep working, for lossy links
-       where artefacts cost more than delay and for servers that refuse UDP. */
-    if (!haveEncoderFor(VideoCodec::H264))
-        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
-    LoopbackServer server(VideoCodec::H264, 320, 240);
-
-    ClientObserver observer;
-    std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", server.url());
-    client->setRtpOverTcp(true);
-    observer.attach(client);
-    ASSERT_NO_THROW(client->connect());
-
-    ASSERT_TRUE(observer.waitFor([&] { return observer.started_ || observer.failed_; }))
-        << "session never started";
-    ASSERT_FALSE(observer.failed_) << "session failed: " << observer.failure_message_ << " ("
-                                   << observer.failure_code_ << ")";
-    ASSERT_TRUE(observer.waitForNals(30)) << "no video data arrived over interleaved TCP";
-    EXPECT_GT(observer.total_bytes_, 0u);
-    client->disconnect();
-}
-
-TEST(RtspLoopback, UdpSessionStillDeliversVideo)
-{
-    /* The default path: RTP on its own UDP sockets. */
-    if (!haveEncoderFor(VideoCodec::H264))
-        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
-    LoopbackServer server(VideoCodec::H264, 320, 240);
-
-    ClientObserver observer;
-    std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", server.url());
-    client->setRtpOverTcp(false);
-    observer.attach(client);
-    ASSERT_NO_THROW(client->connect());
-
-    ASSERT_TRUE(observer.waitFor([&] { return observer.started_ || observer.failed_; }))
-        << "session never started";
-    ASSERT_FALSE(observer.failed_) << "session failed: " << observer.failure_message_ << " ("
-                                   << observer.failure_code_ << ")";
-    ASSERT_TRUE(observer.waitForNals(30)) << "no video data arrived over UDP";
-    client->disconnect();
-}
-
-TEST(RtspLoopback, TcpInterleavedStreamDecodesBackToImages)
-{
-    if (!haveEncoderFor(VideoCodec::H264))
-        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
-    const unsigned width = 320, height = 240;
-    LoopbackServer server(VideoCodec::H264, width, height);
-
-    ClientObserver observer;
-    std::shared_ptr<StreamClient> client = StreamClient::create("test_topic", server.url());
-    client->setRtpOverTcp(true);
-    observer.attach(client);
-    ASSERT_NO_THROW(client->connect());
-    ASSERT_TRUE(observer.waitForNals(60)) << "not enough video data arrived";
-
-    std::vector<FrameDataPtr> nals;
-    {
-        std::lock_guard<std::mutex> lock{observer.mutex_};
-        nals = observer.nals_;
-    }
-    client->disconnect();
-
-    StreamDecoder::Options options;
-    options.use_hw_decoder = false;
-    options.hw_device = "none";
-    StreamDecoder decoder(VideoCodec::H264, options);
-    std::size_t images = 0;
-    for (const FrameDataPtr& nal : nals)
-    {
-        try
-        {
-            decoder.decodeVideo(nal);
-        }
-        catch (const DecodingError&)
-        {
-            continue;
-        }
-        while (sensor_msgs::msg::Image::UniquePtr img = decoder.nextFrame())
-        {
-            EXPECT_EQ(img->width, width);
-            EXPECT_EQ(img->height, height);
-            images++;
-        }
-    }
-    EXPECT_GE(images, 3u) << "interleaved stream did not decode into images";
 }
 
 TEST(RtspLoopback, ClientReportsAvailableVideoSubsessions)

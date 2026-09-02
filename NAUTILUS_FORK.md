@@ -623,6 +623,56 @@ than failing. Asking for the pool explicitly (`pools=`) avoids it everywhere.
   so retransmission happens as fast as the stack can manage — fast retransmit,
   or the 200 ms RTO floor visible in the 1% tail. A real tether with real RTT
   recovers more slowly than this.
+
+## The decoder stall that made UDP look unusable
+
+Running the same loss rig all the way through to decoded pictures, rather than
+stopping at NAL arrival, turned up something the transport measurements could
+not see. H.264 over UDP delivered 3-11% of frames under loss while H.265
+delivered 96-99%, and the H.264 figure was not a function of the loss rate:
+3.3% at 0.05% loss, 97.9% at 0.2%, 93.9% at 0.5%, 11.1% at 1%. Bimodal, not a
+cliff — the stream either worked or it was dead, and higher loss only made
+dying sooner more likely.
+
+It is a latching failure. One badly timed lost packet leaves libavcodec
+rejecting every slice that follows — 1842 `decode_slice_header error` out of
+3808 NAL units, with `Frame num change from 7 to ...` for every value of N —
+and it does not find its way back, because a slice it will not decode is also
+a slice whose parameter sets it never reaches. H.265 escapes it by emitting
+one slice per picture, where a lost packet costs that picture and nothing
+after it.
+
+Two things made this hard to see. The session timeout cannot detect it: RTP
+keeps arriving at full rate, and only the pictures have stopped, so the
+transport looks perfectly healthy. And an early measurement of it was wrong in
+the other direction — the bench set `setSessionTimeout(0ms)`, disabling the one
+recovery path the product does have, which made the failure look permanent
+where the real subscriber sometimes reconnected out of it.
+
+`AV_CODEC_FLAG_OUTPUT_CORRUPT` and `AV_EF_IGNORE_ERR` were tried first, on the
+theory that finished pictures were being discarded. They made no difference
+(6.5% against 9.3%, inside the run-to-run spread), which is what established
+that the slices genuinely cannot be decoded rather than being decoded and
+dropped.
+
+What works is throwing the reference chain away. New `StreamDecoder::flush()`
+calls `avcodec_flush_buffers()` and re-arms the key-frame gate;
+`avcodec_flush_buffers()` rather than a new decoder because it keeps the
+extradata parsed from the SDP, which is every parameter set a camera that
+never repeats them in band will ever send — precisely the camera this fork
+exists for. The subscriber drives it from a new `decoder_stall_timeout`
+parameter (default 2 s, 0 disables): fed for that long with no picture out,
+flush and resume at the next key frame.
+
+Measured through the real plugin stack, frames delivered over a 13 s run:
+
+| packet loss | without watchdog | with watchdog |
+| --- | --- | --- |
+| 1% | 18% | 70% |
+| 3% | 16% | 38% |
+
+3% sustained uniform loss is a thoroughly broken link, and 38% of frames is
+still bad video; the point is that it recovers rather than staying dead.
 - `setBitrate()` did not touch `rc_buffer_size`, which kept twice the 1 Mbit/s
   the context was built with. The VBV was 2 Mbit whatever the stream was
   configured for — ten seconds of buffer at 200 kbit/s, and a quarter second

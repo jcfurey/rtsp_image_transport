@@ -708,6 +708,18 @@ void StreamDecoder::setDecodeFrames(DecodeFrames which) noexcept
     }
 }
 
+void StreamDecoder::flush() noexcept
+{
+    if (!initialized_ || !ctx_)
+        return;
+    avcodec_flush_buffers(ctx_.get());
+    frames_.clear();
+    /* Everything decoded from here references frames that are gone, so hold
+       output until a key frame the way a freshly joined session does. */
+    awaiting_keyframe_ = true;
+    frames_before_keyframe_ = 0;
+}
+
 std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
 {
     /* Some hardware decoders open successfully and accept every packet but

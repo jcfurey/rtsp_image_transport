@@ -336,6 +336,27 @@ Frames decoded before the first key frame of a session are never published.
 Connecting to a live stream lands mid-GOP, so those pictures reference data that
 was never received and would otherwise be the first thing on screen.
 
+Stalled decoders
+----------------
+
+Lost packets can leave an H.264 decoder rejecting every slice that follows —
+libavcodec reports ``decode_slice_header error`` and no picture comes out — and
+it does not reliably recover on its own. The session timeout cannot see this,
+because RTP is still arriving normally; only the pictures have stopped.
+
+``decoder_stall_timeout`` (float, default ``2.0`` s) is the watchdog for it: if
+the decoder has been fed for that long without producing an image, it is
+flushed and resumes at the next key frame. Set it to ``0`` to disable. Measured
+on a 640x480 H.264 stream over UDP, frames delivered over a 13 s run::
+
+    packet loss    without watchdog    with watchdog
+    1%                          18%              70%
+    3%                          16%              38%
+
+H.265 does not show this failure — one slice per picture means a lost packet
+costs the whole picture and nothing downstream of it — and delivers 96-99% at
+the same loss rates either way.
+
 
 Quality of Service
 ==================

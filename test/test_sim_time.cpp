@@ -294,6 +294,10 @@ TEST(Transport, PluginsAreActuallyDrivenByImageTransport)
     /* RTP goes over UDP unless asked otherwise: TCP cannot drop, so a lost
        segment stalls the viewer behind a retransmit it has no use for. */
     EXPECT_FALSE(fixture.node_->get_parameter("alive.image.rtsp.rtp_over_tcp").as_bool());
+    /* On UDP a lost packet can wedge the decoder while RTP keeps arriving, so
+       the stall watchdog is what the transport default depends on. */
+    EXPECT_TRUE(fixture.node_->has_parameter("alive.image.rtsp.decoder_stall_timeout"));
+    EXPECT_GT(fixture.node_->get_parameter("alive.image.rtsp.decoder_stall_timeout").as_double(), 0.0);
     EXPECT_FALSE(fixture.node_->has_parameter("live.image.rtsp.use_hw_decoder"))
         << "the relative topic lost its first character while constructing parameter names";
 }

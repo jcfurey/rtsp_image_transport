@@ -109,6 +109,19 @@ public:
     const std::string& description() const noexcept;
     bool isHardwareAccelerated() const noexcept;
     void setDecodeFrames(DecodeFrames which) noexcept;
+    /* Throws away the decoder's reference frames and starts again at the next
+       key frame.
+     *
+     * Packet loss can leave an H.264 decoder rejecting every slice that
+     * follows — libavcodec reports "decode_slice_header error" and no picture
+     * comes out — and it does not always find its way back on its own, because
+     * a slice it will not decode is also a slice whose parameter sets it never
+     * reaches. RTP keeps arriving throughout, so the session watchdog sees a
+     * perfectly healthy stream. This is the way out of that: cheaper than a
+     * reconnect, and unlike building a new decoder it keeps the extradata
+     * parsed from the SDP, which is all a camera that never repeats its
+     * parameter sets in band will ever send. */
+    void flush() noexcept;
 
     /* Hardware device types this build of FFmpeg can instantiate right now.
        Probed once and cached; intended for diagnostics. */

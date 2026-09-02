@@ -120,6 +120,63 @@ INSTANTIATE_TEST_SUITE_P(AllCodecs, StreamDecoderCodecTest,
                              return name;
                          });
 
+TEST(StreamDecoder, FlushRecoversAndResumesAtTheNextKeyFrame)
+{
+    /* Packet loss can leave an H.264 decoder rejecting every slice that
+       follows, with no picture coming out and RTP still arriving, so the
+       session watchdog sees nothing wrong. flush() is the way out. What it has
+       to guarantee is that decoding resumes: it drops the reference frames,
+       waits for a key frame the way a freshly joined session does, and then
+       keeps producing images. */
+    auto packets = encodeTestStream(VideoCodec::H264, 320, 240, 30);
+    if (packets.empty())
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+
+    StreamDecoder::Options options;
+    options.use_hw_decoder = false;
+    options.hw_device = "none";
+    StreamDecoder decoder(VideoCodec::H264, options);
+
+    auto feed = [&](std::size_t from, std::size_t to)
+    {
+        std::size_t images = 0;
+        for (std::size_t i = from; i < to && i < packets.size(); ++i)
+        {
+            FrameDataPtr data = std::make_shared<FrameData>(
+                packets[i].data(), packets[i].size(),
+                rclcpp::Time(BASE_STAMP_NS + static_cast<std::int64_t>(i) * FRAME_INTERVAL_NS));
+            try
+            {
+                decoder.decodeVideo(data);
+            }
+            catch (const DecodingError&)
+            {
+                continue;
+            }
+            while (decoder.nextFrame())
+                images++;
+        }
+        return images;
+    };
+
+    const std::size_t half = packets.size() / 2;
+    ASSERT_GT(feed(0, half), 0u) << "nothing decoded before the flush";
+    decoder.flush();
+    EXPECT_GT(feed(half, packets.size()), 0u) << "the decoder never recovered after being flushed";
+}
+
+TEST(StreamDecoder, FlushIsSafeBeforeAnythingHasBeenDecoded)
+{
+    /* The watchdog can fire on a session that never produced a picture at all,
+       so flushing an unopened decoder has to be a no-op rather than a crash. */
+    StreamDecoder::Options options;
+    options.use_hw_decoder = false;
+    options.hw_device = "none";
+    StreamDecoder decoder(VideoCodec::H264, options);
+    EXPECT_NO_THROW(decoder.flush());
+    EXPECT_NO_THROW(decoder.flush());
+}
+
 TEST(StreamDecoder, RejectsCodecWithoutDecoderSupport)
 {
     EXPECT_THROW(StreamDecoder(VideoCodec::Unknown, softwareOptions()), StreamingError);
