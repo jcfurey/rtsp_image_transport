@@ -33,6 +33,8 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <string>
+#include <utility>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -302,6 +304,32 @@ TEST(Transport, PluginsAreActuallyDrivenByImageTransport)
        the stall watchdog is what the transport default depends on. */
     EXPECT_TRUE(fixture.node_->has_parameter("alive.image.rtsp.decoder_stall_timeout"));
     EXPECT_GT(fixture.node_->get_parameter("alive.image.rtsp.decoder_stall_timeout").as_double(), 0.0);
+
+    /* Declaring a parameter is not the same as honouring one. The launch files
+       pass these in, and a name or type that does not match what the plugin
+       declared would be accepted by launch and silently ignored here, so set
+       each one the way a launch file does and read it back. */
+    for (const auto& [name, value] :
+         std::vector<std::pair<std::string, rclcpp::ParameterValue>>{
+             {"alive.image.rtsp.decoder_stall_timeout", rclcpp::ParameterValue(3.5)},
+             {"alive.image.rtsp.max_latency", rclcpp::ParameterValue(0.15)},
+             {"alive.image.rtsp.rtp_over_tcp", rclcpp::ParameterValue(true)},
+             {"alive.image.rtsp.video_subsession", rclcpp::ParameterValue(1)},
+             {"alive.image.rtsp.rtp_buffer_size", rclcpp::ParameterValue(1048576)},
+             {"alive.image.rtsp.keyframe_interval", rclcpp::ParameterValue(7)},
+             {"alive.image.rtsp.intra_refresh", rclcpp::ParameterValue(true)},
+             {"alive.image.rtsp.target_bitrate", rclcpp::ParameterValue(3000000)},
+             {"alive.image.rtsp.expected_framerate", rclcpp::ParameterValue(25)}})
+    {
+        SCOPED_TRACE(name);
+        ASSERT_TRUE(fixture.node_->has_parameter(name)) << "not declared, so a launch file setting it is ignored";
+        ASSERT_NO_THROW(fixture.node_->set_parameter(rclcpp::Parameter(name, value)));
+        EXPECT_EQ(fixture.node_->get_parameter(name).get_type(), value.get_type())
+            << "the plugin declared a different type than a launch file would pass";
+    }
+    EXPECT_NEAR(fixture.node_->get_parameter("alive.image.rtsp.decoder_stall_timeout").as_double(), 3.5, 1e-9);
+    EXPECT_TRUE(fixture.node_->get_parameter("alive.image.rtsp.intra_refresh").as_bool());
+    EXPECT_EQ(fixture.node_->get_parameter("alive.image.rtsp.keyframe_interval").as_int(), 7);
     EXPECT_FALSE(fixture.node_->has_parameter("live.image.rtsp.use_hw_decoder"))
         << "the relative topic lost its first character while constructing parameter names";
 }

@@ -43,6 +43,14 @@ launch:
       name: video_subsession
       default: '0'
       description: Zero-based index over the server's video subsessions
+  - arg:
+      name: decoder_stall_timeout
+      default: '2.0'
+      description: >-
+        Flush the decoder when it has been fed for this long [s] without
+        producing an image. Packet loss can leave a decoder rejecting every
+        slice while RTP keeps arriving, which the session timeout cannot see
+        because the transport looks healthy (0 = never flush).
 
   - node:
       pkg: image_transport
@@ -71,6 +79,9 @@ launch:
         - name: in.rtsp.video_subsession
           value: $(var video_subsession)
           type: int
+        - name: in.rtsp.decoder_stall_timeout
+          value: $(var decoder_stall_timeout)
+          type: float
 
         # Emit each picture as soon as it is complete rather than holding it
         # in the reordering buffer. Turn off only for a source with B-frames.
