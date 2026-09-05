@@ -287,8 +287,15 @@ presentation order. Live IP camera streams almost never need this.
 When the decoder cannot keep up, the subscriber progressively drops frames
 before decoding them, so the pipeline catches up instead of drifting further
 behind. ``max_latency`` (float, default ``0.2`` s) is the budget that ladder
-works to: non-intra frames are dropped once the queue spans ``max_latency``,
+works to: non-intra frames are dropped once their receive age reaches ``max_latency``,
 non-key frames at twice that, and everything at four times.
+
+Receive age uses a steady clock, independently of the image header stamp, so
+pausing or jumping simulated time does not hide queued work. With dropping
+enabled, the receive queue also retains at most 120 access units or 64 MiB,
+keeping the initial codec parameter sets and the newest pending pictures.
+Each executor callback handles at most 16 access units and yields after an
+8 ms processing budget (a single decode or image callback can take longer).
 
 Because the queue settles on whichever rung matches the shortfall, this
 parameter is what steady-state latency converges to whenever the decoder is
@@ -301,6 +308,11 @@ grow instead::
       -p in_transport:=rtsp -p out_transport:=raw \
       -p in.rtsp.max_latency:=0.1 \
       -r in/rtsp:=/camera/image_h264/rtsp -r out:=/camera/image_raw
+
+``sws_threads`` (integer, default ``4``) controls CPU threads used to convert
+decoded pictures to BGR. Live changes take effect on the next converted image
+without restarting the codec or waiting for another key frame. ``0`` uses all
+available hardware threads on FFmpeg builds with threaded conversion support.
 
 The publisher side is bounded the same way, per connected client: a client
 whose link cannot carry the stream backs up its own send queue, and once that

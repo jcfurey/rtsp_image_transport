@@ -181,11 +181,14 @@ struct RTSP_IMAGE_TRANSPORT_NO_EXPORT SubscriberPlugin::Config
 using SuperClass = image_transport::SimpleSubscriberPlugin<std_msgs::msg::String>;
 
 SubscriberPlugin::SubscriberPlugin()
-    : SuperClass(), logger_(rclcpp::get_logger("rtsp_image_transport")), config_(std::make_unique<Config>()),
+    : SuperClass(), logger_(rclcpp::get_logger("rtsp_image_transport")), failed_(false),
+      config_(std::make_unique<Config>()),
       old_lag_(0s)
 {
     global_initialize();
 }
+
+SubscriberPlugin::~SubscriberPlugin() = default;
 
 void SubscriberPlugin::shutdown()
 {
@@ -204,7 +207,7 @@ void SubscriberPlugin::shutdown()
        BEFORE tearing objects down, whereas a plain disconnect() from this
        executor thread raced the loop's in-flight frame delivery. */
     client_.reset();
-    decoder_.reset();
+    decoder_.store(nullptr);
     clearQueuedFrames();
     SuperClass::shutdown();
 }
@@ -387,18 +390,19 @@ void SubscriberPlugin::subsessionStarted(VideoCodec codec, MediaSubsession* subs
 {
     old_lag_ = rclcpp::Duration(0, 0);
     RCLCPP_DEBUG(logger_, "[%s] setting up decoder for %s", topic_name_.c_str(), videoCodecName(codec).c_str());
-    decoder_ = std::make_shared<StreamDecoder>(codec, config_->decoder, logger_);
+    auto decoder = std::make_shared<StreamDecoder>(codec, config_->decoder, logger_);
     RCLCPP_INFO(logger_, "[%s] start decoding %s with %s from %s", topic_name_.c_str(),
-                videoCodecName(codec).c_str(), decoder_->description().c_str(), client_->url().c_str());
-    reportMissingHwDecoder();
+                videoCodecName(codec).c_str(), decoder->description().c_str(), client_->url().c_str());
+    reportMissingHwDecoder(*decoder);
+    decoder_.store(std::move(decoder));
 }
 
 /* Hardware decoding was asked for but we ended up in software. The device probe
    has already run at this point, so listing what the machine can do is free and
    turns a silent performance cliff into an actionable message. */
-void SubscriberPlugin::reportMissingHwDecoder()
+void SubscriberPlugin::reportMissingHwDecoder(const StreamDecoder& decoder)
 {
-    if (!decoder_ || decoder_->isHardwareAccelerated())
+    if (decoder.isHardwareAccelerated())
         return;
     if (!config_->decoder.use_hw_decoder || config_->decoder.hw_device == "none")
         return;
@@ -497,6 +501,7 @@ void SubscriberPlugin::setupParameters(
         rclcpp::ParameterValue(config_->decoder.sws_threads),
         ParameterDescriptor()
             .set__description("worker threads for the YUV to BGR conversion (0 = one per hardware thread); "
+                              "changes apply to the next converted image without restarting the decoder; "
                               "the default shares the CPU with the rest of the vehicle rather than taking "
                               "everything the machine has")
             .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(64)}));
@@ -504,10 +509,12 @@ void SubscriberPlugin::setupParameters(
         node_parameters, param_base_name_ + ".max_latency",
         rclcpp::ParameterValue(1e-3 * config_->max_latency.count()),
         ParameterDescriptor()
-            .set__description("how far the decoder may fall behind before frames are dropped [s]; this is the "
+            .set__description("how far the decoder may fall behind in steady receive time before frames are "
+                              "dropped [s]; this is the "
                               "latency budget the queue settles at when the decoder cannot keep up. Non-intra "
                               "frames go first, non-key frames at twice this, everything at four times "
-                              "(0 = never drop, and let latency grow instead)")
+                              "(0 = never drop, and let latency grow instead). When enabled, the pending "
+                              "queue is also limited to 120 access units or 64 MiB")
             .set__floating_point_range(
                 {rcl_interfaces::msg::FloatingPointRange().set__from_value(0).set__to_value(10)}));
     declareParameter(
@@ -603,6 +610,11 @@ void SubscriberPlugin::updateParameters()
         changelevel |= LVL_CONNECTION;
 
     *config_ = new_config;
+    {
+        std::lock_guard<std::mutex> lock{queue_mutex_};
+        bound_queue_ = config_->max_latency > 0ms;
+        trimQueuedFrames();
+    }
     try
     {
         {
@@ -619,15 +631,18 @@ void SubscriberPlugin::updateParameters()
                 reconnect();
                 return;
             }
-            if ((changelevel & LVL_CODEC) && decoder_)
+            if ((changelevel & LVL_CODEC) && decoder_.load())
             {
-                decoder_ = std::make_shared<StreamDecoder>(client_->codec(), config_->decoder, logger_);
+                auto decoder = std::make_shared<StreamDecoder>(client_->codec(), config_->decoder, logger_);
                 RCLCPP_INFO(logger_, "[%s] start decoding %s with %s from %s", topic_name_.c_str(),
-                            videoCodecName(client_->codec()).c_str(), decoder_->description().c_str(),
+                            videoCodecName(client_->codec()).c_str(), decoder->description().c_str(),
                             client_->url().c_str());
-                reportMissingHwDecoder();
+                reportMissingHwDecoder(*decoder);
+                decoder_.store(std::move(decoder));
             }
         }
+        if (auto decoder = decoder_.load())
+            decoder->setSwsThreads(config_->decoder.sws_threads);
     }
     catch (std::exception& e)
     {
@@ -644,7 +659,7 @@ void SubscriberPlugin::updateParameters()
 void SubscriberPlugin::processFrame()
 {
     using namespace std::chrono_literals;
-    std::shared_ptr<StreamDecoder> decoder = decoder_;
+    std::shared_ptr<StreamDecoder> decoder = decoder_.load();
     if (failed_ || !decoder)
         return;
     try
@@ -658,9 +673,19 @@ void SubscriberPlugin::processFrame()
         const rclcpp::Duration drop_non_intra{config_->max_latency};
         const rclcpp::Duration drop_non_key{2 * config_->max_latency};
         const rclcpp::Duration drop_all{4 * config_->max_latency};
-        while (FrameDataPtr frame = popFrame())
+        // Yield to other streams and executor callbacks even if reception is
+        // faster than decoding. At least one access unit is handled each time.
+        const auto deadline = std::chrono::steady_clock::now() + 8ms;
+        for (std::size_t processed = 0; processed < 16; ++processed)
         {
-            rclcpp::Duration lag = frameLag();
+            if (processed > 0 && std::chrono::steady_clock::now() >= deadline)
+                break;
+            QueuedFrame frame = popFrame();
+            if (!frame.data)
+                break;
+            const rclcpp::Duration lag{std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - frame.received_at)};
+            const bool dropping = may_drop && lag >= drop_non_intra;
             if (may_drop && lag >= drop_all)
             {
                 if (old_lag_ < drop_all)
@@ -694,11 +719,10 @@ void SubscriberPlugin::processFrame()
             else
             {
                 decoder->setDecodeFrames(StreamDecoder::DecodeFrames::All);
-                if (lag == 0s)
-                    old_lag_ = 0s;
+                old_lag_ = 0s;
             }
             bool produced = false;
-            if (decoder->decodeVideo(frame) > 0)
+            if (decoder->decodeVideo(frame.data) > 0)
             {
                 while (sensor_msgs::msg::Image::UniquePtr decoded = decoder->nextFrame())
                 {
@@ -717,8 +741,10 @@ void SubscriberPlugin::processFrame()
                    its lack of output as a stall. This is especially important
                    for a late join to an intra-refresh stream: it has no future
                    IDR, and repeatedly flushing here would reset the bounded
-                   key-frame fallback before it could ever be reached. */
-                if (produced || decoder->awaitingKeyframe() || last_image_out_.time_since_epoch().count() == 0)
+                   key-frame fallback before it could ever be reached.
+                   Intentional overload drops also explain a lack of output. */
+                if (produced || dropping || decoder->awaitingKeyframe()
+                    || last_image_out_.time_since_epoch().count() == 0)
                 {
                     last_image_out_ = now;
                 }
@@ -761,6 +787,13 @@ void SubscriberPlugin::processFrame()
             reconnect();
         }
     }
+    bool pending;
+    {
+        std::lock_guard<std::mutex> lock{queue_mutex_};
+        pending = !queue_.empty();
+    }
+    if (pending && notify_frame_)
+        notify_frame_();
 }
 
 void SubscriberPlugin::sessionStarted()
@@ -847,28 +880,38 @@ void SubscriberPlugin::cooldownTimerCallback()
     }
 }
 
-void SubscriberPlugin::pushFrame(const FrameDataPtr& frame)
+void SubscriberPlugin::pushFrame(const FrameDataPtr& frame, std::chrono::steady_clock::time_point received_at)
 {
     std::lock_guard<std::mutex> lock{queue_mutex_};
-    queue_.push_back(frame);
+    queue_.push_back({frame, received_at});
+    queued_bytes_ += frame->length();
+    trimQueuedFrames();
 }
 
-FrameDataPtr SubscriberPlugin::popFrame()
+void SubscriberPlugin::trimQueuedFrames()
+{
+    while (bound_queue_ && (queue_.size() > MAX_QUEUED_FRAMES || queued_bytes_ > MAX_QUEUED_BYTES))
+    {
+        // Keep the initial parameter sets until the decoder has seen them.
+        // Discard the oldest remaining work so newer pictures can catch up.
+        auto oldest = queue_.begin();
+        if (preserve_first_frame_ && queue_.size() > 1)
+            ++oldest;
+        queued_bytes_ -= oldest->data->length();
+        queue_.erase(oldest);
+    }
+}
+
+SubscriberPlugin::QueuedFrame SubscriberPlugin::popFrame()
 {
     std::lock_guard<std::mutex> lock{queue_mutex_};
     if (queue_.empty())
-        return FrameDataPtr();
-    FrameDataPtr frame = queue_.front();
+        return {};
+    QueuedFrame frame = std::move(queue_.front());
+    queued_bytes_ -= frame.data->length();
     queue_.pop_front();
+    preserve_first_frame_ = false;
     return frame;
-}
-
-rclcpp::Duration SubscriberPlugin::frameLag() const noexcept
-{
-    std::lock_guard<std::mutex> lock{queue_mutex_};
-    if (queue_.empty())
-        return rclcpp::Duration(0, 0);
-    return queue_.back()->stamp() - queue_.front()->stamp();
 }
 
 void SubscriberPlugin::clearQueuedFrames()
@@ -876,6 +919,8 @@ void SubscriberPlugin::clearQueuedFrames()
     {
         std::lock_guard<std::mutex> lock{queue_mutex_};
         queue_.clear();
+        queued_bytes_ = 0;
+        preserve_first_frame_ = true;
     }
     /* A new session starts its own stall window; the old one's silence says
        nothing about the decoder that is about to be fed. */

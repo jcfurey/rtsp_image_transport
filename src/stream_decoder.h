@@ -34,6 +34,7 @@ extern "C"
 #include <rclcpp/logger.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <deque>
 #include <memory>
@@ -112,6 +113,9 @@ public:
        session has not reached a key frame (or the bounded fallback) yet. */
     bool awaitingKeyframe() const noexcept;
     void setDecodeFrames(DecodeFrames which) noexcept;
+    /* Safe to request from another thread. The decoding thread replaces only
+       the scaler before converting the next image; codec state is retained. */
+    void setSwsThreads(int threads) noexcept;
     /* Throws away the decoder's reference frames and starts again at the next
        key frame.
      *
@@ -135,6 +139,7 @@ public:
     static std::vector<std::string> candidateDecoderNames(VideoCodec codec);
 
 private:
+    friend class StreamDecoderTestPeer;
     static AVPixelFormat selectPixelFormat(AVCodecContext* ctx, const AVPixelFormat* formats);
     static int prepareFrameBuffer(AVCodecContext* ctx, AVFrame* frame, int flags);
 
@@ -153,6 +158,9 @@ private:
     rclcpp::Logger logger_;
     VideoCodec codec_;
     Options options_;
+    std::atomic<int> requested_sws_threads_;
+    int active_sws_threads_ = -1;
+    DecodeFrames decode_frames_ = DecodeFrames::All;
     bool initialized_, sws_threaded_, hardware_;
     /* Set when the decoder pre-fills freshly allocated frames, which is how a
        picture that lost a slice is told apart from one that decoded cleanly for
@@ -174,6 +182,7 @@ private:
     std::shared_ptr<SwsContext> sws_;
     std::deque<sensor_msgs::msg::Image::UniquePtr> frames_;
     std::vector<FrameDataPtr> hardware_probe_packets_;
+    bool hardware_candidate_proven_ = false;
     bool replaying_probe_packets_ = false;
 };
 
