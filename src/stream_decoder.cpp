@@ -346,7 +346,8 @@ std::vector<std::string> StreamDecoder::availableHwDevices(const std::string& hw
 }
 
 StreamDecoder::StreamDecoder(VideoCodec codec, const Options& options, const rclcpp::Logger& logger)
-    : logger_(logger), codec_(codec), options_(options), initialized_(false), sws_threaded_(false), hardware_(false),
+    : logger_(logger), codec_(codec), options_(options), requested_sws_threads_(options.sws_threads),
+      initialized_(false), sws_threaded_(false), hardware_(false),
       fills_frames_(false), awaiting_keyframe_(true), frames_before_keyframe_(0), corrupt_frames_(0), width_(0),
       height_(0),
       last_pixel_format_(AV_PIX_FMT_NONE), hw_pixel_format_(AV_PIX_FMT_NONE), candidate_index_(0)
@@ -600,6 +601,7 @@ void StreamDecoder::openCandidate(const DecoderCandidate& candidate)
         throw StreamingError(
             std::format("failed to open decoder: {}", av_make_error_string(errbuf, sizeof(errbuf), result)));
     }
+    setDecodeFrames(decode_frames_);
 }
 
 /* Picks the hardware pixel format the decoder was set up for. Called by FFmpeg
@@ -692,10 +694,15 @@ void StreamDecoder::resetWorkingBuffers()
     height_ = 0;
     last_pixel_format_ = AV_PIX_FMT_NONE;
     hardware_probe_packets_.clear();
+    hardware_candidate_proven_ = false;
 }
 
 void StreamDecoder::setDecodeFrames(DecodeFrames which) noexcept
 {
+    decode_frames_ = which;
+    // A suppressed picture is neither evidence of failure nor something to replay.
+    if (which != DecodeFrames::All)
+        hardware_probe_packets_.clear();
     switch (which)
     {
         case DecodeFrames::All:
@@ -711,6 +718,11 @@ void StreamDecoder::setDecodeFrames(DecodeFrames which) noexcept
             ctx_->skip_frame = AVDISCARD_ALL;
             break;
     }
+}
+
+void StreamDecoder::setSwsThreads(int threads) noexcept
+{
+    requested_sws_threads_.store(threads, std::memory_order_relaxed);
 }
 
 void StreamDecoder::flush() noexcept
@@ -736,7 +748,8 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
        letting it refill the buffer would let one fallback trigger the next from
        inside its own replay loop, reordering the stream as it went. */
     constexpr std::size_t hardware_probe_limit = 4;
-    if (hardware_ && !replaying_probe_packets_)
+    const bool probing = hardware_ && !hardware_candidate_proven_ && decode_frames_ == DecodeFrames::All;
+    if (probing && !replaying_probe_packets_)
         hardware_probe_packets_.push_back(data);
 
     if (!initialized_)
@@ -760,6 +773,13 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
     {
         std::string message = std::format("failed to send bitstream packet to decoder: {}",
                                           av_make_error_string(errbuf, sizeof(errbuf), result));
+        // A damaged access unit is not a failed device. Keep the working
+        // decoder and its parameter sets so the next key frame can recover.
+        if (result == AVERROR_INVALIDDATA)
+        {
+            hardware_probe_packets_.clear();
+            throw DecodingError(message);
+        }
         if (hardware_ && fallBackToNextCandidate(message))
             return 0;
         throw DecodingError(message);
@@ -767,6 +787,10 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
     std::size_t count = 0;
     while ((result = avcodec_receive_frame(ctx_.get(), frm_.get())) == 0)
     {
+        // Successful decoding proves the device even if startup or drop policy
+        // withholds this particular image from the subscriber.
+        hardware_candidate_proven_ = true;
+        hardware_probe_packets_.clear();
         if (discardFrame(frm_.get()))
         {
             av_frame_unref(frm_.get());
@@ -785,19 +809,22 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
             throw;
         }
         AVPixelFormat source_format = static_cast<AVPixelFormat>(source->format);
-        if (!sws_ || source->width != width_ || source->height != height_ || source_format != last_pixel_format_)
+        const int requested_threads = requested_sws_threads_.load(std::memory_order_relaxed);
+        if (!sws_ || source->width != width_ || source->height != height_ || source_format != last_pixel_format_
+            || requested_threads != active_sws_threads_)
         {
             width_ = source->width;
             height_ = source->height;
             last_pixel_format_ = source_format;
             sws_ = allocScaler(width_, height_, last_pixel_format_, AV_PIX_FMT_BGR24,
-                              options_.sws_threads, sws_threaded_);
+                              requested_threads, sws_threaded_);
             if (!sws_)
             {
                 const char* name = av_get_pix_fmt_name(last_pixel_format_);
                 throw DecodingError(std::format("cannot convert {}x{} {} frames to BGR8", width_, height_,
                                                 name ? name : "unknown"));
             }
+            active_sws_threads_ = requested_threads;
         }
         /* Prefer the time stamp the decoder propagated with this frame; it
            belongs to the access unit that produced it. */
@@ -821,6 +848,11 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
     {
         std::string message = std::format("failed to receive frames from decoder: {}",
                                           av_make_error_string(errbuf, sizeof(errbuf), result));
+        if (result == AVERROR_INVALIDDATA)
+        {
+            hardware_probe_packets_.clear();
+            throw DecodingError(message);
+        }
         if (hardware_ && fallBackToNextCandidate(message))
             return count;
         throw DecodingError(message);
@@ -829,7 +861,8 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
     {
         hardware_probe_packets_.clear();
     }
-    else if (hardware_ && hardware_probe_packets_.size() >= hardware_probe_limit)
+    else if (probing && !hardware_candidate_proven_ && !replaying_probe_packets_
+             && hardware_probe_packets_.size() >= hardware_probe_limit)
     {
         std::vector<FrameDataPtr> replay_packets = std::move(hardware_probe_packets_);
         hardware_probe_packets_.clear();
@@ -881,6 +914,12 @@ bool StreamDecoder::discardFrame(const AVFrame* frame) noexcept
             awaiting_keyframe_ = false;
         }
     }
+    // Some hardware decoders (notably CUVID) ignore skip_frame. Enforce the
+    // output policy before downloading or converting such frames as well.
+    if (decode_frames_ == DecodeFrames::None
+        || (decode_frames_ == DecodeFrames::Key && !isKeyFrame(frame))
+        || (decode_frames_ == DecodeFrames::Intra && frame->pict_type != AV_PICTURE_TYPE_I))
+        return true;
     if (!options_.drop_corrupt_frames)
         return false;
     /* libavcodec reports the damage for the codecs it can conceal. For the rest

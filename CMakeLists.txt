@@ -270,6 +270,7 @@ if(BUILD_BENCHMARKS)
     find_package(ament_cmake_gtest REQUIRED)
     set(benchmarks
         latency_bench
+        multi_stream_bench
         loss_bench
         soak
         nalscope
@@ -282,9 +283,22 @@ if(BUILD_BENCHMARKS)
             ${bench} PRIVATE src test ${CMAKE_CURRENT_BINARY_DIR} ${FFMPEG_INCLUDE_DIRS}
         )
         target_link_libraries(${bench} ${PROJECT_NAME}_core ${FFMPEG_LIBRARIES})
-        # image_transport only for the one that drives the real plugins
-        if(bench STREQUAL "latency_bench")
+        # These benchmarks drive the real image_transport plugins.
+        if(bench STREQUAL "latency_bench" OR bench STREQUAL "multi_stream_bench")
             target_link_libraries(${bench} image_transport::image_transport)
+        endif()
+        if(bench STREQUAL "multi_stream_bench")
+            find_program(
+                IMAGE_TRANSPORT_REPUBLISH
+                NAMES republish
+                PATHS "${image_transport_DIR}/../../../lib/image_transport"
+                NO_DEFAULT_PATH
+                REQUIRED
+            )
+            target_compile_definitions(
+                ${bench}
+                PRIVATE "RTSP_REPUBLISH_EXECUTABLE=\"${IMAGE_TRANSPORT_REPUBLISH}\""
+            )
         endif()
     endforeach()
 endif()
@@ -302,6 +316,7 @@ if(BUILD_TESTING)
         test_frame_fill
         test_frame_injector
         test_stream_decoder
+        test_subscriber_performance
         test_stream_encoder
         test_roundtrip
         test_host_override
@@ -325,6 +340,9 @@ if(BUILD_TESTING)
         ament_auto_add_gtest(${test_name} test/${test_name}.cpp TIMEOUT 180)
         if(TARGET ${test_name})
             target_link_libraries(${test_name} ${PROJECT_NAME}_core)
+            if(test_name STREQUAL "test_subscriber_performance")
+                target_sources(${test_name} PRIVATE src/subscriber_plugin.cpp)
+            endif()
             set_tests_properties(${test_name} PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=157")
         endif()
     endforeach()

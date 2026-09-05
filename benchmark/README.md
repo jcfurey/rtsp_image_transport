@@ -52,6 +52,61 @@ that exercises `max_latency`, the reconnect policy and the decoder stall
 watchdog, because it goes through `SubscriberPlugin` rather than driving the
 client directly.
 
+### `multi_stream_bench STREAMS WIDTH HEIGHT SECONDS {h264|h265|mixed} [hardware|software] [direct|ros]`
+
+Runs one to four independent raw ROS image topics through separate
+`image_transport republish` processes, each serving its own RTSP output.
+Subscribers decode every output through the real RTSP plugin. `h264` and
+`h265` use the selected codec on every route; `mixed`
+alternates H.264 and H.265; the default uses hardware encoding and CUDA
+decoding when available. `software` disables both. The default `direct` output
+decodes in the harness. `ros` starts a second set of independent republish
+processes (`in_transport:=rtsp`, `out_transport:=raw`), then verifies each raw
+ROS output topic. This covers both bridge directions, including publication
+and delivery of decoded images over ROS.
+
+Both raw ROS legs explicitly use best-effort, keep-last, depth-one QoS on
+publishers and subscribers. The advertised RTSP URL topics remain reliable
+and transient-local. At 1080p, each decoded BGR image is about 6 MiB, so DDS
+delivery and receive-buffer limits are part of the `ros` measurement.
+
+For example, after building with `BUILD_BENCHMARKS=ON`:
+
+    ROS_DOMAIN_ID=231 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST ROS_IP=127.0.0.1 \
+        build/rtsp_image_transport/multi_stream_bench 4 1920 1080 10 h264
+
+    ROS_DOMAIN_ID=231 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST ROS_IP=127.0.0.1 \
+        build/rtsp_image_transport/multi_stream_bench 4 1920 1080 30 mixed hardware ros
+
+The benchmark sends each input at 30 Hz, warms up for five seconds, measures
+for `SECONDS`, then pauses input 0 for three seconds. It reports each output's
+frame rate, latency percentiles, pixel identity, and frame rate while input 0
+is paused. It reports CPU use separately for ROS-to-RTSP relays, RTSP-to-ROS
+relays, and the harness, in CPU cores (1.0 means one fully occupied core).
+In `direct` mode the harness includes decoding; in `ros` mode it includes
+receipt of raw ROS images. Latencies cover the complete route. The source
+precomputes eight frames per input; reported harness memory includes them.
+
+A distinct pixel marker and RTSP URL identify each route. Missing streams,
+crossed outputs, or loss of another stream during the pause return a nonzero
+exit status. Frame rate and latency are measurements without pass/fail limits.
+Each invocation uses unique topic names, ephemeral RTSP ports, and stops its
+own relay processes when it finishes. Run scaling trials sequentially in an
+unused ROS domain so they do not compete with each other or a running vehicle.
+
+The audit also tested Cyclone DDS with a per-process 4 MiB receive-buffer
+request. To reproduce that configuration on a host whose socket-buffer limit
+allows it:
+
+    CYCLONEDDS_URI='<CycloneDDS><Domain><Internal><SocketReceiveBufferSize min="4MiB"/></Internal></Domain></CycloneDDS>' \
+    RMW_IMPLEMENTATION=rmw_cyclonedds_cpp ROS_DOMAIN_ID=231 \
+    ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST ROS_IP=127.0.0.1 \
+        build/rtsp_image_transport/multi_stream_bench 4 1920 1080 30 h265 hardware ros
+
+Four raw 1080p outputs still showed UDP receive-buffer drops with this setting
+on the audit host. Keep raw ROS delivery measurements separate from direct
+RTSP output measurements when assessing capacity.
+
 ### `soak {udp|tcp} {h264|h265} SECONDS LABEL`
 
 `StreamServer` and `StreamClient` directly, with no ROS graph, decoding on a

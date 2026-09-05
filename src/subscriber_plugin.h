@@ -30,6 +30,8 @@
 #include <rclcpp/timer.hpp>
 #include <std_msgs/msg/string.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <mutex>
@@ -47,6 +49,7 @@ class RTSP_IMAGE_TRANSPORT_EXPORT SubscriberPlugin
 {
 public:
     SubscriberPlugin();
+    ~SubscriberPlugin() override;
     void shutdown() override;
     std::string getTransportName() const override;
 
@@ -66,6 +69,12 @@ protected:
     void internalCallback(const std_msgs::msg::String::ConstSharedPtr& message, const Callback& callback) override;
 
 private:
+    friend class SubscriberPluginTestPeer;
+    struct QueuedFrame
+    {
+        FrameDataPtr data;
+        std::chrono::steady_clock::time_point received_at;
+    };
     void receiveDataStream(VideoCodec codec, MediaSubsession* subsession, const FrameDataPtr& data);
     void subsessionStarted(VideoCodec codec, MediaSubsession* subsession);
     void sessionFailed(int code, const std::string& message);
@@ -74,12 +83,13 @@ private:
     void sessionTimeout();
     void processFrame();
     bool useReceiveTimestamps() const;
-    void reportMissingHwDecoder();
+    void reportMissingHwDecoder(const StreamDecoder& decoder);
     void reconnect();
     void cooldownTimerCallback();
-    void pushFrame(const FrameDataPtr& frame);
-    FrameDataPtr popFrame();
-    rclcpp::Duration frameLag() const noexcept;
+    void pushFrame(const FrameDataPtr& frame,
+                   std::chrono::steady_clock::time_point received_at = std::chrono::steady_clock::now());
+    QueuedFrame popFrame();
+    void trimQueuedFrames();  // caller holds queue_mutex_
     void clearQueuedFrames();
     void setupParameters(const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& node_parameters);
     void updateParameters();
@@ -107,7 +117,7 @@ private:
     std::function<void()> notify_frame_;
     Callback callback_;
     std::shared_ptr<StreamClient> client_;
-    std::shared_ptr<StreamDecoder> decoder_;
+    std::atomic<std::shared_ptr<StreamDecoder>> decoder_;
     /* Watchdog for a decoder that is being fed but produces nothing. The
        session timeout cannot see this: it watches for RTP arriving, and here
        RTP arrives normally while the decoder rejects every slice. Wall clock
@@ -118,7 +128,13 @@ private:
     std::size_t decoder_stalls_ = 0;
 
     mutable std::mutex queue_mutex_;
-    std::deque<FrameDataPtr> queue_;
+    std::deque<QueuedFrame> queue_;
+    std::size_t queued_bytes_ = 0;
+    bool bound_queue_ = true;
+    // The first access unit may carry parameter sets supplied only in SDP.
+    bool preserve_first_frame_ = true;
+    static constexpr std::size_t MAX_QUEUED_FRAMES = 120;
+    static constexpr std::size_t MAX_QUEUED_BYTES = 64u << 20;
 };
 
 }  // namespace rtsp_image_transport
