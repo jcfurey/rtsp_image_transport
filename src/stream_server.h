@@ -55,6 +55,7 @@ public:
     StreamServer& operator=(StreamServer&&) = delete;
     void sendAccessUnit(const std::vector<FrameDataPtr>& frames) noexcept;
     bool hasActiveStreams() const noexcept;
+    std::size_t activeStreamCount() const noexcept;
     VideoCodec codec() const noexcept;
     unsigned preferredPacketSize() const noexcept;
     unsigned maxPacketSize() const noexcept;
@@ -80,7 +81,7 @@ private:
     void stopOnLoop();
 
     rclcpp::Logger logger_;
-    VideoCodec codec_;
+    std::atomic<VideoCodec> codec_;
     std::string topic_name_;
     unsigned udp_packet_size_;
     std::string url_;
@@ -89,6 +90,9 @@ private:
        destroyed in this particular order. */
     mutable std::mutex streams_mutex_;
     StreamMapping streams_;
+    // Only accessed on the Live555 thread. A departing client must remove its
+    // SDP sink before another DESCRIBE can inspect a dangling pointer.
+    std::map<FramedSource*, VideoRTPSink*> unicast_sinks_;
     std::shared_ptr<EventLoop> loop_;
     std::shared_ptr<Groupsock> rtp_mcast_, rtcp_mcast_;
     RTSPServer* rtsp_;

@@ -27,6 +27,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <deque>
 #include <mutex>
 #include <vector>
@@ -56,6 +57,8 @@ public:
        source with a stuck clock), where the span above never triggers. Sized
        well past any sane number of NAL units per picture. */
     static constexpr std::size_t MAX_QUEUE_LENGTH = 4096;
+    static constexpr std::size_t MAX_QUEUE_BYTES = 64u << 20;
+    static constexpr std::size_t MAX_ACCESS_UNIT_BYTES = 16u << 20;
 
     static FrameInjector* createNew(UsageEnvironment& env);
     ~FrameInjector();
@@ -84,6 +87,7 @@ private:
     {
         std::vector<FrameDataPtr> frames;
         std::size_t next = 0;
+        std::size_t bytes = 0;
 
         std::size_t remaining() const noexcept
         {
@@ -103,11 +107,12 @@ private:
        its bounds. Call with frame_queue_mutex_ held. */
     void trimQueue();
 
-    bool is_shutdown_;
+    std::atomic<bool> is_shutdown_;
     EventTriggerId deliver_frame_trigger_;
     mutable std::mutex frame_queue_mutex_;
     std::deque<AccessUnit> frame_queue_;
     std::size_t queued_nals_ = 0;
+    std::size_t queued_bytes_ = 0;
     std::size_t dropped_ = 0;
     /* Whether the most recent deliverFrame() emptied its access unit. Written
        on the Live555 thread in deliverFrame and read from the framer's

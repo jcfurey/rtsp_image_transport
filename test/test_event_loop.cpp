@@ -18,6 +18,7 @@
  *
  ****************************************************************************/
 #include "event_loop.h"
+#include "callback_gate.h"
 
 #include <gtest/gtest.h>
 
@@ -132,4 +133,19 @@ TEST(EventLoop, ManyLoopsCanCoexistAndShutDown)
         loop->stop();
     loops.clear();
     SUCCEED();
+}
+
+TEST(CallbackGate, QueuedCallbacksBecomeHarmlessAfterOwnerDestruction)
+{
+    std::function<void()> queued;
+    unsigned calls = 0;
+    {
+        auto gate = std::make_shared<CallbackGate>();
+        auto owner = std::make_unique<unsigned>(42);
+        queued = gate->wrap([raw = owner.get(), &calls] { calls += *raw; });
+        queued();
+        gate->close();
+    }
+    queued(); // still queued in an executor after both owner and handle died
+    EXPECT_EQ(calls, 42u);
 }

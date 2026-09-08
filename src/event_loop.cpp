@@ -83,16 +83,20 @@ void EventLoop::run()
         thread_id_ = std::this_thread::get_id();
     }
     env_->taskScheduler().doEventLoop(&quit_flag_);
+    // Keep post() routing work here until the final queued task has finished.
+    // Publishing running_=false before draining allowed a foreign caller to
+    // tear down Live555 objects concurrently with that drain.
+    for (;;)
     {
+        drainPosted();
         std::lock_guard<std::mutex> lock{mutex_};
-        running_ = false;
+        if (posted_.empty())
+        {
+            running_ = false;
+            finished_.notify_all();
+            break;
+        }
     }
-    /* Tasks posted before the loop noticed the quit flag would otherwise
-       leave their callers waiting forever. Drained here, after running_ went
-       false under the mutex, so no new task can slip in between. */
-    drainPosted();
-    std::lock_guard<std::mutex> lock{mutex_};
-    finished_.notify_all();
 }
 
 void EventLoop::dispatchPosted(void* data)

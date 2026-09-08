@@ -49,6 +49,7 @@ void FrameInjector::shutdown()
     is_shutdown_ = true;
     frame_queue_.clear();
     queued_nals_ = 0;
+    queued_bytes_ = 0;
 }
 
 void FrameInjector::injectAccessUnit(const std::vector<FrameDataPtr>& frames)
@@ -58,8 +59,24 @@ void FrameInjector::injectAccessUnit(const std::vector<FrameDataPtr>& frames)
     std::lock_guard<std::mutex> lock{frame_queue_mutex_};
     if (is_shutdown_)
         return;
-    frame_queue_.push_back(AccessUnit{frames});
+    if (frames.size() > MAX_QUEUE_LENGTH)
+    {
+        dropped_ += frames.size();
+        return;
+    }
+    std::size_t bytes = 0;
+    for (const auto& frame : frames)
+    {
+        if (!frame || frame->length() > MAX_ACCESS_UNIT_BYTES - bytes)
+        {
+            dropped_ += frames.size();
+            return;
+        }
+        bytes += frame->length();
+    }
+    frame_queue_.push_back(AccessUnit{frames, 0, bytes});
     queued_nals_ += frames.size();
+    queued_bytes_ += bytes;
     trimQueue();
     envir().taskScheduler().triggerEvent(deliver_frame_trigger_, this);
 }
@@ -75,7 +92,7 @@ void FrameInjector::trimQueue()
         const std::size_t first_droppable = frame_queue_.front().next == 0 ? 0 : 1;
         if (first_droppable >= frame_queue_.size() - 1)
             break;
-        const bool too_many = queued_nals_ > MAX_QUEUE_LENGTH;
+        const bool too_many = queued_nals_ > MAX_QUEUE_LENGTH || queued_bytes_ > MAX_QUEUE_BYTES;
         const bool too_old =
             (frame_queue_.back().stamp() - frame_queue_[first_droppable].stamp()).nanoseconds()
             > MAX_QUEUE_SPAN_NS;
@@ -84,6 +101,7 @@ void FrameInjector::trimQueue()
 
         const std::size_t count = frame_queue_[first_droppable].remaining();
         queued_nals_ -= count;
+        queued_bytes_ -= frame_queue_[first_droppable].bytes;
         dropped_ += count;
         frame_queue_.erase(frame_queue_.begin() + static_cast<std::ptrdiff_t>(first_droppable));
     }
@@ -126,6 +144,8 @@ void FrameInjector::deliverFrame()
         AccessUnit& access_unit = frame_queue_.front();
         frame = access_unit.frames[access_unit.next++];
         --queued_nals_;
+        queued_bytes_ -= frame->length();
+        access_unit.bytes -= frame->length();
         last_ended_access_unit_ = access_unit.next == access_unit.frames.size();
         if (last_ended_access_unit_)
             frame_queue_.pop_front();

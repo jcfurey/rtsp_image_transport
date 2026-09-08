@@ -405,6 +405,7 @@ void Live555Client::setupNextSubsession(Live555Client* c) noexcept
                whole packets under buffer pressure, and a lost slice leaves its
                macroblocks unwritten, which surfaces as green bands in the
                decoded image. */
+            c->rearmTimeout();
             c->sendSetupCommand(*c->subsession_, continueAfterSETUP, False, over_tcp ? True : False);
             return;
         }

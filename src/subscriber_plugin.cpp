@@ -29,6 +29,7 @@
 
 #include <rclcpp/detail/add_guard_condition_to_rcl_wait_set.hpp>
 #include <rclcpp/waitable.hpp>
+#include <rclcpp/create_subscription.hpp>
 
 #include <atomic>
 #include <functional>
@@ -162,7 +163,7 @@ struct RTSP_IMAGE_TRANSPORT_NO_EXPORT SubscriberPlugin::Config
     int video_subsession = 0;
     bool rtp_over_tcp = false;
     int rtp_buffer_size = static_cast<int>(DEFAULT_RTP_BUFFER_SIZE);
-    ReconnectPolicy reconnect_policy = ReconnectOnTimeout;
+    ReconnectPolicy reconnect_policy = ReconnectAlways;
     std::chrono::milliseconds timeout = 2s;
     std::chrono::milliseconds reconnect_minwait = 100ms;
     std::chrono::milliseconds reconnect_maxwait = 30s;
@@ -178,7 +179,7 @@ struct RTSP_IMAGE_TRANSPORT_NO_EXPORT SubscriberPlugin::Config
     std::chrono::milliseconds decoder_stall_timeout = 2s;
 };
 
-using SuperClass = image_transport::SimpleSubscriberPlugin<std_msgs::msg::String>;
+using SuperClass = image_transport::SubscriberPlugin;
 
 SubscriberPlugin::SubscriberPlugin()
     : SuperClass(), logger_(rclcpp::get_logger("rtsp_image_transport")), failed_(false),
@@ -188,10 +189,32 @@ SubscriberPlugin::SubscriberPlugin()
     global_initialize();
 }
 
-SubscriberPlugin::~SubscriberPlugin() = default;
+SubscriberPlugin::~SubscriberPlugin()
+{
+    shutdown();
+}
+
+void SubscriberPlugin::disconnectClient()
+{
+    // reset() alone is not a callback barrier: an in-flight Live555 callback
+    // may hold the last shared_ptr and keep invoking handlers after it returns.
+    if (client_)
+        client_->disconnect();
+    session_finished_ = false;
+    std::lock_guard<std::mutex> lock{queue_mutex_};
+    pending_events_.clear();
+}
 
 void SubscriberPlugin::shutdown()
 {
+    std::lock_guard<std::recursive_mutex> state_lock{callback_gate_->mutex};
+    if (shutdown_)
+        return;
+    shutdown_ = true;
+    callback_gate_->close();
+    ++connection_generation_;
+    param_cb_handle_.reset();
+    disconnectClient();
     frame_timer_.reset();
     notify_frame_ = {};
     if (auto waitables = node_waitables_.lock(); waitables && scheduled_cb_)
@@ -203,13 +226,10 @@ void SubscriberPlugin::shutdown()
         cooldown_cb_group_.reset();
         cooldown_timer_.reset();
     }
-    /* Destroy, don't just disconnect: ~StreamClient stops the Live555 loop
-       BEFORE tearing objects down, whereas a plain disconnect() from this
-       executor thread raced the loop's in-flight frame delivery. */
     client_.reset();
     decoder_.store(nullptr);
     clearQueuedFrames();
-    SuperClass::shutdown();
+    url_subscription_.reset();
 }
 
 std::string SubscriberPlugin::getTransportName() const
@@ -217,12 +237,24 @@ std::string SubscriberPlugin::getTransportName() const
     return "rtsp";
 }
 
+std::string SubscriberPlugin::getTopic() const
+{
+    std::lock_guard<std::recursive_mutex> lock{callback_gate_->mutex};
+    return url_subscription_ ? url_subscription_->get_topic_name() : std::string();
+}
+
+std::size_t SubscriberPlugin::getNumPublishers() const
+{
+    std::lock_guard<std::recursive_mutex> lock{callback_gate_->mutex};
+    return url_subscription_ ? url_subscription_->get_publisher_count() : 0;
+}
+
 /* True when images should be stamped with the time they arrived rather than
    with the sender's clock. Re-evaluated per frame because use_sim_time can be
    switched at runtime. */
 bool SubscriberPlugin::useReceiveTimestamps() const
 {
-    switch (config_->timestamp_source)
+    switch (timestamp_source_.load())
     {
         case TimestampFromSender:
             return false;
@@ -241,6 +273,10 @@ bool SubscriberPlugin::useReceiveTimestamps() const
 void SubscriberPlugin::subscribeImpl(rclcpp::Node* node, const std::string& base_topic, const Callback& callback,
                                      rmw_qos_profile_t custom_qos, rclcpp::SubscriptionOptions options)
 {
+    if (shutdown_)
+        callback_gate_ = std::make_shared<CallbackGate>();
+    std::lock_guard<std::recursive_mutex> state_lock{callback_gate_->mutex};
+    shutdown_ = false;
     /* The transport topic carries a latched URL rather than image data, so a
        late joining subscriber has to be able to fetch the current value. That
        fixes reliability, durability and history; every other policy the caller
@@ -251,19 +287,24 @@ void SubscriberPlugin::subscribeImpl(rclcpp::Node* node, const std::string& base
     custom_qos.durability = RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
     /* An incompatible publisher otherwise just means no video, with nothing in
        the log to explain it. */
-    options.event_callbacks.incompatible_qos_callback =
+    options.event_callbacks.incompatible_qos_callback = callback_gate_->wrap(
         [this](rclcpp::QOSRequestedIncompatibleQoSInfo& info)
-    {
-        RCLCPP_ERROR(logger_,
-                     "[%s] the RTSP URL publisher offers an incompatible QoS policy (%d); this transport needs "
-                     "RELIABLE and TRANSIENT_LOCAL, so no video will arrive",
-                     topic_name_.c_str(), static_cast<int>(info.last_policy_kind));
-    };
-    SuperClass::subscribeImpl(node, base_topic, callback, custom_qos, options);
+        {
+            RCLCPP_ERROR(
+                logger_,
+                "[%s] the RTSP URL publisher offers an incompatible QoS policy (%d); this transport needs "
+                "RELIABLE and TRANSIENT_LOCAL, so no video will arrive",
+                topic_name_.c_str(), static_cast<int>(info.last_policy_kind));
+        });
+    std::function<void(std_msgs::msg::String::ConstSharedPtr)> on_url = callback_gate_->wrap(
+        [this, callback](std_msgs::msg::String::ConstSharedPtr msg) { internalCallback(msg, callback); });
+    url_subscription_ = node->create_subscription<std_msgs::msg::String>(
+        base_topic + "/rtsp", rclcpp::QoS(rclcpp::QoSInitialization::from_rmw(custom_qos), custom_qos),
+        std::move(on_url), options);
     logger_ = node->get_logger();
     clock_ = node->get_clock();
     ScheduledCB::SharedPtr scheduled_cb =
-        std::make_shared<ScheduledCB>(std::bind(&SubscriberPlugin::processFrame, this));
+        std::make_shared<ScheduledCB>(callback_gate_->wrap([this] { processFrame(); }));
     scheduled_cb_ = scheduled_cb;
     /* Cached so the hot receive path does not need a dynamic_cast per NAL unit */
     notify_frame_ = [scheduled_cb]() { scheduled_cb->trigger(); };
@@ -278,7 +319,7 @@ void SubscriberPlugin::subscribeImpl(rclcpp::Node* node, const std::string& base
     param_base_name_ = topicParameterBase(*node, base_topic, getTransportName());
     setupParameters(node_param_.lock());
     param_cb_handle_ = node_param_.lock()->add_post_set_parameters_callback(
-        [this](const std::vector<rclcpp::Parameter>&) { this->updateParameters(); });
+        callback_gate_->wrap([this](const std::vector<rclcpp::Parameter>&) { updateParameters(); }));
     updateParameters();
 }
 #endif
@@ -288,16 +329,26 @@ void SubscriberPlugin::subscribeImpl(image_transport::RequiredInterfaces node_in
                                      const std::string& base_topic, const Callback& callback,
                                      rclcpp::QoS custom_qos, rclcpp::SubscriptionOptions options)
 {
+    if (shutdown_)
+        callback_gate_ = std::make_shared<CallbackGate>();
+    std::lock_guard<std::recursive_mutex> state_lock{callback_gate_->mutex};
+    shutdown_ = false;
     custom_qos.reliable().keep_last(1).transient_local();
-    options.event_callbacks.incompatible_qos_callback =
+    options.event_callbacks.incompatible_qos_callback = callback_gate_->wrap(
         [this](rclcpp::QOSRequestedIncompatibleQoSInfo& info)
-    {
-        RCLCPP_ERROR(logger_,
-                     "[%s] the RTSP URL publisher offers an incompatible QoS policy (%d); this transport needs "
-                     "RELIABLE and TRANSIENT_LOCAL, so no video will arrive",
-                     topic_name_.c_str(), static_cast<int>(info.last_policy_kind));
-    };
-    SuperClass::subscribeImpl(node_interfaces, base_topic, callback, custom_qos, options);
+        {
+            RCLCPP_ERROR(
+                logger_,
+                "[%s] the RTSP URL publisher offers an incompatible QoS policy (%d); this transport needs "
+                "RELIABLE and TRANSIENT_LOCAL, so no video will arrive",
+                topic_name_.c_str(), static_cast<int>(info.last_policy_kind));
+        });
+    std::function<void(std_msgs::msg::String::ConstSharedPtr)> on_url = callback_gate_->wrap(
+        [this, callback](std_msgs::msg::String::ConstSharedPtr msg) { internalCallback(msg, callback); });
+    auto parameters_interface = node_interfaces.get_node_parameters_interface();
+    auto topics_interface = node_interfaces.get_node_topics_interface();
+    url_subscription_ = rclcpp::create_subscription<std_msgs::msg::String>(
+        parameters_interface, topics_interface, base_topic + "/rtsp", custom_qos, std::move(on_url), options);
 
     auto node_base = node_interfaces.get_node_base_interface();
     auto node_timers = node_interfaces.get_node_timers_interface();
@@ -314,12 +365,12 @@ void SubscriberPlugin::subscribeImpl(image_transport::RequiredInterfaces node_in
 
     setupParameters(node_parameters);
     param_cb_handle_ = node_parameters->add_post_set_parameters_callback(
-        [this](const std::vector<rclcpp::Parameter>&) { this->updateParameters(); });
+        callback_gate_->wrap([this](const std::vector<rclcpp::Parameter>&) { updateParameters(); }));
     updateParameters();
 
     scheduled_cb_group_ = node_base->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     frame_timer_ = std::make_shared<rclcpp::WallTimer<rclcpp::VoidCallbackType>>(
-        2ms, std::bind(&SubscriberPlugin::processFrame, this), node_base->get_context());
+        2ms, callback_gate_->wrap([this] { processFrame(); }), node_base->get_context());
     node_timers->add_timer(frame_timer_, scheduled_cb_group_);
     RCLCPP_INFO(logger_, "[%s] using image_transport node-interface API with executor timer frame delivery",
                 topic_name_.c_str());
@@ -344,6 +395,13 @@ void SubscriberPlugin::subscribeImpl(image_transport::RequiredInterfaces node_in
 
 void SubscriberPlugin::internalCallback(const std_msgs::msg::String::ConstSharedPtr& msg, const Callback& callback)
 {
+    std::lock_guard<std::recursive_mutex> state_lock{callback_gate_->mutex};
+    if (shutdown_)
+        return;
+    disconnectClient();
+    ++connection_generation_;
+    decoder_.store(nullptr);
+    clearQueuedFrames();
     RCLCPP_DEBUG(logger_, "[%s] received updated RTSP URL: %s", topic_name_.c_str(), msg->data.c_str());
     failed_ = false;
     old_lag_ = 0s;
@@ -365,13 +423,15 @@ void SubscriberPlugin::internalCallback(const std_msgs::msg::String::ConstShared
         client_->setReceiveStreamDataHandler(std::bind(&SubscriberPlugin::receiveDataStream, this,
                                                        std::placeholders::_1, std::placeholders::_2,
                                                        std::placeholders::_3));
-        client_->setSessionTimeoutHandler(std::bind(&SubscriberPlugin::sessionTimeout, this));
+        client_->setSessionTimeoutHandler([this] { scheduleEvent([this] { sessionTimeout(); }); });
         client_->setSubsessionStartedHandler(
-            std::bind(&SubscriberPlugin::subsessionStarted, this, std::placeholders::_1, std::placeholders::_2));
-        client_->setSessionStartedHandler(std::bind(&SubscriberPlugin::sessionStarted, this));
+            [this](VideoCodec codec, MediaSubsession*)
+            { scheduleEvent([this, codec] { subsessionStarted(codec, nullptr); }); });
+        client_->setSessionStartedHandler([this] { scheduleEvent([this] { sessionStarted(); }); });
         client_->setSessionFailedHandler(
-            std::bind(&SubscriberPlugin::sessionFailed, this, std::placeholders::_1, std::placeholders::_2));
-        client_->setSessionFinishedHandler(std::bind(&SubscriberPlugin::sessionFinished, this));
+            [this](int code, const std::string& message)
+            { scheduleEvent([this, code, message] { sessionFailed(code, message); }); });
+        client_->setSessionFinishedHandler([this] { scheduleEvent([this] { sessionFinished(); }); });
         client_->connect();
     }
     catch (std::exception& e)
@@ -395,6 +455,17 @@ void SubscriberPlugin::subsessionStarted(VideoCodec codec, MediaSubsession* subs
                 videoCodecName(codec).c_str(), decoder->description().c_str(), client_->url().c_str());
     reportMissingHwDecoder(*decoder);
     decoder_.store(std::move(decoder));
+    failed_ = false;
+}
+
+void SubscriberPlugin::scheduleEvent(std::function<void()> event)
+{
+    {
+        std::lock_guard<std::mutex> lock{queue_mutex_};
+        pending_events_.push_back(std::move(event));
+    }
+    if (notify_frame_)
+        notify_frame_();
 }
 
 /* Hardware decoding was asked for but we ended up in software. The device probe
@@ -557,6 +628,9 @@ void SubscriberPlugin::setupParameters(
 
 void SubscriberPlugin::updateParameters()
 {
+    std::lock_guard<std::recursive_mutex> state_lock{callback_gate_->mutex};
+    if (shutdown_)
+        return;
     static constexpr int LVL_CODEC = 1;
     static constexpr int LVL_CONNECTION = 2;
 
@@ -610,6 +684,7 @@ void SubscriberPlugin::updateParameters()
         changelevel |= LVL_CONNECTION;
 
     *config_ = new_config;
+    timestamp_source_.store(config_->timestamp_source);
     {
         std::lock_guard<std::mutex> lock{queue_mutex_};
         bound_queue_ = config_->max_latency > 0ms;
@@ -626,19 +701,10 @@ void SubscriberPlugin::updateParameters()
         if (client_)
         {
             client_->setSessionTimeout(config_->timeout);
-            if (changelevel & LVL_CONNECTION)
+            if (changelevel & (LVL_CONNECTION | LVL_CODEC))
             {
                 reconnect();
                 return;
-            }
-            if ((changelevel & LVL_CODEC) && decoder_.load())
-            {
-                auto decoder = std::make_shared<StreamDecoder>(client_->codec(), config_->decoder, logger_);
-                RCLCPP_INFO(logger_, "[%s] start decoding %s with %s from %s", topic_name_.c_str(),
-                            videoCodecName(client_->codec()).c_str(), decoder->description().c_str(),
-                            client_->url().c_str());
-                reportMissingHwDecoder(*decoder);
-                decoder_.store(std::move(decoder));
             }
         }
         if (auto decoder = decoder_.load())
@@ -658,12 +724,28 @@ void SubscriberPlugin::updateParameters()
 
 void SubscriberPlugin::processFrame()
 {
-    using namespace std::chrono_literals;
-    std::shared_ptr<StreamDecoder> decoder = decoder_.load();
-    if (failed_ || !decoder)
+    const auto gate = callback_gate_;
+    std::lock_guard<std::recursive_mutex> state_lock{gate->mutex};
+    if (shutdown_)
         return;
+    using namespace std::chrono_literals;
     try
     {
+        for (;;)
+        {
+            std::function<void()> event;
+            {
+                std::lock_guard<std::mutex> lock{queue_mutex_};
+                if (pending_events_.empty())
+                    break;
+                event = std::move(pending_events_.front());
+                pending_events_.pop_front();
+            }
+            event();
+        }
+        std::shared_ptr<StreamDecoder> decoder = decoder_.load();
+        if (failed_ || !decoder)
+            return;
         /* The rungs of the drop ladder, derived from the latency budget. The
            queue settles on whichever one matches how far the decoder is
            behind, so these thresholds are what steady-state latency converges
@@ -729,7 +811,12 @@ void SubscriberPlugin::processFrame()
                     decoded->header.frame_id = config_->frame_id;
                     sensor_msgs::msg::Image::ConstSharedPtr img(std::move(decoded));
                     produced = true;
-                    callback_(img);
+                    // The user may shut down this subscription in its callback.
+                    const auto callback = callback_;
+                    const auto generation = connection_generation_;
+                    callback(img);
+                    if (!gate->active || generation != connection_generation_)
+                        return;
                 }
             }
             const auto now = std::chrono::steady_clock::now();
@@ -775,10 +862,14 @@ void SubscriberPlugin::processFrame()
     }
     catch (const DecodingError& e)
     {
+        if (!gate->active)
+            return;
         RCLCPP_WARN(logger_, "[%s] %s", topic_name_.c_str(), e.what());
     }
     catch (const std::exception& e)
     {
+        if (!gate->active)
+            return;
         RCLCPP_ERROR(logger_, "[%s] %s", topic_name_.c_str(), e.what());
         failed_ = true;
         clearQueuedFrames();
@@ -790,10 +881,16 @@ void SubscriberPlugin::processFrame()
     bool pending;
     {
         std::lock_guard<std::mutex> lock{queue_mutex_};
-        pending = !queue_.empty();
+        pending = !queue_.empty() || !pending_events_.empty();
     }
     if (pending && notify_frame_)
         notify_frame_();
+    if (!pending && session_finished_)
+    {
+        session_finished_ = false;
+        if (reconnectAfterNormalEnd(config_->reconnect_policy))
+            reconnect();
+    }
 }
 
 void SubscriberPlugin::sessionStarted()
@@ -826,17 +923,18 @@ void SubscriberPlugin::sessionFailed(int code, const std::string& message)
 void SubscriberPlugin::sessionFinished()
 {
     RCLCPP_INFO(logger_, "[%s] end of video stream", topic_name_.c_str());
-    if (reconnectAfterNormalEnd(config_->reconnect_policy))
-    {
-        reconnect();
-    }
+    // The extractor may have queued its final picture immediately before EOF.
+    // Drain it on the executor before reconnect() discards the session queue.
+    session_finished_ = true;
 }
 
 void SubscriberPlugin::reconnect()
 {
-    if (!client_)
+    if (shutdown_ || !client_)
         return;
-    client_->disconnect();
+    disconnectClient();
+    ++connection_generation_;
+    decoder_.store(nullptr);
     client_->setVideoSubsession(static_cast<std::size_t>(config_->video_subsession));
     client_->setRtpOverTcp(config_->rtp_over_tcp);
     client_->setRtpBufferSize(static_cast<unsigned>(config_->rtp_buffer_size));
@@ -845,22 +943,26 @@ void SubscriberPlugin::reconnect()
     rclcpp::node_interfaces::NodeTimersInterface::SharedPtr nt = node_timers_.lock();
     if (nb && nt)
     {
-        /* Runs on ROS executor threads AND the Live555 handler thread (via
-           the session failed/timeout handlers) — the cooldown state needs
-           the lock. */
+        // Session events and timer callbacks are serialized by callback_gate_.
         std::lock_guard<std::mutex> lock{cooldown_mutex_};
         RCLCPP_INFO(logger_, "[%s] new connection attempt in %0.3lf seconds", topic_name_.c_str(),
                     1e-3 * cooldown_.count());
         cooldown_cb_group_ = nb->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         cooldown_timer_ = std::make_shared<rclcpp::WallTimer<rclcpp::VoidCallbackType>>(
-            cooldown_, std::bind(&SubscriberPlugin::cooldownTimerCallback, this), nb->get_context());
+            cooldown_,
+            callback_gate_->wrap([this, generation = connection_generation_]
+                                 { cooldownTimerCallback(generation); }),
+            nb->get_context());
         nt->add_timer(cooldown_timer_, cooldown_cb_group_);
         cooldown_ = nextReconnectCooldown(cooldown_, config_->reconnect_maxwait);
     }
 }
 
-void SubscriberPlugin::cooldownTimerCallback()
+void SubscriberPlugin::cooldownTimerCallback(std::uint64_t generation)
 {
+    std::lock_guard<std::recursive_mutex> state_lock{callback_gate_->mutex};
+    if (shutdown_ || generation != connection_generation_)
+        return;
     {
         std::lock_guard<std::mutex> lock{cooldown_mutex_};
         cooldown_timer_.reset();  // just in case

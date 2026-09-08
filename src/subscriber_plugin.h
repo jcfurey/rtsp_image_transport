@@ -22,11 +22,13 @@
 #define RTSP_IMAGE_TRANSPORT_SUBSCRIBER_PLUGIN_H_
 
 #include "init.h"
+#include "callback_gate.h"
 #include "frame_data.h"
 #include "rtsp_image_transport_export.h"
 #include "video_codec.h"
 
-#include <image_transport/simple_subscriber_plugin.hpp>
+#include <image_transport/subscriber_plugin.hpp>
+#include <rclcpp/subscription.hpp>
 #include <rclcpp/timer.hpp>
 #include <std_msgs/msg/string.hpp>
 
@@ -44,14 +46,15 @@ namespace rtsp_image_transport
 class StreamClient;
 class StreamDecoder;
 
-class RTSP_IMAGE_TRANSPORT_EXPORT SubscriberPlugin
-    : public image_transport::SimpleSubscriberPlugin<std_msgs::msg::String>
+class RTSP_IMAGE_TRANSPORT_EXPORT SubscriberPlugin : public image_transport::SubscriberPlugin
 {
 public:
     SubscriberPlugin();
     ~SubscriberPlugin() override;
     void shutdown() override;
     std::string getTransportName() const override;
+    std::string getTopic() const override;
+    std::size_t getNumPublishers() const override;
 
 protected:
 #if RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API
@@ -66,7 +69,7 @@ protected:
                        const Callback& callback, rclcpp::QoS custom_qos,
                        rclcpp::SubscriptionOptions options) override;
 #endif
-    void internalCallback(const std_msgs::msg::String::ConstSharedPtr& message, const Callback& callback) override;
+    void internalCallback(const std_msgs::msg::String::ConstSharedPtr& message, const Callback& callback);
 
 private:
     friend class SubscriberPluginTestPeer;
@@ -82,10 +85,12 @@ private:
     void sessionFinished();
     void sessionTimeout();
     void processFrame();
+    void scheduleEvent(std::function<void()> event);
+    void disconnectClient();
     bool useReceiveTimestamps() const;
     void reportMissingHwDecoder(const StreamDecoder& decoder);
     void reconnect();
-    void cooldownTimerCallback();
+    void cooldownTimerCallback(std::uint64_t generation);
     void pushFrame(const FrameDataPtr& frame,
                    std::chrono::steady_clock::time_point received_at = std::chrono::steady_clock::now());
     QueuedFrame popFrame();
@@ -95,6 +100,15 @@ private:
     void updateParameters();
 
     struct Config;
+    // ROS callbacks can belong to different callback groups. Live555 callbacks
+    // only enqueue work, so holding this lock while disconnecting cannot make
+    // the event loop wait on the executor.
+    std::shared_ptr<CallbackGate> callback_gate_ = std::make_shared<CallbackGate>();
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr url_subscription_;
+    bool shutdown_ = false;
+    bool session_finished_ = false;
+    std::uint64_t connection_generation_ = 0;
+    std::atomic<int> timestamp_source_{2};
     rclcpp::Logger logger_;
     std::string topic_name_, param_base_name_;
     bool failed_;
@@ -109,9 +123,8 @@ private:
     rclcpp::CallbackGroup::SharedPtr cooldown_cb_group_, scheduled_cb_group_;
     rclcpp::Duration old_lag_;
     rclcpp::WallTimer<rclcpp::VoidCallbackType>::SharedPtr cooldown_timer_, frame_timer_;
-    /* Guards cooldown_, cooldown_timer_, cooldown_cb_group_: reconnect
-       bookkeeping is driven from ROS executor threads and from the Live555
-       handler thread (session failed/timeout), which used to race. */
+    /* Local guard for cooldown and timer bookkeeping. Session events are
+       dispatched on the executor under callback_gate_. */
     mutable std::mutex cooldown_mutex_;
     rclcpp::Waitable::SharedPtr scheduled_cb_;
     std::function<void()> notify_frame_;
@@ -129,6 +142,7 @@ private:
 
     mutable std::mutex queue_mutex_;
     std::deque<QueuedFrame> queue_;
+    std::deque<std::function<void()>> pending_events_;
     std::size_t queued_bytes_ = 0;
     bool bound_queue_ = true;
     // The first access unit may carry parameter sets supplied only in SDP.

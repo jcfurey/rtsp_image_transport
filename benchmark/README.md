@@ -4,6 +4,10 @@ Measurement programs for the transport and latency work. They are not tests:
 they take minutes, several need a lossy link, and their output is numbers to
 read rather than assertions to pass. Nothing here runs in CI.
 
+The [2026-09-08 audit](../AUDIT.md) records the latest bidirectional regression
+results and a four-stream H.264/H.265 software measurement, including the
+effect of raw ROS middleware delivery on this host.
+
 Build them with:
 
     colcon build --packages-select rtsp_image_transport \

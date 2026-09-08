@@ -63,15 +63,15 @@ class ScriptedSource : public FramedSource
 {
 public:
     static ScriptedSource* createNew(UsageEnvironment& env, const std::vector<std::vector<std::uint8_t>>& nals,
-                                     std::atomic<std::size_t>* consumed)
+                                     std::atomic<std::size_t>* consumed, unsigned nals_per_picture = 1)
     {
-        return new ScriptedSource(env, nals, consumed);
+        return new ScriptedSource(env, nals, consumed, nals_per_picture);
     }
 
 private:
     ScriptedSource(UsageEnvironment& env, const std::vector<std::vector<std::uint8_t>>& nals,
-                   std::atomic<std::size_t>* consumed)
-        : FramedSource(env), nals_(nals), consumed_(consumed)
+                   std::atomic<std::size_t>* consumed, unsigned nals_per_picture)
+        : FramedSource(env), nals_(nals), consumed_(consumed), nals_per_picture_(nals_per_picture)
     {
     }
 
@@ -108,7 +108,7 @@ private:
            tests exercise the timestamp-change fallback without depending on
            scheduler timing or wall-clock resolution. */
         fPresentationTime.tv_sec = 1700000000;
-        fPresentationTime.tv_usec = static_cast<suseconds_t>(1000 * index_);
+        fPresentationTime.tv_usec = static_cast<suseconds_t>(1000 * ((index_ - 1) / nals_per_picture_ + 1));
         fDurationInMicroseconds = 0;
         /* Counted before handing over, so a test can wait for the whole script
            to have been consumed rather than for a delivery count it would have
@@ -121,6 +121,7 @@ private:
     std::vector<std::vector<std::uint8_t>> nals_;
     std::atomic<std::size_t>* consumed_ = nullptr;
     std::size_t index_ = 0;
+    unsigned nals_per_picture_ = 1;
 };
 
 /* Annex B start code offsets, four byte form included. */
@@ -277,14 +278,15 @@ public:
        that is still being assembled. This waits for the source to have handed
        over every unit in the script, and then for deliveries to stop arriving,
        so what comes back is the finished sequence. */
-    std::vector<std::vector<std::uint8_t>> run(const std::vector<std::vector<std::uint8_t>>& nals)
+    std::vector<std::vector<std::uint8_t>> run(const std::vector<std::vector<std::uint8_t>>& nals,
+                                               unsigned nals_per_picture = 1)
     {
         const std::size_t total = nals.size();
         loop_->post(
-            [this, &nals]
+            [this, &nals, nals_per_picture]
             {
                 extractor_ = FrameExtractor::createNew(client_, loop_->env(), subsession_);
-                source_ = ScriptedSource::createNew(loop_->env(), nals, &consumed_);
+                source_ = ScriptedSource::createNew(loop_->env(), nals, &consumed_, nals_per_picture);
                 extractor_->startPlaying(*source_, nullptr, nullptr);
             });
 
@@ -523,4 +525,42 @@ TEST(FrameExtractorMpeg4, TimestampFallbackPreservesAdjacentUnframedPictures)
     ASSERT_EQ(delivered.size(), 2u);
     EXPECT_EQ(delivered[0], first);
     EXPECT_EQ(delivered[1], second);
+}
+
+TEST_F(FrameExtractorTest, DropsTheRemainderOfATruncatedPicture)
+{
+    ExtractorHarness harness(h265Sdp(sets_));
+    ASSERT_TRUE(harness.usable());
+    const auto delivered = harness.run({syntheticNal(1, 400000, 0xBB), syntheticNal(1, 500, 0xCC),
+                                        syntheticNal(1, 500, 0xDD), syntheticNal(1, 500, 0xEE)},
+                                       2);
+    ASSERT_EQ(delivered.size(), 1u);
+    EXPECT_EQ(std::count(delivered[0].begin(), delivered[0].end(), std::uint8_t{0xCC}), 0);
+    EXPECT_EQ(std::count(delivered[0].begin(), delivered[0].end(), std::uint8_t{0xDD}), 500);
+    EXPECT_TRUE(startsWith(delivered[0], annexB(sets_)));
+}
+
+TEST(FrameExtractorH264, AFullBufferDoesNotSplitOnePictureIntoTwo)
+{
+    const std::string sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n"
+                            "m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n";
+    ExtractorHarness harness(sdp);
+    ASSERT_TRUE(harness.usable());
+    // 262144 initial bytes minus the 4-byte prefix and 2-byte synthetic header.
+    const auto delivered = harness.run({syntheticNal(1, 262138, 0xAA), syntheticNal(1, 500, 0xBB)}, 2);
+    ASSERT_EQ(delivered.size(), 1u);
+    EXPECT_EQ(delivered[0].size(), 262144u + 506u);
+}
+
+TEST(FrameExtractorMPEG4, PrependsTheSdpVolConfiguration)
+{
+    const std::string sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n"
+                            "m=video 0 RTP/AVP 96\r\na=rtpmap:96 MP4V-ES/90000\r\n"
+                            "a=fmtp:96 profile-level-id=1;config=000001b001000001b589\r\n";
+    ExtractorHarness harness(sdp);
+    ASSERT_TRUE(harness.usable());
+    const auto delivered = harness.run({{0, 0, 1, 0xb6, 0x42}});
+    ASSERT_EQ(delivered.size(), 1u);
+    const std::vector<std::uint8_t> expected{0, 0, 1, 0xb0, 1, 0, 0, 1, 0xb5, 0x89, 0, 0, 1, 0xb6, 0x42};
+    EXPECT_EQ(delivered[0], expected);
 }

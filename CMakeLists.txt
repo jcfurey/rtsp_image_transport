@@ -326,6 +326,7 @@ if(BUILD_TESTING)
         test_frame_extractor
         test_reconnect_policy
         test_ffmpeg_logging
+        test_robustness
     )
     # Serve a real RTSP session; the transport tests additionally drive the
     # image_transport plugins through pluginlib.
@@ -343,7 +344,13 @@ if(BUILD_TESTING)
             if(test_name STREQUAL "test_subscriber_performance")
                 target_sources(${test_name} PRIVATE src/subscriber_plugin.cpp)
             endif()
+            if(test_name STREQUAL "test_robustness")
+                target_sources(${test_name} PRIVATE src/publisher_plugin.cpp src/subscriber_plugin.cpp)
+            endif()
             set_tests_properties(${test_name} PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=157")
+            if(test_name STREQUAL "test_robustness")
+                set_tests_properties(${test_name} PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=159")
+            endif()
         endif()
     endforeach()
 

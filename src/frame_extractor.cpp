@@ -100,6 +100,22 @@ FrameExtractor::FrameExtractor(const std::weak_ptr<StreamClient>& stream_client,
             throw StreamingError("SDP parameter sets do not fit the frame buffer");
         seedParameterSets();
     }
+    else if (codec_ == VideoCodec::MPEG4)
+    {
+        // Older cameras may announce their VOL only in the SDP config field.
+        // Without it the decoder has no dimensions until an in-band repeat.
+        const char* config = subsession->fmtp_config();
+        if (config && *config)
+        {
+            if (std::strlen(config) > 2 * INITIAL_FRAME_BUFFER_SIZE)
+                throw StreamingError("SDP MPEG-4 configuration exceeds the frame buffer");
+            unsigned length = 0;
+            std::unique_ptr<unsigned char[]> bytes(parseGeneralConfigStr(config, length));
+            if (bytes && length)
+                parameter_sets_.assign(bytes.get(), bytes.get() + length);
+            seedParameterSets();
+        }
+    }
 }
 
 /* The parameter sets have to reach the decoder ahead of the first slice, and
@@ -124,6 +140,19 @@ VideoCodec FrameExtractor::codec() const
 Boolean FrameExtractor::continuePlaying()
 {
     const std::size_t prefix_size = annexBPrefixSize(codec_);
+    if (buffer_length_ + prefix_size >= buffer_.size())
+    {
+        if (buffer_.size() < MAXIMUM_FRAME_BUFFER_SIZE)
+            buffer_.resize(std::min(MAXIMUM_FRAME_BUFFER_SIZE, 2 * buffer_.size()));
+        else
+        {
+            // Never turn a full buffer into a falsely complete picture.
+            discarding_access_unit_ = true;
+            buffer_length_ = 0;
+            have_buffer_time_ = false;
+            seedParameterSets();
+        }
+    }
     if (prefix_size > 0)
     {
         if (buffer_.size() - prefix_size >= buffer_length_)
@@ -142,7 +171,7 @@ Boolean FrameExtractor::continuePlaying()
 void FrameExtractor::flushPending()
 {
     std::shared_ptr<StreamClient> sc = stream_client_.lock();
-    if (!sc || buffer_length_ == 0)
+    if (!sc || buffer_length_ == 0 || !have_buffer_time_ || discarding_access_unit_)
         return;
     /* For Annex B codecs continuePlaying() leaves a trailing start code waiting
        for a NAL unit that will now never arrive; other codecs have no prefix to
@@ -169,6 +198,8 @@ void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes
     std::shared_ptr<StreamClient> sc = stream_client_.lock();
     if (sc)
     {
+        RTPSource* rtp = subsession_ ? subsession_->rtpSource() : nullptr;
+        const bool marker = rtp && rtp->curPacketMarkerBit();
         if (numTruncatedBytes > 0)
         {
             /* The NAL unit did not fit. Enlarge the buffer so that the following
@@ -189,9 +220,25 @@ void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes
                             sc->topicName().c_str(), MAXIMUM_FRAME_BUFFER_SIZE);
             }
             buffer_length_ = 0;
+            buffer_time_ = presentationTime;
+            have_buffer_time_ = false;
+            discarding_access_unit_ = !marker;
             seedParameterSets();
             continuePlaying();
             return;
+        }
+        if (discarding_access_unit_)
+        {
+            if (presentationTime.tv_sec == buffer_time_.tv_sec && presentationTime.tv_usec == buffer_time_.tv_usec)
+            {
+                buffer_length_ = 0;
+                have_buffer_time_ = false;
+                discarding_access_unit_ = !marker;
+                seedParameterSets();
+                continuePlaying();
+                return;
+            }
+            discarding_access_unit_ = false;
         }
         /* Hand the decoder whole access units rather than individual NAL units.
            Fed one NAL unit at a time it has to infer where each picture begins,
@@ -228,12 +275,7 @@ void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes
         buffer_time_ = presentationTime;
         have_buffer_time_ = true;
 
-        RTPSource* rtp = subsession_ ? subsession_->rtpSource() : nullptr;
-        const bool marker = rtp && rtp->curPacketMarkerBit();
-        /* A buffer with no room for another NAL unit has to go now whatever the
-           boundaries say, or the next getNextFrame() has nowhere to write. */
-        const bool buffer_full = buffer_length_ + prefix_size >= buffer_.size();
-        if ((marker || buffer_full) && buffer_length_ > 0)
+        if (marker && buffer_length_ > 0)
         {
             const rclcpp::Time ts(buffer_time_.tv_sec, 1000ull * buffer_time_.tv_usec);
             sc->receiveStreamData(codec_, subsession_,

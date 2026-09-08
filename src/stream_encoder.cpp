@@ -27,12 +27,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <format>
+#include <limits>
 
 extern "C"
 {
 #include <libavformat/avformat.h>
 #include <libavutil/opt.h>
+#include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 }
 
@@ -160,6 +163,8 @@ AVPixelFormat toAVPixelFormat(const sensor_msgs::msg::Image& image)
         return AV_PIX_FMT_YUYV422;
     if (image.encoding == sensor_msgs::image_encodings::YUV422_YUY2)
         return AV_PIX_FMT_YUYV422;
+    if (image.encoding == sensor_msgs::image_encodings::NV12)
+        return AV_PIX_FMT_NV12;
     if (image.encoding == sensor_msgs::image_encodings::NV21)
         return AV_PIX_FMT_NV21;
     if (image.encoding == sensor_msgs::image_encodings::NV24)
@@ -526,19 +531,56 @@ void StreamEncoder::openEncoder(int width, int height)
 std::size_t StreamEncoder::encodeVideo(const sensor_msgs::msg::Image& image)
 {
     int result;
+    // Validate before opening the codec or letting swscale read the message.
+    // ROS step includes row padding; semiplanar YUV also needs a chroma plane.
+    const AVPixelFormat av_format = toAVPixelFormat(image);
+    if (av_format == AV_PIX_FMT_NONE)
+        throw InvalidImageError(std::format("unsupported image format {}", image.encoding));
+    if (av_image_check_size(image.width, image.height, 0, nullptr) < 0 ||
+        image.step > static_cast<unsigned>(std::numeric_limits<int>::max()))
+        throw InvalidImageError("invalid image dimensions or row stride");
+    int input_linesize[4] = {};
+    if (av_image_fill_linesizes(input_linesize, av_format, image.width) < 0 ||
+        image.step < static_cast<unsigned>(input_linesize[0]))
+        throw InvalidImageError("image step is smaller than a pixel row");
+    input_linesize[0] = static_cast<int>(image.step);
+    if (av_format == AV_PIX_FMT_NV12 || av_format == AV_PIX_FMT_NV21)
+    {
+        if (image.step < static_cast<unsigned>(input_linesize[1]))
+            throw InvalidImageError("image step is smaller than a chroma row");
+        input_linesize[1] = input_linesize[0];
+    }
+    else if (av_format == AV_PIX_FMT_NV24)
+    {
+        if (image.step > static_cast<unsigned>(std::numeric_limits<int>::max() / 2))
+            throw InvalidImageError("invalid NV24 chroma stride");
+        input_linesize[1] = 2 * input_linesize[0];
+    }
+    uint8_t* planes[4] = {};
+    const int required = av_image_fill_pointers(planes, av_format, image.height, nullptr, input_linesize);
+    if (required < 0 || image.data.size() < static_cast<std::size_t>(required))
+        throw InvalidImageError("image data is shorter than its dimensions, stride and pixel format require");
+    av_image_fill_pointers(planes, av_format, image.height, const_cast<uint8_t*>(image.data.data()),
+                           input_linesize);
+    const uint8_t* input_data[4] = {planes[0], planes[1], planes[2], planes[3]};
+    const rclcpp::Time stamp(image.header.stamp);
     if (!initialized_)
     {
         openEncoder(image.width, image.height);
         sw_frm_.reset(av_frame_alloc(), free_frame);
+        if (!sw_frm_)
+            throw StreamingError("failed to allocate software encoding frame");
 #ifdef FFMPEG_HAS_HWFRAME_SUPPORT
         if (is_vaapi_)
         {
             hw_frm_.reset(av_frame_alloc(), free_frame);
-            if (av_hwframe_get_buffer(hw_frames_.get(), hw_frm_.get(), 0) != 0)
+            if (!hw_frm_ || av_hwframe_get_buffer(hw_frames_.get(), hw_frm_.get(), 0) != 0)
                 throw StreamingError("failed to allocate HW frame from VAAPI frame buffer");
         }
 #endif
         pkt_.reset(av_packet_alloc(), free_packet);
+        if (!pkt_)
+            throw StreamingError("failed to allocate encoded packet");
         last_ts_ = rclcpp::Time(image.header.stamp);
         last_pts_ = -1;
         packets_.clear();
@@ -548,12 +590,6 @@ std::size_t StreamEncoder::encodeVideo(const sensor_msgs::msg::Image& image)
     if (image.width != static_cast<unsigned>(ctx_->width) || image.height != static_cast<unsigned>(ctx_->height))
         throw StreamingError("image size changed unexpectedly");
 
-    AVPixelFormat av_format = toAVPixelFormat(image);
-    if (av_format == AV_PIX_FMT_NONE)
-        throw StreamingError(std::format("unsupported image format {}", image.encoding));
-
-    const uint8_t* input_data[] = {image.data.data()};
-    int input_linesize[] = {int(image.step)};
     av_frame_unref(sw_frm_.get());
     sw_frm_->width = image.width;
     sw_frm_->height = image.height;
@@ -575,13 +611,17 @@ std::size_t StreamEncoder::encodeVideo(const sensor_msgs::msg::Image& image)
             throw EncodingError(std::format("cannot convert {} images to the pixel format of the encoder",
                                             image.encoding));
     }
-    sws_scale(sws_.get(), input_data, input_linesize, 0, image.height, sw_frm_->data, sw_frm_->linesize);
+    if (sws_scale(sws_.get(), input_data, input_linesize, 0, image.height, sw_frm_->data, sw_frm_->linesize) !=
+        static_cast<int>(image.height))
+        throw EncodingError("failed to convert image to the encoder pixel format");
 
     AVFrame* encoder_input = sw_frm_.get();
 #ifdef FFMPEG_HAS_HWFRAME_SUPPORT
     if (is_vaapi_)
     {
-        av_hwframe_transfer_data(hw_frm_.get(), sw_frm_.get(), 0);
+        if (av_frame_make_writable(hw_frm_.get()) < 0 ||
+            av_hwframe_transfer_data(hw_frm_.get(), sw_frm_.get(), 0) < 0)
+            throw EncodingError("failed to upload image to the hardware encoder");
         encoder_input = hw_frm_.get();
     }
 #endif
@@ -591,7 +631,6 @@ std::size_t StreamEncoder::encodeVideo(const sensor_msgs::msg::Image& image)
        what a looping bag or a simulation reset does: every following frame ends
        up clamped to one tick after its predecessor, and the encoder concludes
        the stream runs at 300 fps. */
-    const rclcpp::Time stamp(image.header.stamp);
     std::int64_t pts;
     if (last_pts_ < 0)
     {
@@ -653,6 +692,12 @@ FrameDataPtr StreamEncoder::nextPacket() noexcept
 VideoCodec StreamEncoder::codec() const noexcept
 {
     return codec_;
+}
+
+bool StreamEncoder::hwAccel() const noexcept
+{
+    // Matches the hardware entries excluded by use_hw_encoder in the candidate table.
+    return ctx_ && ctx_->codec && std::strchr(ctx_->codec->name, '_') != nullptr;
 }
 
 AVCodecContext* StreamEncoder::context() noexcept
