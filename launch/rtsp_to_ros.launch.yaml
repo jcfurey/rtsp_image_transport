@@ -40,6 +40,14 @@ launch:
         of data it is already too late to show. Turn on for a link lossy
         enough that artefacts cost more than delay.
   - arg:
+      name: reconnect_policy
+      default: '3'
+      description: Retry policy (0 never, 1 timeouts, 2 also failures, 3 also normal stream endings)
+  - arg:
+      name: timeout
+      default: '2.0'
+      description: RTSP handshake and media timeout in seconds (0 disables the watchdog)
+  - arg:
       name: video_subsession
       default: '0'
       description: Zero-based index over the server's video subsessions
@@ -79,6 +87,12 @@ launch:
         - name: in.rtsp.video_subsession
           value: $(var video_subsession)
           type: int
+        - name: in.rtsp.reconnect_policy
+          value: $(var reconnect_policy)
+          type: int
+        - name: in.rtsp.timeout
+          value: $(var timeout)
+          type: float
         - name: in.rtsp.decoder_stall_timeout
           value: $(var decoder_stall_timeout)
           type: float

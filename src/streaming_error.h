@@ -39,6 +39,12 @@ class EncodingError : public StreamingError
     using StreamingError::StreamingError;
 };
 
+// Rejected before any encoder state is changed, so the next image can proceed.
+class InvalidImageError : public EncodingError
+{
+    using EncodingError::EncodingError;
+};
+
 class DecodingError : public StreamingError
 {
     using StreamingError::StreamingError;

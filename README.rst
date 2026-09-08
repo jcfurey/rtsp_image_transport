@@ -13,6 +13,9 @@ an :RFC:`2326` compliant RTSP video stream server, from where the actual image
 data is served. The subscriber will listen for URLs on the ROS topic and
 automatically (re-)connect to the corresponding location.
 
+The `bidirectional audit report <AUDIT.md>`_ records the reliability fixes,
+regression coverage, throughput measurements, and remaining validation limits.
+
 Use Cases
 =========
 
@@ -92,6 +95,14 @@ Both examples request a hardware encoder and transparently fall back to
 software when the machine has no usable one. On NVIDIA hardware the selected
 encoder is logged as ``h264_nvenc`` or ``hevc_nvenc``.
 
+Malformed images are dropped with a diagnostic, and the next valid image can
+still be encoded. Dimensions, row stride, and buffer length are checked before
+pixel conversion. NV12, NV21, and NV24 inputs include their chroma planes;
+``step`` is the luma row stride, with twice that stride for NV24 chroma.
+A resolution change restarts the encoder. Other encoder errors are retried
+with a one-second cooldown; a hardware encoder that fails on the actual stream
+falls back to software until parameters are updated.
+
 The output ROS topic carries the URL, not the video. Read it once, then hand
 the value to ffplay, VLC, GStreamer, or another RTSP client::
 
@@ -170,6 +181,24 @@ separate ``sprop-vps``, ``sprop-sps``, and ``sprop-pps`` parameter sets defined
 by RFC 7798. Upstream treated H.265 like H.264 and looked only for the combined
 ``sprop-parameter-sets`` attribute, leaving some HEVC decoders without the
 configuration needed to decode the first keyframe.
+
+Connection recovery
+===================
+
+``reconnect_policy`` now defaults to ``3`` for live cameras. The policies are
+cumulative: ``0`` never retries, ``1`` retries media timeouts, ``2`` also retries
+connection/setup/decoder failures, and ``3`` also reconnects after normal stream
+termination. Set ``0`` for finite recordings that should end once.
+
+``timeout`` (seconds, default ``2.0``) supervises both the RTSP handshake and
+loss of RTP traffic. Retries use wall time and exponential backoff between
+``reconnect_minwait`` (``0.1`` s) and ``reconnect_maxwait`` (``30.0`` s).
+The receive launch file exposes ``reconnect_policy`` and ``timeout``.
+
+A changed URL discards the old session's queued pictures and decoder. Changes
+to decoder selection also establish a fresh session so cameras that supply
+codec configuration only in SDP can recover. Changing ``sws_threads`` continues
+to take effect without reconnecting.
 
 Hardware Accelerated Decoding
 =============================
@@ -317,8 +346,11 @@ available hardware threads on FFmpeg builds with threaded conversion support.
 The publisher side is bounded the same way, per connected client: a client
 whose link cannot carry the stream backs up its own send queue, and once that
 queue spans more than 200 ms the oldest whole pictures are dropped rather than
-letting that client fall ever further behind. Other clients are unaffected,
-since each has its own queue.
+letting that client fall ever further behind. Each client has its own source
+and queue. The queue also has a 64 MiB byte budget and a 4096-NAL count budget;
+individual access units larger than 16 MiB or 4096 NALs are dropped. A picture
+already being sent is completed before older pending pictures are discarded. The Live555
+socket dispatcher and the encoder are still shared by the clients.
 
 The encoder's VBV buffer is a quarter of the target bitrate, which bounds how
 far a single picture may overshoot its share of the link and therefore how
@@ -440,9 +472,10 @@ that joins after the publisher started would otherwise never learn the stream
 URL. Every other policy — deadline, lifespan, liveliness — is passed through
 untouched.
 
-Because those three are fixed, a peer that insists on ``BEST_EFFORT`` or
-``VOLATILE`` is incompatible and simply receives nothing. Both plugins now
-report that instead of leaving you with a silent black screen::
+The subscriber requires a URL publisher offering ``RELIABLE`` and
+``TRANSIENT_LOCAL``. A URL publisher can serve readers requesting weaker
+policies, although a volatile reader misses URLs published before it joined.
+Both plugins report incompatible QoS rather than leaving a silent black screen::
 
   [/camera0] the RTSP URL publisher offers an incompatible QoS policy (3);
              this transport needs RELIABLE and TRANSIENT_LOCAL, so no video will arrive
@@ -546,7 +579,10 @@ The package ships a GoogleTest suite covering codec selection, the decoder
 (every supported codec, hardware selection and fallback, time stamps, frame
 dropping), the encoder, an encode/decode round trip, the Live555 event loop,
 the graph monitor, and a loopback integration test that serves a real RTSP
-session on localhost and decodes what comes back::
+session on localhost and decodes what comes back. Robustness tests exercise
+both UDP and TCP, malformed image recovery, resolution and URL changes,
+camera startup after an initial failure, concurrent clients, and destruction
+while the executor keeps running::
 
   colcon build --packages-select rtsp_image_transport --cmake-args -DBUILD_TESTING=ON
   colcon test --packages-select rtsp_image_transport

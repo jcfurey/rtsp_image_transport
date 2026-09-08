@@ -23,6 +23,7 @@
 #include "init.h"
 #include "stream_encoder.h"
 #include "stream_server.h"
+#include "streaming_error.h"
 #include "topic_parameter.h"
 #include "video_codec.h"
 
@@ -96,8 +97,21 @@ PublisherPlugin::PublisherPlugin()
     global_initialize();
 }
 
+PublisherPlugin::~PublisherPlugin()
+{
+    shutdown();
+}
+
 void PublisherPlugin::shutdown()
 {
+    callback_gate_->close();
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (shutdown_)
+            return;
+        shutdown_ = true;
+    }
+    param_cb_handle_.reset();
     demand_timer_.reset();
     demand_cb_group_.reset();
     {
@@ -114,6 +128,7 @@ void PublisherPlugin::shutdown()
     if (graph_monitor_)
         graph_monitor_->removeListener(this);
     graph_monitor_.reset();
+    std::lock_guard<std::mutex> lock{mutex_};
     server_.reset();
     encoder_.reset();
 }
@@ -127,6 +142,9 @@ std::string PublisherPlugin::getTransportName() const
 void PublisherPlugin::advertiseImpl(rclcpp::Node* node, const std::string& base_topic, rmw_qos_profile_t custom_qos,
                                     rclcpp::PublisherOptions options)
 {
+    if (shutdown_)
+        callback_gate_ = std::make_shared<CallbackGate>();
+    shutdown_ = false;
     logger_ = node->get_logger();
     topic_name_ = base_topic;
     /* The transport topic carries a latched URL rather than image data, so a
@@ -139,22 +157,23 @@ void PublisherPlugin::advertiseImpl(rclcpp::Node* node, const std::string& base_
     custom_qos.durability = RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
     /* An incompatible subscriber otherwise just never receives the URL, with
        nothing in the log to explain it. */
-    options.event_callbacks.incompatible_qos_callback =
+    options.event_callbacks.incompatible_qos_callback = callback_gate_->wrap(
         [this](rclcpp::QOSOfferedIncompatibleQoSInfo& info)
-    {
-        RCLCPP_ERROR(logger_,
-                     "[%s] a subscriber requests an incompatible QoS policy (%d); this transport publishes the "
-                     "stream URL as RELIABLE and TRANSIENT_LOCAL, so that subscriber will not receive it",
-                     topic_name_.c_str(), static_cast<int>(info.last_policy_kind));
-    };
+        {
+            RCLCPP_ERROR(
+                logger_,
+                "[%s] a subscriber requests an incompatible QoS policy (%d); this transport publishes the "
+                "stream URL as RELIABLE and TRANSIENT_LOCAL, so that subscriber will not receive it",
+                topic_name_.c_str(), static_cast<int>(info.last_policy_kind));
+        });
     setupMatchedCallback(options);
     SuperClass::advertiseImpl(node, base_topic, custom_qos, options);
     graph_monitor_ = GraphMonitor::instance(node, this);
     node_param_ = rclcpp::node_interfaces::get_node_parameters_interface(node);
     param_base_name_ = topicParameterBase(*node, base_topic, getTransportName());
     setupParameters(node_param_.lock());
-    param_cb_handle_ = node->add_post_set_parameters_callback([this](const std::vector<rclcpp::Parameter>&)
-                                                              { this->updateParameters(); });
+    param_cb_handle_ = node->add_post_set_parameters_callback(
+        callback_gate_->wrap([this](const std::vector<rclcpp::Parameter>&) { updateParameters(); }));
     updateParameters();
     setupDemandMonitor(*node);
 }
@@ -165,19 +184,23 @@ void PublisherPlugin::advertiseImpl(image_transport::RequiredInterfaces node_int
                                     const std::string& base_topic, rclcpp::QoS custom_qos,
                                     rclcpp::PublisherOptions options)
 {
+    if (shutdown_)
+        callback_gate_ = std::make_shared<CallbackGate>();
+    shutdown_ = false;
     logger_ = node_interfaces.get_node_logging_interface()->get_logger();
     topic_name_ = base_topic;
     /* Match the legacy path above. The transport topic carries one latched URL,
        so these three QoS policies are part of the wire protocol. */
     custom_qos.reliable().keep_last(1).transient_local();
-    options.event_callbacks.incompatible_qos_callback =
+    options.event_callbacks.incompatible_qos_callback = callback_gate_->wrap(
         [this](rclcpp::QOSOfferedIncompatibleQoSInfo& info)
-    {
-        RCLCPP_ERROR(logger_,
-                     "[%s] a subscriber requests an incompatible QoS policy (%d); this transport publishes the "
-                     "stream URL as RELIABLE and TRANSIENT_LOCAL, so that subscriber will not receive it",
-                     topic_name_.c_str(), static_cast<int>(info.last_policy_kind));
-    };
+        {
+            RCLCPP_ERROR(
+                logger_,
+                "[%s] a subscriber requests an incompatible QoS policy (%d); this transport publishes the "
+                "stream URL as RELIABLE and TRANSIENT_LOCAL, so that subscriber will not receive it",
+                topic_name_.c_str(), static_cast<int>(info.last_policy_kind));
+        });
     setupMatchedCallback(options);
     SuperClass::advertiseImpl(node_interfaces, base_topic, custom_qos, options);
 
@@ -187,7 +210,7 @@ void PublisherPlugin::advertiseImpl(image_transport::RequiredInterfaces node_int
     param_base_name_ = topicParameterBase(node_base->get_namespace(), base_topic, getTransportName());
     setupParameters(node_parameters);
     param_cb_handle_ = node_parameters->add_post_set_parameters_callback(
-        [this](const std::vector<rclcpp::Parameter>&) { this->updateParameters(); });
+        callback_gate_->wrap([this](const std::vector<rclcpp::Parameter>&) { updateParameters(); }));
     updateParameters();
     setupDemandMonitor(DemandInterfaces(node_interfaces));
 
@@ -218,7 +241,7 @@ void PublisherPlugin::setupMatchedCallback(rclcpp::PublisherOptions& options)
     }
     if (source_demand_callback_)
         options.event_callbacks.matched_callback =
-            [this](rclcpp::MatchedInfo& info) { this->onPublisherMatched(info); };
+            callback_gate_->wrap([this](rclcpp::MatchedInfo& info) { onPublisherMatched(info); });
 }
 
 void PublisherPlugin::setupDemandMonitor(DemandInterfaces node_interfaces)
@@ -232,8 +255,7 @@ void PublisherPlugin::setupDemandMonitor(DemandInterfaces node_interfaces)
     auto node_timers = node_interfaces.get_node_timers_interface();
     demand_cb_group_ = node_base->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
     demand_timer_ = std::make_shared<rclcpp::WallTimer<rclcpp::VoidCallbackType>>(
-        std::chrono::milliseconds(10), std::bind(&PublisherPlugin::updateDemand, this),
-        node_base->get_context());
+        std::chrono::milliseconds(10), callback_gate_->wrap([this] { updateDemand(); }), node_base->get_context());
     node_timers->add_timer(demand_timer_, demand_cb_group_);
 }
 
@@ -343,7 +365,7 @@ void PublisherPlugin::setupParameters(
     declareParameter(
         node_parameters, param_base_name_ + ".udp_port", rclcpp::ParameterValue(static_cast<int>(config_->udp_port)),
         ParameterDescriptor()
-            .set__description("force UDP port for RTSP server (0 = auto select)")
+            .set__description("RTSP TCP listening port (legacy udp_port name; 0 = auto select)")
             .set__integer_range({rcl_interfaces::msg::IntegerRange().set__from_value(0).set__to_value(65535)}));
     declareParameter(
         node_parameters, param_base_name_ + ".udp_packet_size",
@@ -367,6 +389,8 @@ void PublisherPlugin::updateParameters()
     if (!np)
         return;
     std::lock_guard<std::mutex> lock{mutex_};
+    if (shutdown_)
+        return;
     Config new_config;
     std::string codec_str = np->get_parameter(param_base_name_ + ".codec").as_string();
     std::string codec_str_canon;
@@ -420,6 +444,8 @@ void PublisherPlugin::updateParameters()
 
     *config_ = new_config;
     failed_ = false;
+    encoder_retry_after_ = {};
+    hardware_failed_ = false;
     try
     {
         if (changelevel >= LVL_SERVER)
@@ -453,7 +479,7 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
     std::lock_guard<std::mutex> lock{mutex_};
     try
     {
-        if (!server_ || failed_)
+        if (shutdown_ || !server_ || failed_)
             return;
         if (update_url_)
         {
@@ -484,9 +510,19 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
             }
             return;
         }
+        if (std::chrono::steady_clock::now() < encoder_retry_after_)
+            return;
+        if (encoder_ && encoder_->context()->width > 0 &&
+            (image.width != static_cast<unsigned>(encoder_->context()->width) ||
+             image.height != static_cast<unsigned>(encoder_->context()->height)))
+        {
+            RCLCPP_INFO(logger_, "[%s] image dimensions changed; restarting the encoder", topic_name_.c_str());
+            encoder_.reset();
+        }
         if (!encoder_)
         {
-            encoder_ = std::make_unique<StreamEncoder>(config_->codec, config_->use_hw_encoder, logger_);
+            encoder_ = std::make_unique<StreamEncoder>(config_->codec,
+                                                       config_->use_hw_encoder && !hardware_failed_, logger_);
             stream_clock_.reset();
             encoder_->setBitrate(config_->target_bitrate);
             encoder_->setFramerate(config_->expected_framerate);
@@ -534,10 +570,20 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
                             topic_name_.c_str());
         }
     }
+    catch (const InvalidImageError& e)
+    {
+        RCLCPP_WARN_THROTTLE(logger_, *steady_clock_, 5000, "[%s] dropping invalid image: %s", topic_name_.c_str(),
+                             e.what());
+    }
     catch (const std::exception& e)
     {
+        if (encoder_ && encoder_->hwAccel())
+        {
+            hardware_failed_ = true;
+            RCLCPP_WARN(logger_, "[%s] hardware encoding failed; retrying in software", topic_name_.c_str());
+        }
         encoder_.reset();
-        failed_ = true;
+        encoder_retry_after_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
         RCLCPP_ERROR(logger_, "[%s] %s", topic_name_.c_str(), e.what());
     }
 }

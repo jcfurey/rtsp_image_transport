@@ -43,15 +43,14 @@ protected:
     void SetUp() override
     {
         loop_ = EventLoop::create();
-        injector_ = FrameInjector::createNew(loop_->env());
+        loop_->post([this] { injector_ = FrameInjector::createNew(loop_->env()); });
     }
 
     void TearDown() override
     {
-        if (injector_)
-            injector_->shutdown();
-        Medium::close(injector_);
+        loop_->post([this] { Medium::close(injector_); });
         injector_ = nullptr;
+        loop_->stop();
         loop_.reset();
     }
 
@@ -177,4 +176,28 @@ TEST_F(FrameInjectorTest, ShutdownDiscardsWhatIsQueued)
     /* Injecting after shutdown is a no-op rather than a crash or a leak */
     injectPicture(BASE_NS + 10 * FRAME_NS);
     SUCCEED();
+}
+
+TEST_F(FrameInjectorTest, BoundsBytesEvenForLargePicturesWithFrozenStamps)
+{
+    constexpr std::size_t picture_bytes = 1u << 20;
+    for (unsigned i = 0; i < 80; ++i)
+        injectPicture(BASE_NS, 1, picture_bytes);
+    EXPECT_GE(injector_->droppedFrames(), 80u - FrameInjector::MAX_QUEUE_BYTES / picture_bytes);
+}
+
+TEST_F(FrameInjectorTest, RejectsAnOversizedAccessUnitAsAWhole)
+{
+    injectPicture(BASE_NS, 2, FrameInjector::MAX_ACCESS_UNIT_BYTES / 2 + 1);
+    EXPECT_EQ(injector_->droppedFrames(), 2u);
+    injectPicture(BASE_NS + FRAME_NS);
+    EXPECT_TRUE(pullOne().first);
+}
+
+TEST_F(FrameInjectorTest, RejectsAnAccessUnitWithTooManyNals)
+{
+    injectPicture(BASE_NS, FrameInjector::MAX_QUEUE_LENGTH + 1, 1);
+    EXPECT_EQ(injector_->droppedFrames(), FrameInjector::MAX_QUEUE_LENGTH + 1);
+    injectPicture(BASE_NS + FRAME_NS);
+    EXPECT_TRUE(pullOne().first);
 }

@@ -739,6 +739,8 @@ void StreamDecoder::flush() noexcept
 
 std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
 {
+    if (!data || data->length() == 0 || data->length() > static_cast<std::size_t>(INT_MAX))
+        throw DecodingError("invalid or empty compressed video packet");
     /* Some hardware decoders open successfully and accept every packet but
        never return a frame. Retain the beginning of the stream while a hardware
        candidate proves itself so that a software fallback can replay the SPS,
@@ -993,9 +995,10 @@ void StreamDecoder::convertToBGR(sensor_msgs::msg::Image& img, AVFrame* source)
         sws_threaded_ = false;
     }
 #endif
-    unsigned char* bgr_data[] = {img.data.data()};
-    int bgr_linesize[] = {3 * width_};
-    sws_scale(sws_.get(), source->data, source->linesize, 0, height_, bgr_data, bgr_linesize);
+    unsigned char* bgr_data[4] = {img.data.data(), nullptr, nullptr, nullptr};
+    int bgr_linesize[4] = {3 * width_, 0, 0, 0};
+    if (sws_scale(sws_.get(), source->data, source->linesize, 0, height_, bgr_data, bgr_linesize) != height_)
+        throw DecodingError("failed to convert decoded frame to BGR8");
 }
 
 sensor_msgs::msg::Image::UniquePtr StreamDecoder::nextFrame() noexcept

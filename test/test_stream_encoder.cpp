@@ -410,3 +410,96 @@ TEST(StreamEncoder, ExposesContextAndCodec)
     ASSERT_NE(encoder->context()->codec, nullptr);
     EXPECT_NE(encoder->context()->codec->name, nullptr);
 }
+
+TEST(StreamEncoder, RejectsMalformedBuffersWithoutPoisoningTheEncoder)
+{
+    auto encoder = makeEncoder();
+    if (!encoder)
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    const auto valid = makeTestImage(160, 120, 0);
+    for (int fault = 0; fault < 7; ++fault)
+    {
+        auto image = valid;
+        switch (fault)
+        {
+        case 0:
+            image.data.clear();
+            break;
+        case 1:
+            image.data.pop_back();
+            break;
+        case 2:
+            image.step = image.width * 3 - 1;
+            break;
+        case 3:
+            image.step = UINT32_MAX;
+            break;
+        case 4:
+            image.width = UINT32_MAX;
+            break;
+        case 5:
+            image.height = 0;
+            break;
+        case 6:
+            image.encoding = "invalid";
+            break;
+        }
+        SCOPED_TRACE(fault);
+        EXPECT_THROW(encoder->encodeVideo(image), InvalidImageError);
+        EXPECT_GT(encoder->encodeVideo(valid), 0u);
+        while (encoder->nextPacket())
+        {
+        }
+    }
+}
+
+TEST(StreamEncoder, SemiplanarYuvUsesChromaAndPaddedRows)
+{
+    for (const std::string encoding : {"nv12", "nv21", "nv24"})
+    {
+        SCOPED_TRACE(encoding);
+        auto encoder = makeEncoder();
+        if (!encoder)
+            GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+        auto image = makeTestImage(160, 120, 0);
+        image.encoding = encoding;
+        image.step = image.width + 16;
+        const std::size_t luma_bytes = image.step * image.height;
+        const std::size_t chroma_stride = encoding == "nv24" ? 2 * image.step : image.step;
+        const unsigned chroma_height = encoding == "nv24" ? image.height : image.height / 2;
+        image.data.assign(luma_bytes + chroma_stride * chroma_height, 0);
+        for (unsigned y = 0; y < image.height; ++y)
+            std::fill_n(image.data.begin() + y * image.step, image.width, 81);
+        // BT.601 limited-range red: Y=81, U=90, V=240. Poisoned row
+        // padding catches code that assumes tightly packed planes.
+        const unsigned chroma_width = encoding == "nv24" ? 2 * image.width : image.width;
+        for (unsigned y = 0; y < chroma_height; ++y)
+            for (unsigned x = 0; x < chroma_width; x += 2)
+            {
+                image.data[luma_bytes + y * chroma_stride + x] = encoding == "nv21" ? 240 : 90;
+                image.data[luma_bytes + y * chroma_stride + x + 1] = encoding == "nv21" ? 90 : 240;
+            }
+        auto truncated = image;
+        truncated.data.pop_back();
+        EXPECT_THROW(encoder->encodeVideo(truncated), InvalidImageError);
+        ASSERT_GT(encoder->encodeVideo(image), 0u);
+        std::vector<unsigned char> annex_b;
+        while (auto packet = encoder->nextPacket())
+        {
+            annex_b.insert(annex_b.end(), {0, 0, 0, 1});
+            annex_b.insert(annex_b.end(), packet->data(), packet->data() + packet->length());
+        }
+        StreamDecoder::Options options;
+        options.use_hw_decoder = false;
+        StreamDecoder decoder(VideoCodec::H264, options);
+        ASSERT_GT(
+            decoder.decodeVideo(std::make_shared<FrameData>(annex_b.data(), annex_b.size(), image.header.stamp)),
+            0u);
+        const auto decoded = decoder.nextFrame();
+        ASSERT_TRUE(decoded);
+        const std::size_t center = (60 * decoded->width + 80) * 3;
+        EXPECT_LT(decoded->data[center], 15);
+        EXPECT_LT(decoded->data[center + 1], 15);
+        EXPECT_GT(decoded->data[center + 2], 240);
+    }
+}

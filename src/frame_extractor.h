@@ -84,6 +84,7 @@ private:
         0, 0
     };
     bool have_buffer_time_ = false;
+    bool discarding_access_unit_ = false;
 };
 
 }  // namespace rtsp_image_transport

@@ -22,6 +22,7 @@
 #define RTSP_IMAGE_TRANSPORT_PUBLISHER_PLUGIN_H_
 
 #include "init.h"
+#include "callback_gate.h"
 #include "graph_monitor.h"
 #include "rtsp_image_transport_export.h"
 #include "stream_clock.h"
@@ -48,6 +49,7 @@ class RTSP_IMAGE_TRANSPORT_EXPORT PublisherPlugin
 {
 public:
     PublisherPlugin();
+    ~PublisherPlugin() override;
     void shutdown() override;
 
     std::string getTransportName() const override;
@@ -81,6 +83,7 @@ private:
     void onGraphChange() override;
 
     struct Config;
+    std::shared_ptr<CallbackGate> callback_gate_ = std::make_shared<CallbackGate>();
     rclcpp::Logger logger_;
     rclcpp::node_interfaces::NodeParametersInterface::WeakPtr node_param_;
     std::string topic_name_, param_base_name_;
@@ -102,6 +105,9 @@ private:
     mutable StreamClock stream_clock_;
     mutable std::mutex mutex_;
     mutable bool update_url_, failed_;
+    bool shutdown_ = false;
+    mutable std::chrono::steady_clock::time_point encoder_retry_after_{};
+    mutable bool hardware_failed_ = false;
 };
 
 }  // namespace rtsp_image_transport

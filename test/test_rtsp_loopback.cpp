@@ -25,6 +25,9 @@
 #include "test_helpers.h"
 
 #include <gtest/gtest.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -77,6 +80,11 @@ public:
     unsigned framesPushed() const
     {
         return frames_pushed_.load();
+    }
+
+    std::size_t clients() const
+    {
+        return server_->activeStreamCount();
     }
 
 private:
@@ -759,4 +767,67 @@ TEST(RtspLoopback, MulticastServerAcceptsFrames)
     while (server.framesPushed() < 5 && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(50ms);
     EXPECT_GE(server.framesPushed(), 5u) << "no frames reached the multicast sink";
+}
+
+TEST_P(RtspTransport, ClientsHaveIndependentSourcesAndSurviveOtherClientsLeaving)
+{
+    if (!haveEncoderFor(VideoCodec::H264))
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    LoopbackServer server(VideoCodec::H264, 160, 120);
+    ClientObserver first_observer, second_observer, third_observer;
+    auto first = StreamClient::create("first", server.url());
+    auto second = StreamClient::create("second", server.url());
+    first->setRtpOverTcp(rtpOverTcp());
+    second->setRtpOverTcp(rtpOverTcp());
+    first_observer.attach(first);
+    second_observer.attach(second);
+    first->connect();
+    ASSERT_TRUE(first_observer.waitForNals(3));
+    second->connect();
+    ASSERT_TRUE(second_observer.waitForNals(3));
+    EXPECT_EQ(server.clients(), 2u);
+    // Delete the earliest sink, then issue DESCRIBE from a new client. The
+    // session must build its SDP from a sink that is still alive.
+    first->disconnect();
+    first.reset();
+    auto third = StreamClient::create("third", server.url());
+    third->setRtpOverTcp(rtpOverTcp());
+    third_observer.attach(third);
+    third->connect();
+    ASSERT_TRUE(third_observer.waitForNals(4));
+    ASSERT_TRUE(second_observer.waitForNals(10));
+    third->disconnect();
+    second->disconnect();
+    std::lock_guard<std::mutex> lock{second_observer.mutex_};
+    EXPECT_GT(decodeAll(VideoCodec::H264, second_observer.nals_, 160, 120), 0u);
+}
+
+TEST(RtspLoopback, SilentServerCannotWedgeTheDescribeHandshake)
+{
+    struct ListeningSocket
+    {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        ~ListeningSocket()
+        {
+            if (fd >= 0)
+                close(fd);
+        }
+    } listener;
+    ASSERT_GE(listener.fd, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(bind(listener.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+    ASSERT_EQ(listen(listener.fd, 4), 0);
+    socklen_t length = sizeof(address);
+    ASSERT_EQ(getsockname(listener.fd, reinterpret_cast<sockaddr*>(&address), &length), 0);
+    ClientObserver observer;
+    auto client =
+        StreamClient::create("silent", "rtsp://127.0.0.1:" + std::to_string(ntohs(address.sin_port)) + "/");
+    observer.attach(client);
+    client->setSessionTimeout(200ms);
+    client->connect();
+    EXPECT_TRUE(observer.waitFor([&] { return observer.failed_; }, 3s));
+    client->disconnect();
+    EXPECT_EQ(observer.failure_code_, 408);
 }

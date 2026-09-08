@@ -39,7 +39,7 @@ constexpr unsigned ESTIMATED_BITRATE = 500;
 
 /* Key frames of high resolution streams are considerably larger than the
    Live555 default, and anything that does not fit is silently truncated. */
-constexpr unsigned MAX_OUT_PACKET_BUFFER_SIZE = 524288;
+constexpr unsigned MAX_OUT_PACKET_BUFFER_SIZE = 16u << 20;
 
 uint16_t sockToPort(const in_addr& addr)
 {
@@ -202,11 +202,11 @@ const char* MulticastServerMediaSubsession::sdpLines(int addressFamily)
 class UnicastServerMediaSubsession : public OnDemandServerMediaSubsession
 {
 public:
-    static UnicastServerMediaSubsession* createNew(UsageEnvironment& env, std::weak_ptr<StreamServer> server,
+    static UnicastServerMediaSubsession* createNew(UsageEnvironment& env, StreamServer* server,
                                                    portNumBits initialPortNum, Boolean multiplexRTCPWithRTP);
 
 protected:
-    UnicastServerMediaSubsession(UsageEnvironment& env, std::weak_ptr<StreamServer> server, portNumBits initialPortNum,
+    UnicastServerMediaSubsession(UsageEnvironment& env, StreamServer* server, portNumBits initialPortNum,
                                  Boolean multiplexRTCPWithRTP);
     const char* sdpLines(int addressFamily) override;
     FramedSource* createNewStreamSource(unsigned clientSessionId, unsigned& estBitrate) override;
@@ -215,31 +215,35 @@ protected:
     void closeStreamSource(FramedSource* inputSource) override;
 
 private:
-    std::weak_ptr<StreamServer> server_;
+    // The owning RTSPServer is closed synchronously on this event loop before
+    // StreamServer's members are destroyed. Taking temporary shared ownership
+    // here can run its destructor inside an unfinished Live555 callback; weak
+    // ownership also loses cleanup notifications once destruction starts.
+    StreamServer* server_;
     bool dummy_session_;
 };
 
-UnicastServerMediaSubsession* UnicastServerMediaSubsession::createNew(UsageEnvironment& env,
-                                                                      std::weak_ptr<StreamServer> server,
+UnicastServerMediaSubsession* UnicastServerMediaSubsession::createNew(UsageEnvironment& env, StreamServer* server,
                                                                       portNumBits initialPortNum,
                                                                       Boolean multiplexRTCPWithRTP)
 {
     return new UnicastServerMediaSubsession(env, server, initialPortNum, multiplexRTCPWithRTP);
 }
 
-UnicastServerMediaSubsession::UnicastServerMediaSubsession(UsageEnvironment& env, std::weak_ptr<StreamServer> server,
-                                                           portNumBits initialPortNum, Boolean multiplexRTCPWithRTP)
-    : OnDemandServerMediaSubsession(env, True, initialPortNum, multiplexRTCPWithRTP), server_(server),
+UnicastServerMediaSubsession::UnicastServerMediaSubsession(UsageEnvironment& env, StreamServer* server,
+                                                           portNumBits initialPortNum,
+                                                           Boolean multiplexRTCPWithRTP)
+    : OnDemandServerMediaSubsession(env, False, initialPortNum, multiplexRTCPWithRTP), server_(server),
       dummy_session_(false)
 {
 }
 
 const char* UnicastServerMediaSubsession::sdpLines(int addressFamily)
 {
-    std::shared_ptr<StreamServer> s = server_.lock();
-    if (s && s->sink_)
+    StreamServer* s = server_;
+    if (RTPSink* sink = s ? s->activeSinkForSDP() : nullptr)
     {
-        setSDPLinesFromRTPSink(s->sink_, nullptr, ESTIMATED_BITRATE);
+        setSDPLinesFromRTPSink(sink, nullptr, ESTIMATED_BITRATE);
     }
     dummy_session_ = true;
     const char* lines = OnDemandServerMediaSubsession::sdpLines(addressFamily);
@@ -251,12 +255,12 @@ RTPSink* UnicastServerMediaSubsession::createNewRTPSink(Groupsock* rtpGroupsock,
                                                         FramedSource* inputSource)
 {
     VideoRTPSink* sink = nullptr;
-    std::shared_ptr<StreamServer> s = server_.lock();
+    StreamServer* s = server_;
     if (s)
     {
         sink = createVideoRTPSink(s->codec(), envir(), rtpGroupsock, rtpPayloadTypeIfDynamic);
-        if (!dummy_session_)
-            s->sink_ = sink;
+        if (!dummy_session_ && sink)
+            s->unicast_sinks_[inputSource] = sink;
         if (sink)
         {
             sink->setPacketSizes(s->preferredPacketSize(), s->maxPacketSize());
@@ -268,7 +272,7 @@ RTPSink* UnicastServerMediaSubsession::createNewRTPSink(Groupsock* rtpGroupsock,
 FramedSource* UnicastServerMediaSubsession::createNewStreamSource(unsigned clientSessionId, unsigned& estBitrate)
 {
     FramedSource* source = nullptr;
-    std::shared_ptr<StreamServer> s = server_.lock();
+    StreamServer* s = server_;
     if (s)
     {
         estBitrate = ESTIMATED_BITRATE;
@@ -281,7 +285,7 @@ FramedSource* UnicastServerMediaSubsession::createNewStreamSource(unsigned clien
         }
         else
         {
-            injector->shutdown();
+            Medium::close(injector);
             RCLCPP_ERROR(s->logger_, "[%s] unable to create RTP sink for %s", s->topic_name_.c_str(),
                          videoCodecName(s->codec()).c_str());
         }
@@ -291,11 +295,7 @@ FramedSource* UnicastServerMediaSubsession::createNewStreamSource(unsigned clien
 
 void UnicastServerMediaSubsession::closeStreamSource(FramedSource* inputSource)
 {
-    std::shared_ptr<StreamServer> s = server_.lock();
-    if (s)
-    {
-        s->closeStreamSource(inputSource);
-    }
+    server_->closeStreamSource(inputSource);
     OnDemandServerMediaSubsession::closeStreamSource(inputSource);
 }
 
@@ -311,10 +311,29 @@ StreamServer::StreamServer(const std::string& topic_name, unsigned udp_port, uns
       loop_(EventLoop::create()), rtsp_(nullptr), sms_(nullptr), sink_(nullptr), mcast_sink_(nullptr),
       mcast_rtcp_(nullptr), mcast_source_(nullptr)
 {
-    rtsp_ = RTSPServer::createNew(loop_->env(), udp_port);
-    if (!rtsp_)
-        throw StreamingError(udp_port == 0 ? "cannot create RTSP server"
-                                           : std::format("cannot create RTSP server on port {}", udp_port));
+    try
+    {
+        // Live555's scheduler is already running, including during construction.
+        loop_->post(
+            [this, udp_port]
+            {
+                static std::once_flag packet_buffer_initialized;
+                std::call_once(packet_buffer_initialized,
+                               [] { OutPacketBuffer::increaseMaxSizeTo(MAX_OUT_PACKET_BUFFER_SIZE); });
+                rtsp_ = RTSPServer::createNew(loop_->env(), udp_port);
+                if (!rtsp_)
+                    throw StreamingError(udp_port == 0
+                                             ? "cannot create RTSP server"
+                                             : std::format("cannot create RTSP server on port {}", udp_port));
+            });
+    }
+    catch (...)
+    {
+        // The EventLoop thread owns itself until stopped, even if this
+        // constructor throws and StreamServer's destructor never runs.
+        loop_->stop();
+        throw;
+    }
 }
 
 /* Creating and tearing down RTP sinks, RTCP instances and media sessions all
@@ -326,7 +345,21 @@ StreamServer::StreamServer(const std::string& topic_name, unsigned udp_port, uns
    so start() calling stop() nests safely. */
 void StreamServer::start(VideoCodec codec, bool use_multicast)
 {
-    loop_->post([this, codec, use_multicast] { startOnLoop(codec, use_multicast); });
+    loop_->post(
+        [this, codec, use_multicast]
+        {
+            try
+            {
+                startOnLoop(codec, use_multicast);
+            }
+            catch (...)
+            {
+                stopOnLoop();
+                rtp_mcast_.reset();
+                rtcp_mcast_.reset();
+                throw;
+            }
+        });
 }
 
 void StreamServer::stop()
@@ -337,7 +370,6 @@ void StreamServer::stop()
 void StreamServer::startOnLoop(VideoCodec codec, bool use_multicast)
 {
     RTCPInstance* rtcp = nullptr;
-    OutPacketBuffer::increaseMaxSizeTo(MAX_OUT_PACKET_BUFFER_SIZE);
     stop();
     if (!isSupported(codec))
         throw StreamingError(std::format("{} is not supported on your system", videoCodecName(codec)));
@@ -346,7 +378,7 @@ void StreamServer::startOnLoop(VideoCodec codec, bool use_multicast)
     {
         if (!rtp_mcast_ || !rtcp_mcast_)
         {
-            struct sockaddr_storage sockStorage;
+            struct sockaddr_storage sockStorage{};
             struct sockaddr_in* sockAddr = reinterpret_cast<struct sockaddr_in*>(&sockStorage);
             sockStorage.ss_family = AF_INET;
             sockAddr->sin_addr.s_addr = chooseRandomIPv4SSMAddress(loop_->env());
@@ -355,10 +387,13 @@ void StreamServer::startOnLoop(VideoCodec codec, bool use_multicast)
             rtp_mcast_->multicastSendOnly();
             rtcp_mcast_ = std::make_shared<Groupsock>(std::ref(loop_->env()), sockStorage, mcast_port + 1, 255);
             rtcp_mcast_->multicastSendOnly();
+            if (rtp_mcast_->socketNum() < 0 || rtcp_mcast_->socketNum() < 0)
+                throw StreamingError("cannot create multicast RTP/RTCP sockets");
         }
         sink_ = createVideoRTPSink(codec_, loop_->env(), rtp_mcast_.get(), 96);
         if (!sink_)
             throw StreamingError(std::format("cannot instantiate VideoRTPSink for {}", videoCodecName(codec_)));
+        mcast_sink_ = sink_;
         sink_->setPacketSizes(preferredPacketSize(), maxPacketSize());
         char hostname[HOST_NAME_MAX + 1];
         if (gethostname(hostname, sizeof(hostname)) == 0)
@@ -366,6 +401,9 @@ void StreamServer::startOnLoop(VideoCodec codec, bool use_multicast)
             hostname[HOST_NAME_MAX] = 0;
             rtcp = RTCPInstance::createNew(loop_->env(), rtcp_mcast_.get(), ESTIMATED_BITRATE,
                                            reinterpret_cast<unsigned char*>(hostname), sink_, NULL, True);
+            mcast_rtcp_ = rtcp;
+            if (!rtcp)
+                throw StreamingError("cannot create multicast RTCP instance");
         }
         else
             throw StreamingError("missing or invalid hostname on this system");
@@ -374,28 +412,31 @@ void StreamServer::startOnLoop(VideoCodec codec, bool use_multicast)
         sms_->addSubsession(MulticastServerMediaSubsession::createNew(*sink_, rtcp));
         rtsp_->addServerMediaSession(sms_);
         FrameInjector* injector = FrameInjector::createNew(loop_->env());
+        mcast_source_ = injector;
         FramedSource* source = createDiscreteFramer(codec_, loop_->env(), injector, injector);
         if (!source)
             throw StreamingError(std::format("cannot instantiate FramedSource for {}", videoCodecName(codec_)));
         /* Unlike the unicast case, Live555 does not take ownership of these
            objects, so stop() has to close them explicitly. */
-        mcast_sink_ = sink_;
-        mcast_rtcp_ = rtcp;
         mcast_source_ = source;
         newStreamSource(source, injector);
-        sink_->startPlaying(*source, afterPlaying, this);
+        if (!sink_->startPlaying(*source, afterPlaying, this))
+            throw StreamingError("cannot start multicast RTP stream");
     }
     else
     {
         sms_ = ServerMediaSession::createNew(loop_->env(), "", "rtsp_image_transport", topic_name_.c_str(),
                                              /*multicast*/ False);
-        sms_->addSubsession(UnicastServerMediaSubsession::createNew(loop_->env(), shared_from_this(),
-                                                                    randomEphemeralPortBase(), False));
+        sms_->addSubsession(
+            UnicastServerMediaSubsession::createNew(loop_->env(), this, randomEphemeralPortBase(), False));
         rtsp_->addServerMediaSession(sms_);
     }
     std::shared_ptr<char> tmp(rtsp_->rtspURL(sms_, ros_interface_socket()), [](char* p) { delete[] p; });
-    url_ = std::string(tmp.get());
-    RCLCPP_INFO(logger_, "[%s] new RTSP session at %s", topic_name_.c_str(), url_.c_str());
+    {
+        std::lock_guard<std::mutex> lock{streams_mutex_};
+        url_ = std::string(tmp.get());
+    }
+    RCLCPP_INFO(logger_, "[%s] new RTSP session at %s", topic_name_.c_str(), tmp.get());
 }
 
 void StreamServer::stopOnLoop()
@@ -418,6 +459,7 @@ void StreamServer::stopOnLoop()
             stream.second->shutdown();
     }
     streams_.clear();
+    unicast_sinks_.clear();
     url_.clear();
     lock.unlock();
 
@@ -470,8 +512,13 @@ StreamServer::~StreamServer()
 
 bool StreamServer::hasActiveStreams() const noexcept
 {
+    return activeStreamCount() != 0;
+}
+
+std::size_t StreamServer::activeStreamCount() const noexcept
+{
     std::lock_guard<std::mutex> lock{streams_mutex_};
-    return !streams_.empty();
+    return streams_.size();
 }
 
 void StreamServer::sendAccessUnit(const std::vector<FrameDataPtr>& frames) noexcept
@@ -502,7 +549,13 @@ unsigned StreamServer::maxPacketSize() const noexcept
 
 std::string StreamServer::url() const noexcept
 {
+    std::lock_guard<std::mutex> lock{streams_mutex_};
     return url_;
+}
+
+RTPSink* StreamServer::activeSinkForSDP()
+{
+    return unicast_sinks_.empty() ? nullptr : unicast_sinks_.begin()->second;
 }
 
 void StreamServer::newStreamSource(FramedSource* source, FrameInjector* injector) noexcept
@@ -518,6 +571,7 @@ void StreamServer::newStreamSource(FramedSource* source, FrameInjector* injector
 void StreamServer::closeStreamSource(FramedSource* source) noexcept
 {
     std::lock_guard<std::mutex> lock{streams_mutex_};
+    unicast_sinks_.erase(source);
     StreamMapping::iterator it = streams_.find(source);
     if (it != streams_.end())
     {
