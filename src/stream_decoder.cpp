@@ -62,14 +62,6 @@ namespace
    happened to flush them out of the decoder. */
 constexpr AVRational NANOSECOND_TIME_BASE{1, 1000000000};
 
-void set_codec_option(std::shared_ptr<AVCodecContext> ctx, const std::string& option, const std::string& value,
-                      const rclcpp::Logger& logger = rclcpp::get_logger("ffmpeg"))
-{
-    int result = av_opt_set(ctx->priv_data, option.c_str(), value.c_str(), 0);
-    if (result != 0)
-        RCLCPP_WARN(logger, "[%s] cannot set codec option %s=\"%s\"", ctx->codec->name, option.c_str(), value.c_str());
-}
-
 void set_codec_option(std::shared_ptr<AVCodecContext> ctx, const std::string& option, int value,
                       const rclcpp::Logger& logger = rclcpp::get_logger("ffmpeg"))
 {

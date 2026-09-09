@@ -36,13 +36,13 @@ int main(int argc, char** argv)
     rclcpp::Node::SharedPtr node = std::make_shared<rclcpp::Node>("rtsp_camera_proxy");
     rclcpp::Logger logger = node->get_logger();
     int ros_sock = -1;
-    if (const char* var = getenv("ROS_HOSTNAME"))
+    if (const char* hostname = getenv("ROS_HOSTNAME"))
     {
-        ros_sock = rtsp_image_transport::create_host_override_socket(var);
+        ros_sock = rtsp_image_transport::create_host_override_socket(hostname);
     }
-    else if (const char* var = getenv("ROS_IP"))
+    else if (const char* ip = getenv("ROS_IP"))
     {
-        ros_sock = rtsp_image_transport::create_host_override_socket(var, true);
+        ros_sock = rtsp_image_transport::create_host_override_socket(ip, true);
     }
     if (ros_sock >= 0)
     {
