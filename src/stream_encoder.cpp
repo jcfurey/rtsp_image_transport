@@ -163,7 +163,8 @@ AVPixelFormat toAVPixelFormat(const sensor_msgs::msg::Image& image)
         return AV_PIX_FMT_YUYV422;
     if (image.encoding == sensor_msgs::image_encodings::YUV422_YUY2)
         return AV_PIX_FMT_YUYV422;
-    if (image.encoding == sensor_msgs::image_encodings::NV12)
+    // Jazzy lacks the NV12 constant; the image encoding string is still "nv12".
+    if (image.encoding == "nv12")
         return AV_PIX_FMT_NV12;
     if (image.encoding == sensor_msgs::image_encodings::NV21)
         return AV_PIX_FMT_NV21;

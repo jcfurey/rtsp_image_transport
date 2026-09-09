@@ -564,7 +564,7 @@ void StreamServer::newStreamSource(FramedSource* source, FrameInjector* injector
     if (source && injector)
     {
         if (streams_.insert(std::make_pair(source, injector)).second)
-            RCLCPP_DEBUG(logger_, "[%s] created media source %p", topic_name_.c_str(), source);
+            RCLCPP_DEBUG(logger_, "[%s] created media source %p", topic_name_.c_str(), static_cast<void*>(source));
     }
 }
 
@@ -576,7 +576,7 @@ void StreamServer::closeStreamSource(FramedSource* source) noexcept
     if (it != streams_.end())
     {
         it->second->shutdown();
-        RCLCPP_DEBUG(logger_, "[%s] destroyed media source %p", topic_name_.c_str(), source);
+        RCLCPP_DEBUG(logger_, "[%s] destroyed media source %p", topic_name_.c_str(), static_cast<void*>(source));
         streams_.erase(it);
     }
     if (streams_.empty())

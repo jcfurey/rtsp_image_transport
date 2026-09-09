@@ -92,13 +92,13 @@ void do_global_initialize()
 #endif
     av_log_set_callback(ffmpeg_log_to_ros);
     av_log_set_level(AV_LOG_ERROR);
-    if (const char* node = getenv("ROS_HOSTNAME"))
+    if (const char* hostname = getenv("ROS_HOSTNAME"))
     {
-        ros_interface_socket_ = create_host_override_socket(node);
+        ros_interface_socket_ = create_host_override_socket(hostname);
     }
-    else if (const char* node = getenv("ROS_IP"))
+    else if (const char* ip = getenv("ROS_IP"))
     {
-        ros_interface_socket_ = create_host_override_socket(node, true);
+        ros_interface_socket_ = create_host_override_socket(ip, true);
     }
     if (ros_interface_socket_ >= 0)
     {
