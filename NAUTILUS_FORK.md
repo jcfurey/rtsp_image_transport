@@ -921,6 +921,58 @@ picture takes.
 - Missing `<algorithm>`, `<format>`, and `<functional>` includes that only
   resolved through transitive ROS headers.
 
+## Review fixes, 2026-09-25
+
+- A marked STAP-A or H.265 aggregation packet closed the access unit at its
+  first NAL unit. Live555 reports the marker bit per RTP packet, so the rest
+  of the picture went on as a separate one without a beginning. The picture is
+  now closed once the packet has been drained. Access units are also split on
+  the RTP timestamp rather than the presentation time, which Live555
+  re-anchors when the first RTCP sender report arrives. Both are covered by
+  tests that send real RTP packets through Live555's depacketizer.
+- A hardware decoder that turns the stream down in `get_format` makes
+  libavcodec return `AVERROR_INVALIDDATA`, which was treated as a damaged
+  packet. With a Vulkan device lacking video decode (Mesa's software
+  lavapipe in a GPU-less container) `auto` never fell back and lost every
+  frame. That rejection now falls back, and the startup packets are replayed
+  on the next candidate after every kind of hardware fallback.
+- Probing encoders and decoders quietened FFmpeg by saving and restoring the
+  process-wide log level. Two probes overlapping could leave it at PANIC for
+  good. The quietening is now per thread.
+- An unknown `codec` was accepted as a successful parameter change, then
+  stopped the running stream. It is now rejected before it is set. Both
+  plugins also reacted to every parameter change on the node, unrelated ones
+  included, resetting the encoder retry backoff or the reconnect backoff; they
+  now only react to their own.
+- A decoder failure with `reconnect_policy` 0 or 1 left the session streaming
+  into a queue nothing read, unbounded with `max_latency=0`. It now
+  disconnects; a parameter change reconnects.
+- The encoder allocated a full software frame per image and reused the VAAPI
+  surface through `av_frame_make_writable`, which would need a GPU-to-GPU copy
+  once the encoder still held it. The hardware decoder likewise allocated a
+  system-memory frame per picture. All three buffers are now reused or taken
+  from the pool.
+- Odd image sizes for H.264/H.265/MPEG-4 are rejected as invalid images
+  instead of failing the encoder, disabling hardware encoding and logging an
+  error every second.
+- More than 31 simultaneous viewers of one publisher exhausted Live555's event
+  triggers, and the extra viewer silently received nothing. It is now refused.
+- Quick Sync queued four frames (`async_depth`); NVENC used the deprecated
+  `llhp` preset, now its equivalent `p1` with `tune=ll`.
+- `rtsp_camera_proxy` logged camera credentials, truncated key frames larger
+  than 500 kB, and skipped `rclcpp::shutdown()`.
+- Tests run under `ament_cmake_ros`' isolation runner instead of fixed ROS
+  domain IDs, and the package no longer forces `Python3_EXECUTABLE`; the
+  workspace colcon defaults already select the system interpreter.
+
+The Nautilus Jazzy image also installs `ros-jazzy-rtsp-image-transport`
+2.0.2 from apt. Its plugins have the same class names, so whenever this
+package's install is not sourced ahead of it — running ctest directly, or a
+launch environment missing the overlay — pluginlib loads the upstream plugin
+without any of these changes. Its subscriber parameters are then named with
+the first character of the namespace cut off (`live.image.rtsp.*` for
+`/alive/image`).
+
 Keep upstream's Apache-2.0 license and copyright notices when rebasing. The
 intended upstreamable changes are configurable video subsession selection,
 codec-correct H.265 SDP parameter-set handling, the latency work, and the bug

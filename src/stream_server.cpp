@@ -277,6 +277,15 @@ FramedSource* UnicastServerMediaSubsession::createNewStreamSource(unsigned clien
     {
         estBitrate = ESTIMATED_BITRATE;
         FrameInjector* injector = FrameInjector::createNew(envir());
+        if (!injector->valid())
+        {
+            /* Refusing the viewer is better than accepting one that would
+               never be sent a frame. */
+            Medium::close(injector);
+            RCLCPP_ERROR(s->logger_, "[%s] too many simultaneous RTSP viewers; refusing another one",
+                         s->topic_name_.c_str());
+            return nullptr;
+        }
         source = createDiscreteFramer(s->codec(), envir(), injector, injector);
         if (source)
         {
@@ -413,6 +422,8 @@ void StreamServer::startOnLoop(VideoCodec codec, bool use_multicast)
         rtsp_->addServerMediaSession(sms_);
         FrameInjector* injector = FrameInjector::createNew(loop_->env());
         mcast_source_ = injector;
+        if (!injector->valid())
+            throw StreamingError("no Live555 event trigger left for the multicast source");
         FramedSource* source = createDiscreteFramer(codec_, loop_->env(), injector, injector);
         if (!source)
             throw StreamingError(std::format("cannot instantiate FramedSource for {}", videoCodecName(codec_)));

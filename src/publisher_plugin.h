@@ -74,6 +74,8 @@ private:
         rclcpp::node_interfaces::NodeTimersInterface>;
 
     void setupParameters(const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& node_parameters);
+    static rcl_interfaces::msg::SetParametersResult validateParameters(
+        const std::vector<rclcpp::Parameter>& parameters, const std::string& codec_parameter);
     void setupMatchedCallback(rclcpp::PublisherOptions& options);
     void setupDemandMonitor(DemandInterfaces node_interfaces);
     void onPublisherMatched(rclcpp::MatchedInfo& info);
@@ -88,6 +90,7 @@ private:
     rclcpp::node_interfaces::NodeParametersInterface::WeakPtr node_param_;
     std::string topic_name_, param_base_name_;
     std::unique_ptr<Config> config_;
+    rclcpp::Node::OnSetParametersCallbackHandle::SharedPtr param_validate_handle_;
     rclcpp::Node::PostSetParametersCallbackHandle::SharedPtr param_cb_handle_;
     std::shared_ptr<StreamServer> server_;
     std::shared_ptr<GraphMonitor> graph_monitor_;

@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <string>
+#include <vector>
 
 namespace rtsp_image_transport
 {
@@ -55,6 +56,16 @@ inline std::string topicParameterBase(const rclcpp::Node& node, const std::strin
                                       const std::string& transport)
 {
     return topicParameterBase(node.get_effective_namespace(), base_topic, transport);
+}
+
+/* Whether a parameter change touches anything under `prefix`. The node-wide
+   post-set callback fires for every parameter of the node, and a transport
+   reacting to unrelated ones reset its retry backoff and rebuilt failed
+   sessions or servers. */
+inline bool parametersConcern(const std::vector<rclcpp::Parameter>& parameters, const std::string& prefix)
+{
+    return std::any_of(parameters.begin(), parameters.end(),
+                       [&prefix](const rclcpp::Parameter& p) { return p.get_name().starts_with(prefix); });
 }
 
 /* The absolute topic name a relative one resolves to when nothing remaps it. */

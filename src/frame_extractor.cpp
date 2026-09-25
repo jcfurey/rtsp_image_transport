@@ -29,6 +29,7 @@
 #include <rclcpp/logging.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <format>
 #include <memory>
 
@@ -44,6 +45,18 @@ const unsigned char MPEG_START_CODE[] = {0x00, 0x00, 0x00, 0x01};
    frames up to the maximum. */
 constexpr std::size_t INITIAL_FRAME_BUFFER_SIZE = 262144;
 constexpr std::size_t MAXIMUM_FRAME_BUFFER_SIZE = 16777216;
+
+/* RTPSource keeps the RTP timestamp of the current packet protected, and its
+   accessor private to MediaSubsession. Naming the member through a derived
+   class yields an ordinary pointer to it, which is the only standard way to
+   read it from outside; nothing is ever instantiated. */
+struct RtpTimestampAccess : RTPSource
+{
+    static std::uint32_t current(const RTPSource& source)
+    {
+        return source.*(&RtpTimestampAccess::fCurPacketRTPTimestamp);
+    }
+};
 
 std::size_t annexBPrefixSize(VideoCodec codec)
 {
@@ -171,7 +184,7 @@ Boolean FrameExtractor::continuePlaying()
 void FrameExtractor::flushPending()
 {
     std::shared_ptr<StreamClient> sc = stream_client_.lock();
-    if (!sc || buffer_length_ == 0 || !have_buffer_time_ || discarding_access_unit_)
+    if (!sc || buffer_length_ == 0 || !have_buffer_time_ || discarding_access_unit_ || delivered_length_ > 0)
         return;
     /* For Annex B codecs continuePlaying() leaves a trailing start code waiting
        for a NAL unit that will now never arrive; other codecs have no prefix to
@@ -195,11 +208,69 @@ void FrameExtractor::sourceClosed(void* obj)
 void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes, struct timeval presentationTime,
                                   unsigned durationInMicroseconds)
 {
+    /* MultiFramedRTPSource hands over every NAL unit of an RTP packet from
+       within the getNextFrame() that continuePlaying() issues for the previous
+       one, so the NAL units of an aggregation packet (STAP-A, or an H.265 AP)
+       arrive as nested calls. The marker bit belongs to the packet, and every
+       one of them reports it. Closing the access unit at the first would send
+       the rest of the picture on as a separate, headless one. Only once the
+       outermost call returns has the packet been drained. */
+    ++delivery_depth_;
+    deliverNalUnit(frameSize, numTruncatedBytes, presentationTime);
+    if (--delivery_depth_ == 0 && marker_pending_)
+    {
+        marker_pending_ = false;
+        /* A picture being discarded ends with this packet as a whole, not with
+           its first NAL unit. */
+        if (discarding_access_unit_)
+            discarding_access_unit_ = false;
+        else
+            closeMarkedAccessUnit();
+    }
+}
+
+/* Hands over the access unit a marker bit closed. continuePlaying() has
+   already asked for the next NAL unit, to be stored after the start code at
+   the end of the buffer, so the buffer cannot be emptied yet: the delivered
+   bytes are only recorded, and dropped when that NAL unit arrives. */
+void FrameExtractor::closeMarkedAccessUnit()
+{
+    std::shared_ptr<StreamClient> sc = stream_client_.lock();
+    const std::size_t prefix_size = annexBPrefixSize(codec_);
+    if (!sc || discarding_access_unit_ || !have_buffer_time_ || buffer_length_ < prefix_size)
+        return;
+    const std::size_t length = buffer_length_ - prefix_size;
+    if (length == 0)
+        return;
+    const rclcpp::Time ts(buffer_time_.tv_sec, 1000ull * buffer_time_.tv_usec);
+    sc->receiveStreamData(codec_, subsession_, std::make_shared<FrameData>(buffer_.data(), length, ts));
+    delivered_length_ = length;
+    have_buffer_time_ = false;
+}
+
+void FrameExtractor::deliverNalUnit(unsigned frameSize, unsigned numTruncatedBytes, struct timeval presentationTime)
+{
+    if (delivered_length_ > 0)
+    {
+        /* Move the start code and the NAL unit that follows the delivered
+           access unit to the front, as if the buffer had been emptied. */
+        const std::size_t kept = buffer_length_ - delivered_length_ + frameSize;
+        std::memmove(buffer_.data(), buffer_.data() + delivered_length_, kept);
+        buffer_length_ -= delivered_length_;
+        delivered_length_ = 0;
+    }
     std::shared_ptr<StreamClient> sc = stream_client_.lock();
     if (sc)
     {
         RTPSource* rtp = subsession_ ? subsession_->rtpSource() : nullptr;
         const bool marker = rtp && rtp->curPacketMarkerBit();
+        /* Every NAL unit of one picture carries the same RTP timestamp, so a
+           change of it ends an access unit. The presentation time derived from
+           it is no substitute: Live555 re-anchors it on the sender's clock
+           when the first RTCP sender report arrives, and a report landing in
+           the middle of a picture would split that picture in two. Scripted
+           sources in the tests have no RTP source. */
+        const std::uint32_t rtp_time = rtp ? RtpTimestampAccess::current(*rtp) : 0;
         if (numTruncatedBytes > 0)
         {
             /* The NAL unit did not fit. Enlarge the buffer so that the following
@@ -221,19 +292,27 @@ void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes
             }
             buffer_length_ = 0;
             buffer_time_ = presentationTime;
+            buffer_rtp_time_ = rtp_time;
             have_buffer_time_ = false;
-            discarding_access_unit_ = !marker;
+            discarding_access_unit_ = true;
+            marker_pending_ = marker_pending_ || marker;
             seedParameterSets();
             continuePlaying();
             return;
         }
+        auto same_picture = [&]
+        {
+            if (rtp)
+                return rtp_time == buffer_rtp_time_;
+            return presentationTime.tv_sec == buffer_time_.tv_sec && presentationTime.tv_usec == buffer_time_.tv_usec;
+        };
         if (discarding_access_unit_)
         {
-            if (presentationTime.tv_sec == buffer_time_.tv_sec && presentationTime.tv_usec == buffer_time_.tv_usec)
+            if (same_picture())
             {
                 buffer_length_ = 0;
                 have_buffer_time_ = false;
-                discarding_access_unit_ = !marker;
+                marker_pending_ = marker_pending_ || marker;
                 seedParameterSets();
                 continuePlaying();
                 return;
@@ -247,16 +326,14 @@ void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes
            losing packets decodes a small fraction of its frames.
 
            Two things close an access unit. The RTP marker bit says so directly
-           (RFC 6184), which costs nothing in latency. A change of presentation
-           time says so too, but only once the next picture has started, so it
+           (RFC 6184), which costs nothing in latency. A change of RTP timestamp
+           (or of presentation time, without an RTP source) says so too, but only once the next picture has started, so it
            arrives a frame late; it is the fallback for a sender whose marker
            bit is wrong — as ours was until it stopped letting live555 guess. */
         const std::size_t prefix_size = annexBPrefixSize(codec_);
         const std::size_t prefix_length =
             buffer_length_ >= prefix_size ? buffer_length_ - prefix_size : buffer_length_;
-        const bool time_changed = have_buffer_time_
-                                  && (presentationTime.tv_sec != buffer_time_.tv_sec
-                                      || presentationTime.tv_usec != buffer_time_.tv_usec);
+        const bool time_changed = have_buffer_time_ && !same_picture();
         if (time_changed && prefix_length > 0)
         {
             /* Everything sharing the old stamp has arrived; send it, then start
@@ -272,17 +349,16 @@ void FrameExtractor::deliverFrame(unsigned frameSize, unsigned numTruncatedBytes
         {
             buffer_length_ += frameSize;
         }
-        buffer_time_ = presentationTime;
+        /* The first NAL unit of a picture sets its stamp, so a presentation
+           time re-anchored halfway through does not move it. */
+        if (!have_buffer_time_ || time_changed)
+            buffer_time_ = presentationTime;
+        buffer_rtp_time_ = rtp_time;
         have_buffer_time_ = true;
 
+        /* Closed by deliverFrame() once the rest of this packet is in. */
         if (marker && buffer_length_ > 0)
-        {
-            const rclcpp::Time ts(buffer_time_.tv_sec, 1000ull * buffer_time_.tv_usec);
-            sc->receiveStreamData(codec_, subsession_,
-                                  std::make_shared<FrameData>(buffer_.data(), buffer_length_, ts));
-            buffer_length_ = 0;
-            have_buffer_time_ = false;
-        }
+            marker_pending_ = true;
         continuePlaying();
     }
 }

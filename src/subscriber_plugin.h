@@ -120,6 +120,8 @@ private:
     rclcpp::node_interfaces::NodeWaitablesInterface::WeakPtr node_waitables_;
     rclcpp::node_interfaces::PostSetParametersCallbackHandle::SharedPtr param_cb_handle_;
     rclcpp::Clock::SharedPtr clock_;
+    /* For log throttling, which must not stall with a paused simulated clock. */
+    rclcpp::Clock::SharedPtr steady_clock_ = std::make_shared<rclcpp::Clock>(RCL_STEADY_TIME);
     rclcpp::CallbackGroup::SharedPtr cooldown_cb_group_, scheduled_cb_group_;
     rclcpp::Duration old_lag_;
     rclcpp::WallTimer<rclcpp::VoidCallbackType>::SharedPtr cooldown_timer_, frame_timer_;

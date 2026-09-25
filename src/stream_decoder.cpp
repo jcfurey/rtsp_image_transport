@@ -514,6 +514,7 @@ void StreamDecoder::openCandidate(const DecoderCandidate& candidate)
 
     hw_device_.reset();
     hw_pixel_format_ = AV_PIX_FMT_NONE;
+    hw_format_rejected_.store(false);
     hardware_ = candidate.hardware;
     ctx_.reset(avcodec_alloc_context3(decoder), free_context);
     if (!ctx_)
@@ -629,6 +630,10 @@ AVPixelFormat StreamDecoder::selectPixelFormat(AVCodecContext* ctx, const AVPixe
             offered += name ? name : "?";
         }
         const char* wanted = av_get_pix_fmt_name(self->hw_pixel_format_);
+        /* libavcodec reports the resulting failure as AVERROR_INVALIDDATA,
+           exactly like a damaged packet. This is how decodeVideo() tells the
+           two apart. */
+        self->hw_format_rejected_.store(true);
         RCLCPP_WARN(self->logger_, "%s cannot decode this stream (it offers %s, not %s); trying the next decoder",
                     self->description_.c_str(), offered.empty() ? "nothing" : offered.c_str(),
                     wanted ? wanted : "the prepared format");
@@ -671,6 +676,47 @@ bool StreamDecoder::fallBackToNextCandidate(const std::string& reason)
     }
     resetWorkingBuffers();
     return false;
+}
+
+/* Falls back after the current hardware path failed, then decodes the
+   packets it was still being probed with again on the new candidate. Those
+   carry the parameter sets and first key frame of the stream, and without
+   them the next decoder would have nothing to start from until the camera
+   repeats them. Only the outermost call replays: when another candidate fails
+   during a replay, the replay starts over on the one after it. */
+bool StreamDecoder::fallBackAndReplay(const std::string& reason, std::size_t& replayed)
+{
+    std::vector<FrameDataPtr> packets = std::move(hardware_probe_packets_);
+    hardware_probe_packets_.clear();
+    replayed = 0;
+    if (!fallBackToNextCandidate(reason))
+        return false;
+    if (replaying_probe_packets_)
+    {
+        restart_replay_ = true;
+        return true;
+    }
+    replaying_probe_packets_ = true;
+    try
+    {
+        for (std::size_t i = 0; i < packets.size(); ++i)
+        {
+            replayed += decodeVideo(packets[i]);
+            if (restart_replay_)
+            {
+                restart_replay_ = false;
+                i = static_cast<std::size_t>(-1);
+            }
+        }
+    }
+    catch (...)
+    {
+        replaying_probe_packets_ = false;
+        restart_replay_ = false;
+        throw;
+    }
+    replaying_probe_packets_ = false;
+    return true;
 }
 
 void StreamDecoder::resetWorkingBuffers()
@@ -769,13 +815,17 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
                                           av_make_error_string(errbuf, sizeof(errbuf), result));
         // A damaged access unit is not a failed device. Keep the working
         // decoder and its parameter sets so the next key frame can recover.
-        if (result == AVERROR_INVALIDDATA)
+        // A hardware format the device turned down looks the same to the
+        // caller, but is a failed device.
+        const bool rejected = hw_format_rejected_.exchange(false);
+        if (result == AVERROR_INVALIDDATA && !(hardware_ && rejected))
         {
             hardware_probe_packets_.clear();
             throw DecodingError(message);
         }
-        if (hardware_ && fallBackToNextCandidate(message))
-            return 0;
+        std::size_t replayed = 0;
+        if (hardware_ && fallBackAndReplay(message, replayed))
+            return replayed;
         throw DecodingError(message);
     }
     std::size_t count = 0;
@@ -798,8 +848,9 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
         catch (const DecodingError& e)
         {
             av_frame_unref(frm_.get());
-            if (hardware_ && fallBackToNextCandidate(e.what()))
-                return count;
+            std::size_t replayed = 0;
+            if (hardware_ && fallBackAndReplay(e.what(), replayed))
+                return count + replayed;
             throw;
         }
         AVPixelFormat source_format = static_cast<AVPixelFormat>(source->format);
@@ -842,13 +893,15 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
     {
         std::string message = std::format("failed to receive frames from decoder: {}",
                                           av_make_error_string(errbuf, sizeof(errbuf), result));
-        if (result == AVERROR_INVALIDDATA)
+        const bool rejected = hw_format_rejected_.exchange(false);
+        if (result == AVERROR_INVALIDDATA && !(hardware_ && rejected))
         {
             hardware_probe_packets_.clear();
             throw DecodingError(message);
         }
-        if (hardware_ && fallBackToNextCandidate(message))
-            return count;
+        std::size_t replayed = 0;
+        if (hardware_ && fallBackAndReplay(message, replayed))
+            return count + replayed;
         throw DecodingError(message);
     }
     if (count > 0)
@@ -858,25 +911,9 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
     else if (probing && !hardware_candidate_proven_ && !replaying_probe_packets_
              && hardware_probe_packets_.size() >= hardware_probe_limit)
     {
-        std::vector<FrameDataPtr> replay_packets = std::move(hardware_probe_packets_);
-        hardware_probe_packets_.clear();
-        if (fallBackToNextCandidate("hardware decoder produced no frames during startup"))
-        {
-            std::size_t replayed = 0;
-            replaying_probe_packets_ = true;
-            try
-            {
-                for (const FrameDataPtr& packet : replay_packets)
-                    replayed += decodeVideo(packet);
-            }
-            catch (...)
-            {
-                replaying_probe_packets_ = false;
-                throw;
-            }
-            replaying_probe_packets_ = false;
+        std::size_t replayed = 0;
+        if (fallBackAndReplay("hardware decoder produced no frames during startup", replayed))
             return replayed;
-        }
     }
     return count;
 }
@@ -941,16 +978,31 @@ AVFrame* StreamDecoder::downloadIfHardwareFrame(AVFrame* frame)
 {
     if (!frame->hw_frames_ctx && !isHardwarePixelFormat(static_cast<AVPixelFormat>(frame->format)))
         return frame;
-    av_frame_unref(sw_frm_.get());
-    /* Leaving the format unset lets FFmpeg pick the cheapest transfer format
-       the device supports, usually NV12 or P010 for 10 bit streams. */
-    int result = av_hwframe_transfer_data(sw_frm_.get(), frame, 0);
+    /* The first transfer leaves the format unset, letting FFmpeg pick the
+       cheapest one the device supports, usually NV12 or P010 for 10 bit
+       streams. Later ones reuse that buffer instead of allocating a whole
+       frame of system memory per picture; nothing else references it once
+       the previous picture has been converted. */
+    int result = -1;
+    if (sw_frm_->buf[0] && sw_frm_->width == frame->width && sw_frm_->height == frame->height)
+        result = av_hwframe_transfer_data(sw_frm_.get(), frame, 0);
+    if (result < 0)
+    {
+        av_frame_unref(sw_frm_.get());
+        result = av_hwframe_transfer_data(sw_frm_.get(), frame, 0);
+    }
     if (result < 0)
     {
         char errbuf[80];
         throw DecodingError(std::format("failed to transfer decoded frame from device memory: {}",
                                         av_make_error_string(errbuf, sizeof(errbuf), result)));
     }
+    /* copy_props() appends side data and merges metadata rather than
+       replacing them, so a reused frame has to shed the previous picture's
+       first. */
+    while (sw_frm_->nb_side_data > 0)
+        av_frame_remove_side_data(sw_frm_.get(), sw_frm_->side_data[0]->type);
+    av_dict_free(&sw_frm_->metadata);
     av_frame_copy_props(sw_frm_.get(), frame);
     return sw_frm_.get();
 }

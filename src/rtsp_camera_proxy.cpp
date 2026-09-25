@@ -28,7 +28,27 @@
 #include <std_msgs/msg/string.hpp>
 
 #include <format>
+#include <string>
 #include <thread>
+
+namespace
+{
+
+/* Camera URLs often carry credentials (rtsp://user:password@host/...), which
+   have no business in a log file. */
+std::string withoutCredentials(const std::string& url)
+{
+    const std::size_t scheme = url.find("://");
+    if (scheme == std::string::npos)
+        return url;
+    const std::size_t authority = scheme + 3;
+    const std::size_t at = url.find('@', authority);
+    if (at == std::string::npos || at > url.find('/', authority))
+        return url;
+    return url.substr(0, authority) + "***@" + url.substr(at + 1);
+}
+
+}  // namespace
 
 int main(int argc, char** argv)
 {
@@ -57,7 +77,9 @@ int main(int argc, char** argv)
     rtsp_only_img->encoding = sensor_msgs::image_encodings::BGR8;
     rtsp_only_img->step = 3;
     rtsp_only_img->data = {0, 0, 0};
-    OutPacketBuffer::maxSize = 500000;
+    /* Anything larger is silently truncated, and 500 kB did not hold the key
+       frames of a 4K camera. Matches the publisher's RTSP server. */
+    OutPacketBuffer::maxSize = 16u << 20;
     TaskScheduler* scheduler = BasicTaskScheduler::createNew();
     UsageEnvironment* env = BasicUsageEnvironment::createNew(*scheduler);
 
@@ -104,7 +126,8 @@ int main(int argc, char** argv)
         std_msgs::msg::String url_msg;
         url_msg.data = proxyURL;
         delete[] proxyURL;
-        RCLCPP_INFO(logger, "%s: %s via %s", camera_base_topic.c_str(), camera_uri.c_str(), url_msg.data.c_str());
+        RCLCPP_INFO(logger, "%s: %s via %s", camera_base_topic.c_str(), withoutCredentials(camera_uri).c_str(),
+                    url_msg.data.c_str());
 
         camera_pub_raw.push_back(node->create_publisher<sensor_msgs::msg::Image>(
             camera_base_topic, rclcpp::QoS(rclcpp::KeepLast(1)).durability(RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL)));
@@ -120,5 +143,11 @@ int main(int argc, char** argv)
     rclcpp::spin(node);
     shutdown = 1;
     t.join();
+    Medium::close(rtspServer);
+    env->reclaim();
+    delete scheduler;
+    /* See publish_rtsp_stream: the context has to go down before the node and
+       its publishers are destroyed. */
+    rclcpp::shutdown();
     return 0;
 }

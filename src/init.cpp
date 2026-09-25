@@ -21,6 +21,7 @@
 #include "init.h"
 
 #include "host_override.h"
+#include "log_level.h"
 
 #include <rclcpp/logging.hpp>
 
@@ -44,12 +45,13 @@ void ffmpeg_log_to_ros(void* avcl, int level, const char* fmt, va_list ap)
     static rclcpp::Logger logger = rclcpp::get_logger("ffmpeg");
     int effective_log_level =
         logger.get_effective_level() == rclcpp::Logger::Level::Debug ? AV_LOG_INFO : av_log_get_level();
-    if (level > effective_log_level)
+    if (level > effective_log_level || level > thread_av_log_cap)
         return;
     char buf[256];
     const char* class_name = "misc";
-    if (avcl)
-        class_name = (*static_cast<AVClass**>(avcl))->class_name;
+    const AVClass* av_class = avcl ? *static_cast<AVClass**>(avcl) : nullptr;
+    if (av_class && av_class->class_name)
+        class_name = av_class->class_name;
     int len = vsnprintf(buf, sizeof(buf), fmt, ap);
     if (len <= 0)
         return;
