@@ -973,6 +973,155 @@ without any of these changes. Its subscriber parameters are then named with
 the first character of the namespace cut off (`live.image.rtsp.*` for
 `/alive/image`).
 
+## Open decisions
+
+Found in the 2026-09-25 review and deliberately left unchanged, because each
+one trades one behaviour for another or needs measuring first. Each entry
+gives what happens now, the options, and a recommendation.
+
+### 1. Output after the drop ladder recovers
+
+**Now.** When the decoder falls behind, `processFrame()` in
+`subscriber_plugin.cpp` steps it down to decoding intra frames, then key
+frames, then nothing (`StreamDecoder::setDecodeFrames()`). Once the lag clears
+it goes straight back to decoding everything, mid-GOP. The next P-frames
+reference pictures that were never decoded, so the output is smeared until the
+next key frame, and `drop_corrupt_frames` defaults to off, so those pictures
+are published. With `intra_refresh=true` there are no key frames or I-frames
+at all, so the intra and key rungs discard every picture: the ladder only ever
+means blackout followed by smearing.
+
+**Options.**
+- (a) Leave it. Smearing lasts at most one GOP (one second by default).
+- (b) After leaving the key or nothing rungs, where references are certainly
+  missing, wait for a key frame again as a new session does. This costs up to
+  one GOP of no output after each overload episode, and repeatedly if the load
+  oscillates around a threshold.
+- (c) Do (b) only when `drop_corrupt_frames` is on. That parameter already
+  states the choice between seeing nothing and seeing wrong pixels, and the
+  launch files set it to off.
+- Separately, skip the intra and key rungs for a stream that has shown no key
+  frame within `KEYFRAME_WAIT_LIMIT` (120) pictures.
+
+**Recommendation.** (c), plus skipping those rungs for streams without key
+frames. This keeps the current behaviour for the shipped launch files.
+
+### 2. Lock scope in both plugins
+
+**Now.**
+- The publisher holds `mutex_` across the whole encode and send in
+  `publish()`. Three other things wait on it: the 100 Hz demand timer
+  (`updateDemand()`, which occupies an executor thread while it waits),
+  parameter updates, and `onGraphChange()`. `GraphMonitor` calls
+  `onGraphChange()` under its process-wide mutex, so graph events for every
+  publisher in the process wait on this one's encode.
+- The subscriber holds the callback gate's mutex across decoding, BGR
+  conversion and the user's image callback. `getNumPublishers()`, `getTopic()`
+  and parameter updates block for that long. A user callback that waits for
+  another thread which calls `getNumPublishers()` on the same subscriber
+  deadlocks.
+
+**Options.**
+- Publisher: a small state mutex for `server_`, `failed_` and the
+  configuration, a separate encode mutex, and an atomic "encoding" flag.
+  `updateDemand()` and `onGraphChange()` would read the flag, and the encoder
+  reset would move into the next `publish()`.
+- Subscriber: invoke the user callback after releasing the gate, then check
+  `gate->active` and the connection generation again.
+- Or leave both as they are.
+
+**Recommendation.** Do the publisher split; it is contained and testable.
+Hold the subscriber change until needed. The gate is what AUDIT.md's lifetime
+fixes depend on, and changing it needs the ASan lifetime tests re-run.
+
+### 3. Encoder probing on every restart
+
+**Now.** Constructing a `StreamEncoder` opens a throwaway 640×480 encoder for
+each candidate to see whether it works, and then opens the real one. For
+VAAPI that creates the device twice. A new encoder is constructed on every
+first RTSP client, every resolution change and every one-second retry after an
+error, inside `publish()` and under `mutex_`.
+
+**Options.** Cache the working encoder name for each (codec, use_hw_encoder)
+pair for the whole process, and probe again only after it fails. Or leave it.
+
+**Recommendation.** Measure it first with the GPU: time from the first client
+connecting to the first packet, on NVENC, VAAPI and x264. Cache the name if
+NVENC or VAAPI setup exceeds about 100 ms.
+
+### 4. Time stamps of delayed encoder output
+
+**Now.** Every packet `avcodec_receive_packet()` returns after an image is
+sent to the encoder is stamped with that image's time and sent as one access
+unit. That is only right for an encoder that returns image N's packet before
+image N+1 goes in. The configured encoders aim for that (x264/x265
+`zerolatency`, NVENC `zerolatency`, VAAPI and Quick Sync `async_depth=1`,
+libvpx `lag-in-frames=0`), but nothing checks it. An encoder with delay would
+give every packet a newer image's stamp, and if one call drained two pictures
+they would go out as one access unit with one marker bit.
+
+**Options.**
+- Key both stamps and access-unit boundaries on `AVPacket::pts`: keep a small
+  map from pts to stamp, and send one access unit per packet.
+- Or add a test asserting one packet per image for every encoder this build
+  offers.
+
+**Recommendation.** The pts map. It is defensive and low risk.
+
+### 5. Sender time stamps step once RTCP synchronises
+
+**Now.** With `timestamp_source=0`, or `2` on a wall-clock node (the vehicle
+case), `header.stamp` is Live555's presentation time. Until the first RTCP
+sender report, which usually arrives within about five seconds, Live555
+derives it from the receiver's clock. After that it follows the sender's
+clock. `header.stamp` therefore steps by the camera's clock offset early in
+every session, and backwards if the camera runs behind, which upsets TF and
+message_filters. For a camera without NTP or PTP synchronisation, sender time
+is arbitrary. The access-unit boundary no longer depends on this (see the
+review fixes above); only the published stamp does.
+
+**Options.**
+- (a) Document it, and recommend `timestamp_source=1` (receive time) for
+  cameras that are not clock-synchronised.
+- (b) Discard pictures until `RTPSource::hasBeenSynchronizedUsingRTCP()`
+  whenever sender time is selected. The stamps are then consistent, at the
+  cost of a few seconds without output at the start of each session.
+- (c) Never let the stamp decrease. This hides the backwards step but
+  produces repeated stamps.
+
+**Recommendation.** (a) now. Add (b) as an opt-in parameter if a synchronised
+camera needs sender time from its first frame.
+
+### Lower priority
+
+- A hardware decoder failing mid-stream after it has worked falls back without
+  the SDP parameter sets. Those are only prepended to the first access unit
+  and never set as `extradata`. A camera that sends them only in the SDP then
+  leaves the new decoder unable to start. The stall watchdog flushes it every
+  `decoder_stall_timeout` indefinitely without escalating to a reconnect.
+  Suggested fix: pass the parameter sets to the decoder as `extradata`, and
+  reconnect after several consecutive stalls.
+- On the image_transport node-interface path (Lyrical), frames are delivered
+  by a 2 ms wall timer that runs even while no session is active: 500 wakeups
+  per second per subscriber. It could be cancelled while disconnected.
+- `img->data.resize()` zero-fills every decoded BGR image before swscale
+  overwrites it: 6 MB per frame at 1080p. Avoiding it needs a
+  default-initialising allocator in the message type.
+- The encoder does not tag colour metadata. swscale converts with BT.601
+  limited range, and third-party players tend to assume BT.709 for untagged
+  HD video. Set `colorspace`/`color_range` on the codec context to match.
+- The legacy advertise path names parameters from the node's effective
+  namespace and the node-interface path from the plain namespace, so they
+  differ for sub-nodes. RequiredInterfaces does not provide the effective
+  namespace.
+
+### Not yet verified
+
+- Nothing was built or tested on Lyrical in the review; everything ran on the
+  Jazzy development image.
+- The VAAPI encoder surface change and Quick Sync `async_depth=1` have not run
+  on Intel hardware. The NVENC, CUDA and software paths were tested.
+
 Keep upstream's Apache-2.0 license and copyright notices when rebasing. The
 intended upstreamable changes are configurable video subsession selection,
 codec-correct H.265 SDP parameter-set handling, the latency work, and the bug
