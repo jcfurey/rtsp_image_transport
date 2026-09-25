@@ -154,6 +154,7 @@ private:
        does not pre-fill its frames. Sparsely sampled; see the implementation. */
     double unwrittenFraction(const AVFrame* frame) const noexcept;
     void resetWorkingBuffers();
+    bool fallBackAndReplay(const std::string& reason, std::size_t& replayed);
 
     rclcpp::Logger logger_;
     VideoCodec codec_;
@@ -184,6 +185,10 @@ private:
     std::vector<FrameDataPtr> hardware_probe_packets_;
     bool hardware_candidate_proven_ = false;
     bool replaying_probe_packets_ = false;
+    bool restart_replay_ = false;
+    /* Set by the get_format callback when the device cannot take this stream.
+       Atomic because frame threading may call it from a worker thread. */
+    std::atomic<bool> hw_format_rejected_{false};
 };
 
 }  // namespace rtsp_image_transport

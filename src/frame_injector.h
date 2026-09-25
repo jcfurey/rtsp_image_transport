@@ -61,6 +61,13 @@ public:
     static constexpr std::size_t MAX_ACCESS_UNIT_BYTES = 16u << 20;
 
     static FrameInjector* createNew(UsageEnvironment& env);
+    /* False when the task scheduler had no event trigger left for this
+       injector (Live555 allows MAX_NUM_EVENT_TRIGGERS, 32 by default, per
+       scheduler). Such an injector would never wake its client up. */
+    bool valid() const noexcept
+    {
+        return deliver_frame_trigger_ != 0;
+    }
     ~FrameInjector();
     void shutdown();
     /* Enqueues one complete encoded picture atomically. Keeping this boundary

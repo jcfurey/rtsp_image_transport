@@ -26,6 +26,7 @@
 #include <liveMedia.hh>
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -53,6 +54,8 @@ private:
                                  struct timeval presentationTime, unsigned durationInMicroseconds);
     void deliverFrame(unsigned frameSize, unsigned numTruncatedBytes, struct timeval presentationTime,
                       unsigned durationInMicroseconds);
+    void deliverNalUnit(unsigned frameSize, unsigned numTruncatedBytes, struct timeval presentationTime);
+    void closeMarkedAccessUnit();
 
     /* Copies the out-of-band parameter sets to the front of an empty buffer */
     void seedParameterSets();
@@ -75,16 +78,24 @@ private:
        the decoder at all. */
     std::vector<unsigned char> parameter_sets_;
     bool warned_at_limit_;
-    /* Presentation time of the NAL units currently in the buffer. Every NAL
-       unit of one picture carries the same RTP timestamp, so a change of it
-       ends an access unit — the fallback boundary for a sender whose marker
-       bit cannot be trusted. */
+    /* Presentation time of the first NAL unit in the buffer, which stamps the
+       access unit. Also the fallback boundary when there is no RTP source. */
     struct timeval buffer_time_
     {
         0, 0
     };
     bool have_buffer_time_ = false;
     bool discarding_access_unit_ = false;
+    /* RTP timestamp of the buffered NAL units; the access unit boundary
+       whenever there is an RTP source to read it from. */
+    std::uint32_t buffer_rtp_time_ = 0;
+    /* Nesting of deliverFrame(), and whether a marker bit seen inside it still
+       has to close the access unit once the current RTP packet is drained. */
+    unsigned delivery_depth_ = 0;
+    bool marker_pending_ = false;
+    /* Leading bytes of the buffer that were already handed over as a closed
+       access unit, to be discarded when the next NAL unit arrives. */
+    std::size_t delivered_length_ = 0;
 };
 
 }  // namespace rtsp_image_transport

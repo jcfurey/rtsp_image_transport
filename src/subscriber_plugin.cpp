@@ -31,6 +31,7 @@
 #include <rclcpp/waitable.hpp>
 #include <rclcpp/create_subscription.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <functional>
 
@@ -318,8 +319,12 @@ void SubscriberPlugin::subscribeImpl(rclcpp::Node* node, const std::string& base
     failed_ = false;
     param_base_name_ = topicParameterBase(*node, base_topic, getTransportName());
     setupParameters(node_param_.lock());
-    param_cb_handle_ = node_param_.lock()->add_post_set_parameters_callback(
-        callback_gate_->wrap([this](const std::vector<rclcpp::Parameter>&) { updateParameters(); }));
+    param_cb_handle_ = node_param_.lock()->add_post_set_parameters_callback(callback_gate_->wrap(
+        [this](const std::vector<rclcpp::Parameter>& parameters)
+        {
+            if (parametersConcern(parameters, param_base_name_ + "."))
+                updateParameters();
+        }));
     updateParameters();
 }
 #endif
@@ -364,8 +369,12 @@ void SubscriberPlugin::subscribeImpl(image_transport::RequiredInterfaces node_in
     param_base_name_ = topicParameterBase(node_base->get_namespace(), base_topic, getTransportName());
 
     setupParameters(node_parameters);
-    param_cb_handle_ = node_parameters->add_post_set_parameters_callback(
-        callback_gate_->wrap([this](const std::vector<rclcpp::Parameter>&) { updateParameters(); }));
+    param_cb_handle_ = node_parameters->add_post_set_parameters_callback(callback_gate_->wrap(
+        [this](const std::vector<rclcpp::Parameter>& parameters)
+        {
+            if (parametersConcern(parameters, param_base_name_ + "."))
+                updateParameters();
+        }));
     updateParameters();
 
     scheduled_cb_group_ = node_base->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -698,6 +707,9 @@ void SubscriberPlugin::updateParameters()
         }
         if (config_->reconnect_maxwait < config_->reconnect_minwait)
             config_->reconnect_maxwait = config_->reconnect_minwait;
+        /* Zero for both would retry an unreachable camera as fast as the
+           executor can spin. */
+        config_->reconnect_maxwait = std::max(config_->reconnect_maxwait, std::chrono::milliseconds(100));
         if (client_)
         {
             client_->setSessionTimeout(config_->timeout);
@@ -864,7 +876,8 @@ void SubscriberPlugin::processFrame()
     {
         if (!gate->active)
             return;
-        RCLCPP_WARN(logger_, "[%s] %s", topic_name_.c_str(), e.what());
+        /* A lossy link can make this fail on every access unit. */
+        RCLCPP_WARN_THROTTLE(logger_, *steady_clock_, 5000, "[%s] %s", topic_name_.c_str(), e.what());
     }
     catch (const std::exception& e)
     {
@@ -876,6 +889,14 @@ void SubscriberPlugin::processFrame()
         if (reconnectAfterFailure(config_->reconnect_policy))
         {
             reconnect();
+        }
+        else
+        {
+            /* Nothing will consume the stream any more. Left connected, it
+               kept the socket and receive thread busy and, with max_latency=0,
+               queued data without bound. A parameter change reconnects. */
+            disconnectClient();
+            clearQueuedFrames();
         }
     }
     bool pending;
@@ -947,7 +968,11 @@ void SubscriberPlugin::reconnect()
         std::lock_guard<std::mutex> lock{cooldown_mutex_};
         RCLCPP_INFO(logger_, "[%s] new connection attempt in %0.3lf seconds", topic_name_.c_str(),
                     1e-3 * cooldown_.count());
-        cooldown_cb_group_ = nb->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        /* One group for every retry timer: the node keeps a list entry per
+           group ever created, and each new one makes the executor rebuild its
+           entity collection. */
+        if (!cooldown_cb_group_)
+            cooldown_cb_group_ = nb->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         cooldown_timer_ = std::make_shared<rclcpp::WallTimer<rclcpp::VoidCallbackType>>(
             cooldown_,
             callback_gate_->wrap([this, generation = connection_generation_]

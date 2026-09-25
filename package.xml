@@ -8,6 +8,7 @@
     <author email="timo.roehling@fkie.fraunhofer.de">Timo Röhling</author>
     <maintainer email="timo.roehling@fkie.fraunhofer.de">Timo Röhling</maintainer>
     <buildtool_depend>ament_cmake_auto</buildtool_depend>
+    <buildtool_depend>pkg-config</buildtool_depend>
     <depend>ffmpeg</depend>
     <depend>image_transport</depend>
     <depend>live555_vendor</depend>
@@ -18,6 +19,7 @@
     <exec_depend>launch_ros</exec_depend>
     <exec_depend>launch_yaml</exec_depend>
     <test_depend>ament_cmake_gtest</test_depend>
+    <test_depend>ament_cmake_ros</test_depend>
     <test_depend>rosgraph_msgs</test_depend>
     <export>
         <build_type>ament_cmake</build_type>

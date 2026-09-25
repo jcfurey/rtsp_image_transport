@@ -40,7 +40,8 @@ FrameInjector::FrameInjector(UsageEnvironment& env)
 FrameInjector::~FrameInjector()
 {
     shutdown();
-    envir().taskScheduler().deleteEventTrigger(deliver_frame_trigger_);
+    if (deliver_frame_trigger_ != 0)
+        envir().taskScheduler().deleteEventTrigger(deliver_frame_trigger_);
 }
 
 void FrameInjector::shutdown()

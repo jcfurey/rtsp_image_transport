@@ -343,7 +343,13 @@ void StreamEncoder::setupEncoder(const AVCodec* encoder, bool silent)
         set_codec_option(ctx_, "profile", "main", silent, logger_);
         if (strstr(encoder->name, "nvenc"))
         {
-            set_codec_option(ctx_, "preset", "llhp", silent, logger_);
+            /* p1 with the low-latency tuning is what FFmpeg expands the
+               deprecated llhp alias to, without the deprecation warning.
+               Builds older than the SDK 10 presets still take llhp. */
+            if (set_codec_option(ctx_, "preset", "p1", true, logger_))
+                set_codec_option(ctx_, "tune", "ll", silent, logger_);
+            else
+                set_codec_option(ctx_, "preset", "llhp", silent, logger_);
             set_codec_option(ctx_, "zerolatency", 1, silent, logger_);
         }
         else if (strstr(encoder->name, "x26"))
@@ -355,7 +361,10 @@ void StreamEncoder::setupEncoder(const AVCodec* encoder, bool silent)
         {
             set_codec_option(ctx_, "look_ahead", "0", silent, logger_);
             set_codec_option(ctx_, "preset", "fast", silent, logger_);
-            set_codec_option(ctx_, "tune", "zerolatency", silent, logger_);
+            /* Quick Sync queues four frames by default, which is four frames
+               of latency. It has no "tune" option; setting one only logged a
+               warning on every encoder start. */
+            set_codec_option(ctx_, "async_depth", 1, silent, logger_);
         }
         if (is_vaapi_)
         {
@@ -537,6 +546,14 @@ std::size_t StreamEncoder::encodeVideo(const sensor_msgs::msg::Image& image)
     const AVPixelFormat av_format = toAVPixelFormat(image);
     if (av_format == AV_PIX_FMT_NONE)
         throw InvalidImageError(std::format("unsupported image format {}", image.encoding));
+    /* The H.264, H.265 and MPEG-4 encoders refuse to open for an odd size of
+       4:2:0 input. Rejecting the image here keeps that a dropped frame rather
+       than an encoder failure, which disabled hardware encoding and was
+       retried and logged every second. libvpx and AV1 cope with odd sizes. */
+    if ((codec_ == VideoCodec::H264 || codec_ == VideoCodec::H265 || codec_ == VideoCodec::MPEG4) &&
+        (image.width % 2 != 0 || image.height % 2 != 0))
+        throw InvalidImageError(std::format("{}x{} images cannot be encoded; width and height must be even",
+                                            image.width, image.height));
     if (av_image_check_size(image.width, image.height, 0, nullptr) < 0 ||
         image.step > static_cast<unsigned>(std::numeric_limits<int>::max()))
         throw InvalidImageError("invalid image dimensions or row stride");
@@ -591,16 +608,26 @@ std::size_t StreamEncoder::encodeVideo(const sensor_msgs::msg::Image& image)
     if (image.width != static_cast<unsigned>(ctx_->width) || image.height != static_cast<unsigned>(ctx_->height))
         throw StreamingError("image size changed unexpectedly");
 
-    av_frame_unref(sw_frm_.get());
-    sw_frm_->width = image.width;
-    sw_frm_->height = image.height;
+    /* Allocated once and reused: a fresh buffer per image was a multi-megabyte
+       malloc and free on every frame. The encoder may still hold a reference
+       to the previous picture, in which case make_writable() gives this frame
+       new storage and leaves the old one to the encoder. */
+    if (!sw_frm_->buf[0])
+    {
+        sw_frm_->width = image.width;
+        sw_frm_->height = image.height;
 #ifdef FFMPEG_HAS_HWFRAME_SUPPORT
-    sw_frm_->format = is_vaapi_ ? hw_frames_ctx_->sw_format : ctx_->pix_fmt;
+        sw_frm_->format = is_vaapi_ ? hw_frames_ctx_->sw_format : ctx_->pix_fmt;
 #else
-    sw_frm_->format = ctx_->pix_fmt;
+        sw_frm_->format = ctx_->pix_fmt;
 #endif
-    if (av_frame_get_buffer(sw_frm_.get(), 0) != 0)
+        if (av_frame_get_buffer(sw_frm_.get(), 0) != 0)
+            throw StreamingError("failed to allocate encoding frame buffer");
+    }
+    else if (av_frame_make_writable(sw_frm_.get()) < 0)
+    {
         throw StreamingError("failed to allocate encoding frame buffer");
+    }
 
     if (!sws_ || av_format != last_pixel_format_)
     {
@@ -620,7 +647,12 @@ std::size_t StreamEncoder::encodeVideo(const sensor_msgs::msg::Image& image)
 #ifdef FFMPEG_HAS_HWFRAME_SUPPORT
     if (is_vaapi_)
     {
-        if (av_frame_make_writable(hw_frm_.get()) < 0 ||
+        /* A fresh surface from the pool for every picture, as FFmpeg's own
+           VAAPI encoding example does. make_writable() on a surface the
+           encoder still references would need a GPU-to-GPU frame copy, which
+           the VAAPI hwcontext does not provide. */
+        av_frame_unref(hw_frm_.get());
+        if (av_hwframe_get_buffer(hw_frames_.get(), hw_frm_.get(), 0) < 0 ||
             av_hwframe_transfer_data(hw_frm_.get(), sw_frm_.get(), 0) < 0)
             throw EncodingError("failed to upload image to the hardware encoder");
         encoder_input = hw_frm_.get();

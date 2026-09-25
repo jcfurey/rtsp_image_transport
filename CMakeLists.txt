@@ -21,26 +21,9 @@
 cmake_minimum_required(VERSION 3.13...3.28)
 project(
     rtsp_image_transport
-    VERSION 2.0.0
+    VERSION 2.0.2
     LANGUAGES CXX
 )
-
-# ament executes package.xml helpers with the interpreter selected by CMake.
-# cam-ripper has an unrelated ~/.local Python 3.11 ahead of the ROS Lyrical
-# system interpreter, but that environment does not contain catkin_pkg. Honour
-# an explicit caller override; otherwise select the Ubuntu system Python that
-# owns the ROS Python modules.
-if(NOT Python3_EXECUTABLE)
-    find_program(
-        ROS_SYSTEM_PYTHON
-        NAMES python3
-        PATHS /usr/bin
-        NO_DEFAULT_PATH
-        REQUIRED
-    )
-    set(Python3_EXECUTABLE "${ROS_SYSTEM_PYTHON}" CACHE FILEPATH "Python interpreter used by ROS" FORCE)
-endif()
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 include(GenerateExportHeader)
 include(CheckCXXSourceCompiles)
@@ -280,9 +263,9 @@ if(BUILD_BENCHMARKS)
     foreach(bench IN LISTS benchmarks)
         add_executable(${bench} benchmark/${bench}.cpp)
         target_include_directories(
-            ${bench} PRIVATE src test ${CMAKE_CURRENT_BINARY_DIR} ${FFMPEG_INCLUDE_DIRS}
+            ${bench} PRIVATE src test ${CMAKE_CURRENT_BINARY_DIR} 
         )
-        target_link_libraries(${bench} ${PROJECT_NAME}_core ${FFMPEG_LIBRARIES})
+        target_link_libraries(${bench} ${PROJECT_NAME}_core)
         # These benchmarks drive the real image_transport plugins.
         if(bench STREQUAL "latency_bench" OR bench STREQUAL "multi_stream_bench")
             target_link_libraries(${bench} image_transport::image_transport)
@@ -337,8 +320,16 @@ if(BUILD_TESTING)
     # report a slow run as a failure. ament_auto_add_gtest() links this
     # package's dependencies with the plain target_link_libraries() signature,
     # so the core has to be added plainly too.
+    #
+    # Every test runs under ament_cmake_ros' isolation runner, which gives it
+    # a ROS domain (or rmw test fixture) of its own. The loopback, robustness
+    # and executable tests publish topics with the same names, and a fixed
+    # ROS_DOMAIN_ID would also collide with a second build testing at once.
+    find_package(ament_cmake_ros REQUIRED)
+    set(isolated_runner RUNNER "${ament_cmake_ros_DIR}/run_test_isolated.py")
+
     foreach(test_name IN LISTS unit_tests)
-        ament_auto_add_gtest(${test_name} test/${test_name}.cpp TIMEOUT 180)
+        ament_auto_add_gtest(${test_name} test/${test_name}.cpp ${isolated_runner} TIMEOUT 180)
         if(TARGET ${test_name})
             target_link_libraries(${test_name} ${PROJECT_NAME}_core)
             if(test_name STREQUAL "test_subscriber_performance")
@@ -347,27 +338,19 @@ if(BUILD_TESTING)
             if(test_name STREQUAL "test_robustness")
                 target_sources(${test_name} PRIVATE src/publisher_plugin.cpp src/subscriber_plugin.cpp)
             endif()
-            set_tests_properties(${test_name} PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=157")
-            if(test_name STREQUAL "test_robustness")
-                set_tests_properties(${test_name} PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=159")
-            endif()
         endif()
     endforeach()
 
     # Runs the two command line programs as child processes, so it needs to
-    # know where they were built and must not start before they exist. Its own
-    # ROS domain: it waits on latched topics by name, and the loopback tests
-    # publish similar ones alongside it.
-    ament_auto_add_gtest(test_executables test/test_executables.cpp TIMEOUT 300)
+    # know where they were built and must not start before they exist. The
+    # child processes inherit the isolated environment of the test.
+    ament_auto_add_gtest(test_executables test/test_executables.cpp ${isolated_runner} TIMEOUT 300)
     if(TARGET test_executables)
         target_link_libraries(test_executables ${PROJECT_NAME}_core)
         target_compile_definitions(
             test_executables PRIVATE "RTSP_BINARY_DIR=\"${CMAKE_CURRENT_BINARY_DIR}\""
         )
         add_dependencies(test_executables publish_rtsp_stream rtsp_camera_proxy)
-        set_tests_properties(
-            test_executables PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=158"
-        )
     endif()
 endif()
 

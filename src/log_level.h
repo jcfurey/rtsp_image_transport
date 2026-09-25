@@ -21,6 +21,8 @@
 #ifndef RTSP_IMAGE_TRANSPORT_LOG_LEVEL_H_
 #define RTSP_IMAGE_TRANSPORT_LOG_LEVEL_H_
 
+#include <climits>
+
 extern "C"
 {
 #include <libavutil/log.h>
@@ -29,20 +31,31 @@ extern "C"
 namespace rtsp_image_transport
 {
 
+/* The most verbose FFmpeg level the calling thread currently forwards to ROS.
+   Per thread rather than av_log_set_level(): that is global, and two encoders
+   or decoders probing at once in one process would restore each other's saved
+   level out of order, leaving FFmpeg silenced for good. It also kept the
+   errors of every other stream quiet while one of them probed. */
+inline thread_local int thread_av_log_cap = INT_MAX;
+
+/* Quietens FFmpeg on this thread for the lifetime of the object. Probing runs
+   on the calling thread, which is where its expected failures are logged. */
 class TemporaryAvLogLevel
 {
 public:
-    TemporaryAvLogLevel(int level) : old_log_level_(av_log_get_level())
+    explicit TemporaryAvLogLevel(int level) : old_cap_(thread_av_log_cap)
     {
-        av_log_set_level(level);
+        thread_av_log_cap = level < old_cap_ ? level : old_cap_;
     }
     ~TemporaryAvLogLevel()
     {
-        av_log_set_level(old_log_level_);
+        thread_av_log_cap = old_cap_;
     }
+    TemporaryAvLogLevel(const TemporaryAvLogLevel&) = delete;
+    TemporaryAvLogLevel& operator=(const TemporaryAvLogLevel&) = delete;
 
 private:
-    int old_log_level_;
+    int old_cap_;
 };
 
 }  // namespace rtsp_image_transport

@@ -37,6 +37,11 @@
 
 #include <gtest/gtest.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <Base64.hh>
 #include <liveMedia.hh>
 
@@ -47,6 +52,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace rtsp_image_transport;
@@ -313,6 +319,57 @@ public:
         return delivered_;
     }
 
+    /* Sends raw RTP packets to the subsession's own RTP source over loopback
+       UDP, so the NAL units reach the extractor through Live555's real
+       depacketizer — aggregation packets and per-packet marker bits included,
+       which a scripted source cannot reproduce. */
+    std::vector<std::vector<std::uint8_t>> runRtp(const std::vector<std::vector<std::uint8_t>>& packets,
+                                                  std::size_t expected_deliveries)
+    {
+        unsigned short port = 0;
+        loop_->post(
+            [this, &port]
+            {
+                if (!subsession_->initiate())
+                    return;
+                port = subsession_->clientPortNum();
+                extractor_ = FrameExtractor::createNew(client_, loop_->env(), subsession_);
+                extractor_->startPlaying(*subsession_->readSource(), nullptr, nullptr);
+            });
+        if (port == 0)
+            return {};
+
+        const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+        sockaddr_in to{};
+        to.sin_family = AF_INET;
+        to.sin_port = htons(port);
+        to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        for (const std::vector<std::uint8_t>& packet : packets)
+        {
+            ::sendto(fd, packet.data(), packet.size(), 0, reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+            std::this_thread::sleep_for(2ms);
+        }
+        ::close(fd);
+
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        std::size_t stable_for = 0, last_seen = 0;
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            std::size_t now = 0;
+            {
+                std::lock_guard<std::mutex> lock{mutex_};
+                now = delivered_.size();
+            }
+            stable_for = (now == last_seen) ? stable_for + 1 : 0;
+            last_seen = now;
+            if (now >= expected_deliveries && stable_for >= 40)
+                break;
+            std::this_thread::sleep_for(5ms);
+        }
+        std::lock_guard<std::mutex> lock{mutex_};
+        return delivered_;
+    }
+
 private:
     std::shared_ptr<EventLoop> loop_;
     MediaSession* session_ = nullptr;
@@ -563,4 +620,93 @@ TEST(FrameExtractorMPEG4, PrependsTheSdpVolConfiguration)
     ASSERT_EQ(delivered.size(), 1u);
     const std::vector<std::uint8_t> expected{0, 0, 1, 0xb0, 1, 0, 0, 1, 0xb5, 0x89, 0, 0, 1, 0xb6, 0x42};
     EXPECT_EQ(delivered[0], expected);
+}
+
+namespace
+{
+
+std::vector<std::uint8_t> rtpPacket(std::uint16_t seq, std::uint32_t timestamp, bool marker,
+                                    const std::vector<std::uint8_t>& payload)
+{
+    std::vector<std::uint8_t> packet{0x80,
+                                     static_cast<std::uint8_t>((marker ? 0x80 : 0x00) | 96),
+                                     static_cast<std::uint8_t>(seq >> 8),
+                                     static_cast<std::uint8_t>(seq),
+                                     static_cast<std::uint8_t>(timestamp >> 24),
+                                     static_cast<std::uint8_t>(timestamp >> 16),
+                                     static_cast<std::uint8_t>(timestamp >> 8),
+                                     static_cast<std::uint8_t>(timestamp),
+                                     0x12,
+                                     0x34,
+                                     0x56,
+                                     0x78};
+    packet.insert(packet.end(), payload.begin(), payload.end());
+    return packet;
+}
+
+/* An H.264 non-IDR slice NAL unit */
+std::vector<std::uint8_t> h264Slice(std::size_t payload_bytes, std::uint8_t fill)
+{
+    std::vector<std::uint8_t> nal{0x41};
+    nal.insert(nal.end(), payload_bytes, fill);
+    return nal;
+}
+
+/* RFC 6184 STAP-A: a type 24 header, then each NAL unit behind its size. */
+std::vector<std::uint8_t> stapA(const std::vector<std::vector<std::uint8_t>>& nals)
+{
+    std::vector<std::uint8_t> payload{0x58};
+    for (const std::vector<std::uint8_t>& nal : nals)
+    {
+        payload.push_back(static_cast<std::uint8_t>(nal.size() >> 8));
+        payload.push_back(static_cast<std::uint8_t>(nal.size()));
+        payload.insert(payload.end(), nal.begin(), nal.end());
+    }
+    return payload;
+}
+
+const std::string H264_RTP_SDP = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n"
+                                 "m=video 0 RTP/AVP 96\r\nc=IN IP4 0.0.0.0\r\n"
+                                 "a=rtpmap:96 H264/90000\r\na=control:track1\r\n";
+
+}  // namespace
+
+TEST(FrameExtractorRtp, AMarkedAggregationPacketClosesThePictureOnlyAfterItsLastNalUnit)
+{
+    /* The marker bit belongs to the RTP packet, so every NAL unit of a marked
+       STAP-A reports it. The picture used to be closed at the first of them,
+       and the remaining slices went on as a separate picture without a
+       beginning. */
+    ExtractorHarness harness(H264_RTP_SDP);
+    ASSERT_TRUE(harness.usable());
+    const auto delivered =
+        harness.runRtp({rtpPacket(1, 3000, false, h264Slice(300, 0xA1)),
+                        rtpPacket(2, 3000, true, stapA({h264Slice(40, 0xB2), h264Slice(40, 0xC3)})),
+                        rtpPacket(3, 6000, true, h264Slice(300, 0xD4))},
+                       2);
+    ASSERT_EQ(delivered.size(), 2u) << "one picture per RTP timestamp";
+    EXPECT_EQ(std::count(delivered[0].begin(), delivered[0].end(), std::uint8_t{0xA1}), 300);
+    EXPECT_EQ(std::count(delivered[0].begin(), delivered[0].end(), std::uint8_t{0xB2}), 40);
+    EXPECT_EQ(std::count(delivered[0].begin(), delivered[0].end(), std::uint8_t{0xC3}), 40);
+    EXPECT_EQ(nalOffsets(delivered[0]).size(), 3u);
+    EXPECT_EQ(std::count(delivered[1].begin(), delivered[1].end(), std::uint8_t{0xD4}), 300);
+    EXPECT_EQ(nalOffsets(delivered[1]).size(), 1u);
+}
+
+TEST(FrameExtractorRtp, AnRtpTimestampChangeSplitsPicturesWithoutMarkerBits)
+{
+    /* Without marker bits the boundary is the RTP timestamp, which, unlike
+       the presentation time Live555 derives from it, is not re-anchored when
+       RTCP synchronisation arrives. */
+    ExtractorHarness harness(H264_RTP_SDP);
+    ASSERT_TRUE(harness.usable());
+    const auto delivered = harness.runRtp({rtpPacket(1, 3000, false, h264Slice(200, 0xA1)),
+                                           rtpPacket(2, 3000, false, h264Slice(200, 0xB2)),
+                                           rtpPacket(3, 6000, false, h264Slice(200, 0xC3)),
+                                           rtpPacket(4, 9000, true, h264Slice(200, 0xD4))},
+                                          3);
+    ASSERT_EQ(delivered.size(), 3u);
+    EXPECT_EQ(nalOffsets(delivered[0]).size(), 2u);
+    EXPECT_EQ(std::count(delivered[1].begin(), delivered[1].end(), std::uint8_t{0xC3}), 200);
+    EXPECT_EQ(std::count(delivered[2].begin(), delivered[2].end(), std::uint8_t{0xD4}), 200);
 }

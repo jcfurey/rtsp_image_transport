@@ -87,6 +87,38 @@ const std::map<std::string, VideoCodec> CODEC_NAMES = {
     {"H264", VideoCodec::H264},   {"AVC", VideoCodec::H264}, {"H265", VideoCodec::H265}, {"HEVC", VideoCodec::H265},
     {"MPEG4", VideoCodec::MPEG4}, {"VP8", VideoCodec::VP8},  {"VP9", VideoCodec::VP9},   {"AV1", VideoCodec::AV1}};
 
+namespace
+{
+
+/* Case and punctuation are ignored, so "h.264", "H-264" and "h264" all work. */
+VideoCodec parseCodec(const std::string& name)
+{
+    std::string canonical;
+    for (char ch : name)
+    {
+        if (ch >= 'a' && ch <= 'z')
+            ch -= 32;
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))
+            canonical.push_back(ch);
+    }
+    auto codec_iter = CODEC_NAMES.find(canonical);
+    return codec_iter != CODEC_NAMES.end() ? codec_iter->second : VideoCodec::Unknown;
+}
+
+std::string knownCodecNames()
+{
+    std::string known;
+    for (const auto& entry : CODEC_NAMES)
+    {
+        if (!known.empty())
+            known += ", ";
+        known += entry.first;
+    }
+    return known;
+}
+
+}  // namespace
+
 using SuperClass = image_transport::SimplePublisherPlugin<std_msgs::msg::String>;
 
 PublisherPlugin::PublisherPlugin()
@@ -111,6 +143,7 @@ void PublisherPlugin::shutdown()
             return;
         shutdown_ = true;
     }
+    param_validate_handle_.reset();
     param_cb_handle_.reset();
     demand_timer_.reset();
     demand_cb_group_.reset();
@@ -172,8 +205,15 @@ void PublisherPlugin::advertiseImpl(rclcpp::Node* node, const std::string& base_
     node_param_ = rclcpp::node_interfaces::get_node_parameters_interface(node);
     param_base_name_ = topicParameterBase(*node, base_topic, getTransportName());
     setupParameters(node_param_.lock());
-    param_cb_handle_ = node->add_post_set_parameters_callback(
-        callback_gate_->wrap([this](const std::vector<rclcpp::Parameter>&) { updateParameters(); }));
+    param_validate_handle_ = node->add_on_set_parameters_callback(
+        [codec_parameter = param_base_name_ + ".codec"](const std::vector<rclcpp::Parameter>& parameters)
+        { return validateParameters(parameters, codec_parameter); });
+    param_cb_handle_ = node->add_post_set_parameters_callback(callback_gate_->wrap(
+        [this](const std::vector<rclcpp::Parameter>& parameters)
+        {
+            if (parametersConcern(parameters, param_base_name_ + "."))
+                updateParameters();
+        }));
     updateParameters();
     setupDemandMonitor(*node);
 }
@@ -209,8 +249,15 @@ void PublisherPlugin::advertiseImpl(image_transport::RequiredInterfaces node_int
     node_param_ = node_parameters;
     param_base_name_ = topicParameterBase(node_base->get_namespace(), base_topic, getTransportName());
     setupParameters(node_parameters);
-    param_cb_handle_ = node_parameters->add_post_set_parameters_callback(
-        callback_gate_->wrap([this](const std::vector<rclcpp::Parameter>&) { updateParameters(); }));
+    param_validate_handle_ = node_parameters->add_on_set_parameters_callback(
+        [codec_parameter = param_base_name_ + ".codec"](const std::vector<rclcpp::Parameter>& parameters)
+        { return validateParameters(parameters, codec_parameter); });
+    param_cb_handle_ = node_parameters->add_post_set_parameters_callback(callback_gate_->wrap(
+        [this](const std::vector<rclcpp::Parameter>& parameters)
+        {
+            if (parametersConcern(parameters, param_base_name_ + "."))
+                updateParameters();
+        }));
     updateParameters();
     setupDemandMonitor(DemandInterfaces(node_interfaces));
 
@@ -325,12 +372,36 @@ void PublisherPlugin::updateDemand()
     }
 }
 
+rcl_interfaces::msg::SetParametersResult PublisherPlugin::validateParameters(
+    const std::vector<rclcpp::Parameter>& parameters, const std::string& codec_parameter)
+{
+    /* Checked before the change is accepted. An unknown codec used to be
+       reported as a successful parameter change and then stopped the stream
+       that was running. */
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
+    for (const rclcpp::Parameter& parameter : parameters)
+    {
+        if (parameter.get_name() != codec_parameter)
+            continue;
+        if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_STRING ||
+            parseCodec(parameter.as_string()) == VideoCodec::Unknown)
+        {
+            result.successful = false;
+            result.reason = "unknown codec; supported values are: " + knownCodecNames();
+        }
+    }
+    return result;
+}
+
 void PublisherPlugin::setupParameters(
     const rclcpp::node_interfaces::NodeParametersInterface::SharedPtr& node_parameters)
 {
     using rcl_interfaces::msg::ParameterDescriptor;
     declareParameter(node_parameters, param_base_name_ + ".codec", rclcpp::ParameterValue("H264"),
-                     ParameterDescriptor().set__description("video encoding format"));
+                     ParameterDescriptor()
+                         .set__description("video encoding format")
+                         .set__additional_constraints("one of " + knownCodecNames() + " (case insensitive)"));
     declareParameter(
         node_parameters, param_base_name_ + ".target_bitrate",
         rclcpp::ParameterValue(static_cast<int>(config_->target_bitrate)),
@@ -393,29 +464,11 @@ void PublisherPlugin::updateParameters()
         return;
     Config new_config;
     std::string codec_str = np->get_parameter(param_base_name_ + ".codec").as_string();
-    std::string codec_str_canon;
-    for (char ch : codec_str)
-    {
-        if (ch >= 'a' && ch <= 'z')
-            ch -= 32;
-        if (ch >= 'A' && ch <= 'Z')
-            codec_str_canon.push_back(ch);
-        if (ch >= '0' && ch <= '9')
-            codec_str_canon.push_back(ch);
-    }
-    auto codec_iter = CODEC_NAMES.find(codec_str_canon);
-    new_config.codec = codec_iter != CODEC_NAMES.end() ? codec_iter->second : VideoCodec::Unknown;
+    new_config.codec = parseCodec(codec_str);
     if (new_config.codec == VideoCodec::Unknown)
     {
-        std::string known;
-        for (const auto& entry : CODEC_NAMES)
-        {
-            if (!known.empty())
-                known += ", ";
-            known += entry.first;
-        }
         RCLCPP_ERROR(logger_, "[%s] unknown codec \"%s\"; supported values are: %s", topic_name_.c_str(),
-                     codec_str.c_str(), known.c_str());
+                     codec_str.c_str(), knownCodecNames().c_str());
     }
     new_config.target_bitrate = np->get_parameter(param_base_name_ + ".target_bitrate").as_int();
     new_config.expected_framerate = np->get_parameter(param_base_name_ + ".expected_framerate").as_int();
@@ -584,7 +637,9 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
         }
         encoder_.reset();
         encoder_retry_after_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-        RCLCPP_ERROR(logger_, "[%s] %s", topic_name_.c_str(), e.what());
+        /* Retried every second, so a persistent failure would otherwise log at
+           the same rate. */
+        RCLCPP_ERROR_THROTTLE(logger_, *steady_clock_, 10000, "[%s] %s", topic_name_.c_str(), e.what());
     }
 }
 
