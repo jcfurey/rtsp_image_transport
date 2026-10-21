@@ -280,6 +280,38 @@ TEST(RtspLoopback, ServerPublishesAUsableUrl)
     EXPECT_LE(port, 65535) << "url is " << url;
 }
 
+TEST(RtspLoopback, RebindsIpv4ImmediatelyAfterServerClosesAnActiveTcpConnection)
+{
+    auto server = StreamServer::create("restart_test", 0, 1354);
+    server->start(VideoCodec::H264, false);
+    const auto url = server->url();
+    const auto colon = url.rfind(':');
+    const unsigned port = std::stoul(url.substr(colon + 1));
+    int client = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(client, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET; address.sin_port = htons(port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(0, connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)));
+    // OPTIONS confirms Live555 accepted it. Then close the server first,
+    // which places the server-side connection in TIME_WAIT after peer close.
+    const char request[] = "OPTIONS rtsp://localhost/ RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+    ASSERT_GT(send(client, request, sizeof(request)-1, 0), 0);
+    timeval timeout{2, 0};
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    char response[4096];
+    ASSERT_GT(recv(client, response, sizeof(response), 0), 0);
+    server.reset();
+    close(client);
+    auto restarted = StreamServer::create("restart_test", port, 1354);
+    int next = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(next, 0);
+    EXPECT_EQ(0, connect(next, reinterpret_cast<sockaddr*>(&address), sizeof(address)));
+    close(next);
+    // Enabling TIME_WAIT reuse must still reject a second active IPv4 owner.
+    EXPECT_THROW(StreamServer::create("duplicate", port, 1354), StreamingError);
+}
+
 TEST(RtspLoopback, ClientReceivesVideoFromServer)
 {
     if (!haveEncoderFor(VideoCodec::H264))

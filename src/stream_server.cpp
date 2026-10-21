@@ -24,10 +24,13 @@
 #include "streaming_error.h"
 
 #include <arpa/inet.h>
+#include <GroupsockHelper.hh>
 #include <rclcpp/logging.hpp>
 
 #include <format>
 #include <random>
+#include <cerrno>
+#include <unistd.h>
 
 namespace rtsp_image_transport
 {
@@ -40,6 +43,63 @@ constexpr unsigned ESTIMATED_BITRATE = 500;
 /* Key frames of high resolution streams are considerably larger than the
    Live555 default, and anything that does not fit is silently truncated. */
 constexpr unsigned MAX_OUT_PACKET_BUFFER_SIZE = 16u << 20;
+
+/* Live555 normally disables all port reuse, including TIME_WAIT reuse. A
+   server stopped with an interleaved TCP viewer attached could therefore
+   restart as IPv6-only while advertising its unavailable IPv4 URL. Enable
+   SO_REUSEADDR alone; unlike SO_REUSEPORT it does not share a listening port
+   with another server. Keep socket creation on the owning event loop. */
+class RestartableRTSPServer final : public RTSPServer
+{
+public:
+    static RTSPServer* create(UsageEnvironment& env, Port port)
+    {
+        int v4 = listener(env, port, AF_INET);
+        int error = errno;
+        int v6 = listener(env, port, AF_INET6);
+        if ((v4 < 0 && error == EADDRINUSE) || (v4 < 0 && v6 < 0))
+        {
+            if (v4 >= 0) ::closeSocket(v4);
+            if (v6 >= 0) ::closeSocket(v6);
+            env.setResultMsg("cannot bind RTSP listener; port is unavailable");
+            return nullptr;
+        }
+        return new RestartableRTSPServer(env, v4, v6, port);
+    }
+private:
+    RestartableRTSPServer(UsageEnvironment& env, int v4, int v6, Port port)
+        : RTSPServer(env, v4, v6, port, nullptr, 65) {}
+    static int listener(UsageEnvironment& env, Port& port, int family)
+    {
+        int fd = socket(family, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        if (family == AF_INET6) setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+        sockaddr_storage storage{};
+        socklen_t size;
+        if (family == AF_INET)
+        {
+            auto& address = reinterpret_cast<sockaddr_in&>(storage);
+            address.sin_family = AF_INET; address.sin_port = port.num();
+            address.sin_addr.s_addr = INADDR_ANY; size = sizeof(address);
+        }
+        else
+        {
+            auto& address = reinterpret_cast<sockaddr_in6&>(storage);
+            address.sin6_family = AF_INET6; address.sin6_port = port.num();
+            address.sin6_addr = in6addr_any; size = sizeof(address);
+        }
+        if (bind(fd, reinterpret_cast<sockaddr*>(&storage), size) < 0 || listen(fd, 20) < 0)
+        {
+            int error = errno; ::closeSocket(fd); errno = error; return -1;
+        }
+        makeSocketNonBlocking(fd);
+        increaseSendBufferTo(env, fd, 50*1024);
+        if (port.num() == 0) getSourcePort(env, fd, family, port);
+        return fd;
+    }
+};
 
 uint16_t sockToPort(const in_addr& addr)
 {
@@ -329,7 +389,7 @@ StreamServer::StreamServer(const std::string& topic_name, unsigned udp_port, uns
                 static std::once_flag packet_buffer_initialized;
                 std::call_once(packet_buffer_initialized,
                                [] { OutPacketBuffer::increaseMaxSizeTo(MAX_OUT_PACKET_BUFFER_SIZE); });
-                rtsp_ = RTSPServer::createNew(loop_->env(), udp_port);
+                rtsp_ = RestartableRTSPServer::create(loop_->env(), udp_port);
                 if (!rtsp_)
                     throw StreamingError(udp_port == 0
                                              ? "cannot create RTSP server"

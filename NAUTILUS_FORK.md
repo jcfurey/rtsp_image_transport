@@ -3,6 +3,16 @@
 Remote: [`jcfurey/rtsp_image_transport`](https://github.com/jcfurey/rtsp_image_transport),
 branch `cam_wip`.
 
+## Immediate server restart
+
+The publisher's listeners now use `SO_REUSEADDR`, without `SO_REUSEPORT`, so a
+server can restart after closing an active interleaved TCP viewer. Live555's
+default disables TIME_WAIT reuse; the observed result was an IPv6-only restart
+that still advertised an unavailable IPv4 URL. A busy IPv4 port now fails
+creation instead of silently degrading to IPv6. Regression coverage closes the
+server side first, immediately rebinds the same IPv4 port, and verifies that a
+second active owner is still rejected.
+
 This change is based on upstream commit
 `d815a176b0634cda8d5f4290f33173b82fab7a6c`. Nautilus adds a zero-based
 `video_subsession` subscriber parameter. Upstream 2.0.2 always selects the
