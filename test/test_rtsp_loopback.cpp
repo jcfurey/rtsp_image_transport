@@ -93,9 +93,9 @@ private:
         unsigned seq = 0;
         while (!stop_.load())
         {
-            /* The server only encodes while a client is attached, which is what
-               the publisher plugin does too. */
-            if (server_->hasActiveStreams())
+            /* Seed codec setup once, then encode only with an attached client,
+               matching the publisher plugin's demand behavior. */
+            if (server_->hasActiveStreams() || server_->needsCodecParameters())
             {
                 sensor_msgs::msg::Image img = makeTestImage(width_, height_, seq);
                 try
@@ -474,6 +474,59 @@ TEST(RtspLoopback, SwitchingTransportBetweenSessionsWorks)
         EXPECT_TRUE(observer.waitForNals(20)) << "no video after switching transport";
         client->disconnect();
     }
+}
+
+TEST(RtspLoopback, FirstAndReturningH264ViewersReceiveDecoderSetupInSdp)
+{
+    if (!haveEncoderFor(VideoCodec::H264))
+        GTEST_SKIP() << "no H.264 encoder in this FFmpeg build";
+    LoopbackServer server(VideoCodec::H264, 320, 240);
+    auto deadline = std::chrono::steady_clock::now()+3s;
+    while (server.framesPushed() == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(10ms);
+    ASSERT_GT(server.framesPushed(), 0u) << "no decoder metadata bootstrap without a viewer";
+    const auto bootstrap_frames = server.framesPushed();
+    std::this_thread::sleep_for(120ms);
+    EXPECT_EQ(server.framesPushed(), bootstrap_frames) << "idle server kept encoding after setup was cached";
+
+    for (unsigned attempt = 0; attempt < 2; ++attempt)
+    {
+        SCOPED_TRACE(attempt == 0 ? "first viewer" : "viewer after all clients disconnected");
+        ClientObserver observer;
+        auto client = StreamClient::create("test_topic", server.url());
+        observer.attach(client);
+        std::string parameters;
+        client->setSubsessionStartedHandler([&](VideoCodec codec, MediaSubsession* subsession) {
+            std::lock_guard<std::mutex> lock{observer.mutex_};
+            observer.codec_ = codec;
+            if (subsession) parameters = subsession->attrVal_str("sprop-parameter-sets");
+            observer.cv_.notify_all();
+        });
+        client->connect();
+        ASSERT_TRUE(observer.waitFor([&] { return observer.started_ || observer.failed_; }));
+        ASSERT_FALSE(observer.failed_) << observer.failure_message_;
+        {
+            std::lock_guard<std::mutex> lock{observer.mutex_};
+            EXPECT_NE(parameters.find(','), std::string::npos)
+                << "SDP lacks SPS/PPS; Android rejects this before receiving RTP";
+        }
+        EXPECT_TRUE(observer.waitForNals(5));
+        client->disconnect();
+        deadline = std::chrono::steady_clock::now()+3s;
+        while (server.clients() != 0 && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(10ms);
+        ASSERT_EQ(server.clients(), 0u);
+    }
+}
+
+TEST(RtspLoopback, TruncatedH264SetupDoesNotBecomeUsableSdp)
+{
+    auto server = StreamServer::create("test_topic", 0, 1354);
+    server->start(VideoCodec::H264, false);
+    const unsigned char sps[] = {0x67}, pps[] = {0x68};
+    server->sendAccessUnit({std::make_shared<FrameData>(sps, sizeof(sps), rclcpp::Time(0)),
+                           std::make_shared<FrameData>(pps, sizeof(pps), rclcpp::Time(0))});
+    EXPECT_TRUE(server->needsCodecParameters()) << "truncated parameter sets marked decoder setup ready";
 }
 
 TEST_P(RtspTransport, H265SessionDecodesBackToImages)

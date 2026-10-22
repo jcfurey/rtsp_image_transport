@@ -336,7 +336,7 @@ void PublisherPlugin::updateDemand()
     bool rtsp_active = false;
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        rtsp_active = server_ && !failed_ && server_->hasActiveStreams();
+        rtsp_active = server_ && !failed_ && (server_->hasActiveStreams() || server_->needsCodecParameters());
     }
     const std::size_t ros_subscribers = getNumSubscribers();
 
@@ -363,7 +363,7 @@ void PublisherPlugin::updateDemand()
     else
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        if (encoder_ && (!server_ || !server_->hasActiveStreams()))
+        if (encoder_ && (!server_ || !(server_->hasActiveStreams() || server_->needsCodecParameters())))
         {
             RCLCPP_INFO(logger_, "[%s] stop encoding for disconnected RTSP clients", topic_name_.c_str());
             encoder_.reset();
@@ -541,7 +541,7 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
             publisher->publish(std::move(url));
             update_url_ = false;
         }
-        if (!server_->hasActiveStreams())
+        if (!(server_->hasActiveStreams() || server_->needsCodecParameters()))
         {
             // We need to call publish_fn at least once more after
             // the last client has disconnected, or the ROS topic networking
@@ -646,7 +646,7 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
 void PublisherPlugin::onGraphChange()
 {
     std::lock_guard<std::mutex> lock{mutex_};
-    if (getNumSubscribers() == 0 && encoder_ && server_ && !server_->hasActiveStreams())
+    if (getNumSubscribers() == 0 && encoder_ && server_ && !(server_->hasActiveStreams() || server_->needsCodecParameters()))
     {
         RCLCPP_INFO(logger_, "[%s] stop encoding for %s", topic_name_.c_str(), server_->url().c_str());
         encoder_.reset();

@@ -305,6 +305,13 @@ const char* UnicastServerMediaSubsession::sdpLines(int addressFamily)
     {
         setSDPLinesFromRTPSink(sink, nullptr, ESTIMATED_BITRATE);
     }
+    else
+    {
+        // A DESCRIBE before the first encoded image may have cached bare SDP.
+        // Rebuild from the retained codec parameters even after the last viewer left.
+        delete[] fSDPLines;
+        fSDPLines = nullptr;
+    }
     dummy_session_ = true;
     const char* lines = OnDemandServerMediaSubsession::sdpLines(addressFamily);
     dummy_session_ = false;
@@ -318,7 +325,7 @@ RTPSink* UnicastServerMediaSubsession::createNewRTPSink(Groupsock* rtpGroupsock,
     StreamServer* s = server_;
     if (s)
     {
-        sink = createVideoRTPSink(s->codec(), envir(), rtpGroupsock, rtpPayloadTypeIfDynamic);
+        sink = s->createRTPSink(rtpGroupsock, rtpPayloadTypeIfDynamic);
         if (!dummy_session_ && sink)
             s->unicast_sinks_[inputSource] = sink;
         if (sink)
@@ -531,6 +538,10 @@ void StreamServer::stopOnLoop()
     }
     streams_.clear();
     unicast_sinks_.clear();
+    sps_.clear();
+    pps_.clear();
+    vps_.clear();
+    codec_ = VideoCodec::Unknown;
     url_.clear();
     lock.unlock();
 
@@ -586,6 +597,13 @@ bool StreamServer::hasActiveStreams() const noexcept
     return activeStreamCount() != 0;
 }
 
+bool StreamServer::needsCodecParameters() const noexcept
+{
+    std::lock_guard<std::mutex> lock{streams_mutex_};
+    return (codec_ == VideoCodec::H264 && (sps_.empty() || pps_.empty()))
+        || (codec_ == VideoCodec::H265 && (vps_.empty() || sps_.empty() || pps_.empty()));
+}
+
 std::size_t StreamServer::activeStreamCount() const noexcept
 {
     std::lock_guard<std::mutex> lock{streams_mutex_};
@@ -597,6 +615,33 @@ void StreamServer::sendAccessUnit(const std::vector<FrameDataPtr>& frames) noexc
     if (frames.empty())
         return;
     std::lock_guard<std::mutex> lock{streams_mutex_};
+    // FrameData contains individual NAL units without Annex B start codes.
+    // Retain only bounded setup data; a departed viewer must not erase it.
+    for (const FrameDataPtr& frame : frames)
+    {
+        if (!frame || frame->length() == 0 || frame->length() > 65536)
+            continue;
+        unsigned type = codec_ == VideoCodec::H264 ? frame->data()[0] & 0x1f
+                                                   : (frame->data()[0] >> 1) & 0x3f;
+        // Live555 reads the SPS profile/level bytes while forming H.264 SDP.
+        if ((codec_ == VideoCodec::H264 && ((type == 7 && frame->length() < 4)
+                                          || (type == 8 && frame->length() < 2)))
+            || (codec_ == VideoCodec::H265 && frame->length() < 2))
+            continue;
+        std::vector<unsigned char>* target = nullptr;
+        if (codec_ == VideoCodec::H264)
+        {
+            if (type == 7) target = &sps_;
+            if (type == 8) target = &pps_;
+        }
+        else if (codec_ == VideoCodec::H265)
+        {
+            if (type == 32) target = &vps_;
+            if (type == 33) target = &sps_;
+            if (type == 34) target = &pps_;
+        }
+        if (target) target->assign(frame->data(), frame->data()+frame->length());
+    }
     for (auto& stream : streams_)
     {
         stream.second->injectAccessUnit(frames);
@@ -627,6 +672,20 @@ std::string StreamServer::url() const noexcept
 RTPSink* StreamServer::activeSinkForSDP()
 {
     return unicast_sinks_.empty() ? nullptr : unicast_sinks_.begin()->second;
+}
+
+VideoRTPSink* StreamServer::createRTPSink(Groupsock* groupsock, unsigned char payload_type)
+{
+    std::lock_guard<std::mutex> lock{streams_mutex_};
+    if (codec_ == VideoCodec::H264 && !sps_.empty() && !pps_.empty())
+        return H264VideoRTPSink::createNew(loop_->env(), groupsock, payload_type,
+            sps_.data(), sps_.size(), pps_.data(), pps_.size());
+#ifdef LIVE555_HAS_H265_SUPPORT
+    if (codec_ == VideoCodec::H265 && !vps_.empty() && !sps_.empty() && !pps_.empty())
+        return H265VideoRTPSink::createNew(loop_->env(), groupsock, payload_type,
+            vps_.data(), vps_.size(), sps_.data(), sps_.size(), pps_.data(), pps_.size());
+#endif
+    return createVideoRTPSink(codec_, loop_->env(), groupsock, payload_type);
 }
 
 void StreamServer::newStreamSource(FramedSource* source, FrameInjector* injector) noexcept
