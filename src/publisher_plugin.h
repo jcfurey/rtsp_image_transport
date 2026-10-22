@@ -55,7 +55,7 @@ public:
     std::string getTransportName() const override;
 
 protected:
-#if RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API
+#if !RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
     void advertiseImpl(rclcpp::Node* node, const std::string& base_topic, rmw_qos_profile_t custom_qos,
                        rclcpp::PublisherOptions options) override;
 #endif

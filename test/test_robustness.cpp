@@ -48,7 +48,7 @@ public:
         if (publish_images)
         {
             publisher = std::make_unique<PublisherPlugin>();
-#if RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API
+#if !RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
             publisher->advertise(node.get(), "video", rmw_qos_profile_default);
 #else
             publisher->advertise(*node, "video", rclcpp::QoS(1));
@@ -62,7 +62,7 @@ public:
             if (on_image)
                 on_image();
         };
-#if RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API
+#if !RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
         subscriber->subscribe(node.get(), "video", collect, rmw_qos_profile_default);
 #else
         subscriber->subscribe(*node, "video", collect, rclcpp::QoS(1));

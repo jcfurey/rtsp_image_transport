@@ -161,3 +161,57 @@ Further benchmark modes and packet-loss experiments are described in
   plugin objects on both the original and updated revision. Their tested
   runs exit successfully; this audit does not claim to fix that upstream
   unloading behavior.
+
+## Follow-up audit — 2026-10-22
+
+Preserved the existing local SDP bootstrap/parameter-retention changes and
+their loopback regressions. This follow-up addresses additional recovery,
+timestamp and ROS API issues:
+
+| Area | Finding | Change |
+| --- | --- | --- |
+| Retry lifetime | Releasing a retry timer did not cancel an executor's retained timer or a previously taken callback. | Cancel timers explicitly and invalidate the generation when claiming a retry. Duplicate or cancelled callbacks cannot start another connection. |
+| Backoff | PLAY success and unrelated parameter edits reset the delay even when a camera never produced a usable picture. | Reset after successful image decoding. Compare normalized retry settings so zero or inverted delay limits do not cause spurious resets. |
+| Runtime policy | Disabling retries left a scheduled attempt active; handshake timeouts were treated as ordinary failures. | Cancel or resume attempts when policy changes, classify RTSP 408 as a timeout, and release stopped sessions even when retries are disabled. |
+| RTSP control | The client sent no RTSP keepalives. | Send GET_PARAMETER at half the advertised session timeout, fall back to OPTIONS on 405/501, and supervise unanswered control requests independently of RTP reception. |
+| GPU ownership | The decoder's process-wide device cache held raw FFmpeg references without releasing them at teardown. | Store shared owners in the cache, share them with decoders, and release partially created devices on failed initialization. |
+| Modern ROS time | image_transport 6.4+ receive timestamps used a system clock, preventing simulated-time operation. | Attach an independent ROS clock to `rclcpp::TimeSource`; support startup and runtime `use_sim_time`, pauses, bag loops and explicit ROS contexts. |
+| Executor delivery | The node-interface path polled every 2 ms, including while idle. | Register a guard-condition waitable through the node base interface, use public RCL wait-set functions, and implement readiness notifications for EventsExecutor. |
+| RTP timeline | Forward jumps below the one-hour wall-offset limit left playback holes; offset addition could overflow; encoder recreation reset the timeline of a live session. | Advance from the previous input/output pair, check addition bounds, re-anchor jumps exceeding elapsed wall time by five seconds, and reset the mapping only when replacing the RTSP session. |
+| Introspection and setup | The plugin manifest omitted transport/message metadata; common receiver options required manual parameter overrides. | Declare `rtsp` and `std_msgs/msg/String`; expose frame ID, timestamp source, simulated time, decoder buffering and reconnect delays in the receive launch file. |
+
+The independent clock uses the standard
+[`rclcpp::TimeSource` implementation](https://github.com/ros2/rclcpp/blob/lyrical/rclcpp/src/rclcpp/time_source.cpp).
+The installed rclcpp 32.0.3 implementation retains but does not use the graph,
+services or node-clock interfaces passed to `attachNode`; base, topics,
+logging and parameters provide the required clock subscription and callbacks.
+
+Validation used a separate build/install under `/tmp`, ROS Lyrical,
+image_transport 6.4.10, and FFmpeg libavcodec 62.11.100. All **23 CTest
+executables passed: 250 cases passed, two skipped, zero failures**. The skips
+are the unavailable Intel iGPU path and H.263 decoding on this FFmpeg build.
+The receive launch file also parsed with `ros2 launch ... --show-args`.
+
+AddressSanitizer, UndefinedBehaviorSanitizer and leak detection cover five
+targets: stream clock, extractor, RTSP keepalive, subscriber performance and
+UDP/TCP plugin robustness. The software/recovery cases pass without sanitizer
+reports. The four `CudaAndCuvid` cases are excluded from that clean sanitizer
+run; they pass in the normal build, but CUDA is unavailable under ASan here.
+The unfiltered sanitizer run still fails leak detection after hardware probing:
+2,192 bytes in seven allocations from libdrm/libdbus through system FFmpeg.
+An independent program that only creates and unreferences QSV/Vulkan devices
+reproduces the identical leak without linking this package or ROS. The
+package's leaked cache references are fixed; the residual dependency leaks
+remain unsuppressed and are not claimed as resolved.
+
+New regressions cover timer cancellation with executor ownership and duplicate
+events, backoff retention and reset, live policy changes, control keepalive
+fallback and timeout, forward timestamp jumps and overflow, runtime simulated
+time and pauses, a non-default ROS context, EventsExecutor delivery, and plugin
+message-type discovery. Existing UDP/TCP, codec, malformed-image, URL-change,
+multi-viewer and shutdown regressions continue to pass.
+
+Validation used local RTSP sessions. Physical cameras, the vehicle network,
+long-running loss/soak behavior and other ROS distributions were not exercised
+in this follow-up. The earlier simulated-time limitation on 6.4+ is resolved;
+other limitations in the preceding audit remain applicable.

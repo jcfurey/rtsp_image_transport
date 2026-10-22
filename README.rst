@@ -153,6 +153,14 @@ consumer that has fallen behind on live video wants the newest frame rather
 than a replay of the one it missed. ``max_latency`` and ``rtp_over_tcp`` are
 launch arguments; see `Latency`_ and `RTP transport and packet loss`_.
 
+The launch file also exposes ``frame_id``, ``timestamp_source``,
+``use_sim_time``, ``low_latency``, ``timeout`` and the reconnect delays. For a
+camera whose clock is not synchronized with ROS, use receive timestamps::
+
+  ros2 launch rtsp_image_transport rtsp_to_ros.launch.yaml \
+      input_topic:=/camera/image/rtsp output_topic:=/camera/image_raw \
+      frame_id:=camera_optical_frame timestamp_source:=1
+
 The input is the URL topic, so it works equally with a stream advertised by
 ``publish_rtsp_stream`` from an IP camera.
 
@@ -190,14 +198,24 @@ Connection recovery
 ===================
 
 ``reconnect_policy`` now defaults to ``3`` for live cameras. The policies are
-cumulative: ``0`` never retries, ``1`` retries media timeouts, ``2`` also retries
+cumulative: ``0`` never retries, ``1`` retries handshake, media and control-response timeouts, ``2`` also retries
 connection/setup/decoder failures, and ``3`` also reconnects after normal stream
 termination. Set ``0`` for finite recordings that should end once.
 
 ``timeout`` (seconds, default ``2.0``) supervises both the RTSP handshake and
 loss of RTP traffic. Retries use wall time and exponential backoff between
 ``reconnect_minwait`` (``0.1`` s) and ``reconnect_maxwait`` (``30.0`` s).
-The receive launch file exposes ``reconnect_policy`` and ``timeout``.
+Backoff resets after a picture is decoded, so a camera that accepts PLAY but
+sends no usable images cannot keep retries at the shortest interval. Changing
+``reconnect_policy`` at runtime cancels or resumes pending retries immediately;
+changing an unrelated parameter preserves the current backoff.
+
+RTSP keepalives run at half the server's advertised session timeout (30 seconds
+when none is advertised). The client sends an empty GET_PARAMETER and falls
+back to OPTIONS if the camera rejects it. A missing control response fails the
+session and follows the timeout retry policy, independently of the RTP watchdog.
+Setting ``timeout:=0`` disables the handshake/media watchdog while keepalives
+continue supervising the control session.
 
 A changed URL discards the old session's queued pictures and decoder. Changes
 to decoder selection also establish a fresh session so cameras that supply
@@ -312,6 +330,10 @@ parameter controls this: it makes the decoder emit each frame as soon as it is
 complete rather than holding it in the reordering buffer, and it keeps FFmpeg
 from using frame-level multithreading, which delays output by roughly one frame
 per worker thread.
+
+Completed access units wake the ROS executor through a guard condition. This
+also works with the image_transport node-interface API and removes its former
+2 ms polling timer, including 500 idle timer callbacks per second per stream.
 
 Set ``-p in.rtsp.low_latency:=false`` if your source encodes B-frames and you
 see frames arriving out of order; you trade a few frames of latency for correct
@@ -523,6 +545,11 @@ simulation reset — the timeline is re-anchored and the stream carries on::
 
   [/camera0] image time stamps jumped, re-anchoring the RTP timeline
 
+Forward stamp jumps exceeding elapsed wall time by more than five seconds are
+also re-anchored, so skipping forward in a bag does not leave a playback hole.
+Restarting the encoder within the same RTSP session preserves the timeline.
+Unset or repeated image stamps use wall-time pacing, with throttled logging.
+
 Frame pacing is taken from the gap between consecutive images rather than from
 a fixed origin, so a clock that jumps backwards does not convince the encoder
 that the stream suddenly runs at 300 fps.
@@ -554,11 +581,13 @@ Supported image_transport versions
 The transport supports both the legacy plugin API used by Jazzy and Kilted and
 the node-interface API introduced in ``image_transport`` 6.4.
 
-The newer API does not provide the node clock interface. Consequently, on
-6.4+ a subscriber plugin cannot stamp decoded images in simulated ROS time;
-select ``timestamp_source:=1`` for receive timestamps, which use the system
-clock on that API. Encoding, native RTSP serving, lazy ROS-to-RTSP republishing,
-QoS handling, and wall-clock operation are supported normally.
+On 6.4+ the subscriber uses an independent ROS clock managed by
+``rclcpp::TimeSource``, so ``use_sim_time`` and runtime clock changes work
+without the node clock interface. Automatic timestamp selection follows
+``/clock`` while simulated time is enabled. Frame notifications and retries
+use the node's ROS context, including explicitly created contexts.
+The plugin manifest declares the transport name and the URL message type
+(``std_msgs/msg/String``) for image_transport's metadata discovery.
 
 Building
 ========

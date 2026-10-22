@@ -37,8 +37,8 @@ namespace rtsp_image_transport
  * presentation time produces RTCP sender reports dated 1970 and RTP time stamps
  * that jump backwards, which receivers cannot follow.
  *
- * The mapping is an offset that is re-anchored whenever the input goes
- * backwards or lands implausibly far from real time. Between re-anchors the
+ * The mapping is re-anchored whenever the input goes backwards, jumps forward
+ * independently of wall time, or lands implausibly far from real time. Between re-anchors the
  * spacing of the stamps is preserved exactly, so genuine frame timing survives.
  *
  * Call it once per image and give every packet of that image the result. A
@@ -55,11 +55,13 @@ public:
     static constexpr std::int64_t MAX_WALL_CLOCK_OFFSET_NS = 3600LL * 1000000000LL;
     /* Minimum spacing inserted when stamps repeat or move backwards */
     static constexpr std::int64_t MIN_STEP_NS = 1000000LL;
+    static constexpr std::int64_t MAX_FRAME_GAP_NS = 5LL * 1000000000LL;
 
     /* `now` is the current wall clock, passed in so the caller controls the
        clock source and tests stay deterministic. */
     rclcpp::Time toWallClock(const rclcpp::Time& stamp, const rclcpp::Time& now) noexcept;
-    /* Forgets the anchor, e.g. when the encoder is restarted */
+    /* Forgets the anchor when the RTSP session is replaced. An encoder restart
+       within a live session must preserve the existing RTP timeline. */
     void reset() noexcept;
     bool anchored() const noexcept
     {
@@ -74,7 +76,8 @@ public:
 
 private:
     bool anchored_ = false;
-    std::int64_t offset_ns_ = 0;
+    std::int64_t last_input_ns_ = 0;
+    std::int64_t last_wall_ns_ = 0;
     std::int64_t last_output_ns_ = 0;
     std::uint64_t reanchor_count_ = 0;
 };

@@ -20,7 +20,9 @@
  ****************************************************************************/
 #include "stream_clock.h"
 
+#include <algorithm>
 #include <cstdlib>
+#include <limits>
 
 namespace rtsp_image_transport
 {
@@ -28,7 +30,8 @@ namespace rtsp_image_transport
 void StreamClock::reset() noexcept
 {
     anchored_ = false;
-    offset_ns_ = 0;
+    last_input_ns_ = 0;
+    last_wall_ns_ = 0;
     last_output_ns_ = 0;
 }
 
@@ -41,29 +44,39 @@ rclcpp::Time StreamClock::toWallClock(const rclcpp::Time& stamp, const rclcpp::T
     {
         /* Start out as a pass-through, so a node running on wall clock time
            keeps the exact capture times its camera reported. */
-        offset_ns_ = 0;
         anchored_ = true;
+        last_input_ns_ = stamp_ns;
+        last_wall_ns_ = now_ns;
         last_output_ns_ = stamp_ns;
         if (std::llabs(stamp_ns - now_ns) > MAX_WALL_CLOCK_OFFSET_NS)
         {
-            offset_ns_ = now_ns - stamp_ns;
             last_output_ns_ = now_ns;
         }
         return rclcpp::Time(last_output_ns_);
     }
 
-    std::int64_t output_ns = stamp_ns + offset_ns_;
-    if (output_ns <= last_output_ns_ || std::llabs(output_ns - now_ns) > MAX_WALL_CLOCK_OFFSET_NS)
+    const std::int64_t step = stamp_ns - last_input_ns_;
+    const std::int64_t wall_step = std::max<std::int64_t>(0, now_ns - last_wall_ns_);
+    const bool jumped_forward = step > wall_step && step - wall_step > MAX_FRAME_GAP_NS;
+    // Adding an offset to an arbitrary source stamp could overflow int64_t.
+    const bool can_advance = step > 0 && step <= std::numeric_limits<std::int64_t>::max() - last_output_ns_;
+    std::int64_t output_ns = can_advance ? last_output_ns_ + step : last_output_ns_;
+    if (!can_advance || jumped_forward || std::llabs(output_ns - now_ns) > MAX_WALL_CLOCK_OFFSET_NS)
     {
         /* The ROS clock jumped: a bag looped, the simulation was reset, or the
            publisher was restarted. Re-anchor on real time and carry on from
            there rather than stalling the timeline. */
-        const std::int64_t candidate = now_ns > last_output_ns_ ? now_ns : last_output_ns_ + MIN_STEP_NS;
-        offset_ns_ = candidate - stamp_ns;
+        const std::int64_t candidate =
+            now_ns > last_output_ns_
+                ? now_ns
+                : last_output_ns_ +
+                      std::min(MIN_STEP_NS, std::numeric_limits<std::int64_t>::max() - last_output_ns_);
         output_ns = candidate;
         ++reanchor_count_;
     }
     last_output_ns_ = output_ns;
+    last_input_ns_ = stamp_ns;
+    last_wall_ns_ = now_ns;
     return rclcpp::Time(output_ns);
 }
 

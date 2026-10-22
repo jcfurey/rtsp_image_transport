@@ -141,6 +141,40 @@ TEST(StreamClock, ResetForgetsTheAnchor)
     EXPECT_EQ(out.nanoseconds(), WALL_NOW);
 }
 
+TEST(StreamClock, ForwardClockJumpDoesNotLeaveAPlaybackHole)
+{
+    StreamClock clock;
+    clock.toWallClock(rclcpp::Time(WALL_NOW), rclcpp::Time(WALL_NOW));
+    const auto next =
+        clock.toWallClock(rclcpp::Time(WALL_NOW + 300LL * 1000000000LL), rclcpp::Time(WALL_NOW + FRAME));
+    EXPECT_EQ(next.nanoseconds(), WALL_NOW + FRAME);
+    EXPECT_EQ(clock.reanchorCount(), 1u);
+    const auto following = clock.toWallClock(rclcpp::Time(WALL_NOW + 300LL * 1000000000LL + FRAME),
+                                             rclcpp::Time(WALL_NOW + 2 * FRAME));
+    EXPECT_EQ(following.nanoseconds() - next.nanoseconds(), FRAME);
+}
+
+TEST(StreamClock, RealElapsedTimeKeepsTheCaptureGap)
+{
+    StreamClock clock;
+    clock.toWallClock(rclcpp::Time(WALL_NOW), rclcpp::Time(WALL_NOW));
+    const auto later = WALL_NOW + 300LL * 1000000000LL;
+    EXPECT_EQ(clock.toWallClock(rclcpp::Time(later), rclcpp::Time(later)).nanoseconds(), later);
+    EXPECT_EQ(clock.reanchorCount(), 0u);
+}
+
+TEST(StreamClock, ExtremeSourceStampsCannotOverflowTheMappedTime)
+{
+    StreamClock clock;
+    clock.toWallClock(rclcpp::Time(0), rclcpp::Time(WALL_NOW));
+    const auto extreme = std::numeric_limits<std::int64_t>::max();
+    EXPECT_EQ(clock.toWallClock(rclcpp::Time(extreme), rclcpp::Time(WALL_NOW + FRAME)).nanoseconds(),
+              WALL_NOW + FRAME);
+    EXPECT_EQ(
+        clock.toWallClock(rclcpp::Time(extreme - FRAME), rclcpp::Time(WALL_NOW + 2 * FRAME)).nanoseconds(),
+        WALL_NOW + 2 * FRAME);
+}
+
 TEST(StreamClock, OutputIsAlwaysStrictlyIncreasing)
 {
     /* Whatever the input does, the RTP timeline may never go backwards. */

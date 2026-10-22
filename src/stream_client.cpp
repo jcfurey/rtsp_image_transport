@@ -26,6 +26,8 @@
 #include <GroupsockHelper.hh>
 #include <rclcpp/logging.hpp>
 
+#include <cstdint>
+#include <cstring>
 #include <format>
 #include <string>
 #include <vector>
@@ -56,14 +58,15 @@ public:
     void rearmTimeout() noexcept;
 
 private:
-    Live555Client(const std::weak_ptr<StreamClient>& stream_client, UsageEnvironment& env, char const* url,
-                  int verbosity, char const* appName, portNumBits tunnelOverHTTPPortNum, int socketNumToServer) noexcept
-        : RTSPClient(env, url, verbosity, appName, tunnelOverHTTPPortNum, socketNumToServer),
-          stream_client_(stream_client), session_(nullptr), subsession_(nullptr), has_video_(false),
-          session_active_(false), handshake_started_(false), try_pos_(0), timeout_task_(nullptr),
-          received_packets_(0)
-    {
-    }
+  Live555Client(const std::weak_ptr<StreamClient>& stream_client, UsageEnvironment& env, char const* url,
+                int verbosity, char const* appName, portNumBits tunnelOverHTTPPortNum,
+                int socketNumToServer) noexcept
+      : RTSPClient(env, url, verbosity, appName, tunnelOverHTTPPortNum, socketNumToServer),
+        stream_client_(stream_client), session_(nullptr), subsession_(nullptr), has_video_(false),
+        session_active_(false), handshake_started_(false), try_pos_(0), timeout_task_(nullptr),
+        keepalive_task_(nullptr), keepalive_pending_(false), keepalive_options_(false), received_packets_(0)
+  {
+  }
 
     static void continueAfterDESCRIBE(RTSPClient* client, int resultCode, char* resultMsg) noexcept;
     static void continueAfterSETUP(RTSPClient* client, int resultCode, char* resultMsg) noexcept;
@@ -74,6 +77,9 @@ private:
     static void enlargeRtpBuffer(Live555Client* c, const std::shared_ptr<StreamClient>& sc) noexcept;
     static void subsessionAfterPlaying(void* obj) noexcept;
     static void checkTimeout(void* obj) noexcept;
+    static void sendKeepalive(void* obj) noexcept;
+    static void continueAfterKeepalive(RTSPClient* client, int resultCode, char* resultMsg) noexcept;
+    void scheduleKeepalive() noexcept;
 
     std::weak_ptr<StreamClient> stream_client_;
     std::mutex session_mutex_;
@@ -88,6 +94,8 @@ private:
     std::size_t try_pos_;
     std::chrono::milliseconds timeout_;
     TaskToken timeout_task_;
+    TaskToken keepalive_task_;
+    bool keepalive_pending_, keepalive_options_;
     std::size_t received_packets_;
 };
 
@@ -143,6 +151,9 @@ void Live555Client::teardown() noexcept
     std::lock_guard<std::mutex> lock{session_mutex_};
     session_active_ = false;
     handshake_started_ = false;
+    if (keepalive_task_)
+        envir().taskScheduler().unscheduleDelayedTask(keepalive_task_);
+    keepalive_pending_ = false;
     subsession_ = nullptr;
     candidates_.clear();
     try_order_.clear();
@@ -228,6 +239,8 @@ bool Live555Client::collectVideoSubsessions(Live555Client* c, const std::shared_
     MediaSubsessionIterator iter{*c->session_};
     while (MediaSubsession* subsession = iter.next())
     {
+        if (!subsession->mediumName() || std::strcmp(subsession->mediumName(), "video") != 0)
+            continue;
         const char* codec_name = subsession->codecName();
         VideoCodec codec = codec_name ? fromRTSPCodecName(codec_name) : VideoCodec::Unknown;
         if (codec == VideoCodec::Unknown)
@@ -344,6 +357,7 @@ void Live555Client::continueAfterPLAY(RTSPClient* client, int resultCode, char* 
                 c->timeout_task_ =
                     c->envir().taskScheduler().scheduleDelayedTask(1000 * c->timeout_.count(), checkTimeout, c);
             lock.unlock();
+            c->scheduleKeepalive();
             sc->sessionStarted();
         }
         else
@@ -351,6 +365,60 @@ void Live555Client::continueAfterPLAY(RTSPClient* client, int resultCode, char* 
             c->teardown();
             sc->sessionFailed(resultCode, resultString ? resultString : c->envir().getResultMsg());
         }
+    }
+}
+
+void Live555Client::scheduleKeepalive() noexcept
+{
+    // The server's RTSP session lifetime is independent of the media watchdog.
+    // RTCP reception alone does not refresh every camera's control session.
+    const auto seconds = sessionTimeoutParameter() ? sessionTimeoutParameter() : 60u;
+    keepalive_task_ = envir().taskScheduler().scheduleDelayedTask(static_cast<std::int64_t>(seconds) * 500000,
+                                                                  sendKeepalive, this);
+}
+
+void Live555Client::sendKeepalive(void* obj) noexcept
+{
+    auto* c = static_cast<Live555Client*>(obj);
+    c->keepalive_task_ = nullptr;
+    auto sc = c->streamClient();
+    if (!sc || !c->session_active_ || !c->session_)
+        return;
+    if (c->keepalive_pending_)
+    {
+        c->teardown();
+        sc->sessionFailed(408, "RTSP keepalive response timed out");
+        return;
+    }
+    c->keepalive_pending_ = true;
+    c->scheduleKeepalive();
+    // A synchronous error may destroy c via the response handler. Do not use
+    // it again after sending the command.
+    if (c->keepalive_options_)
+        c->sendOptionsCommand(continueAfterKeepalive);
+    else
+        c->sendGetParameterCommand(*c->session_, continueAfterKeepalive, "");
+}
+
+void Live555Client::continueAfterKeepalive(RTSPClient* client, int resultCode, char* resultMsg) noexcept
+{
+    auto* c = static_cast<Live555Client*>(client);
+    std::unique_ptr<char[]> message(resultMsg);
+    auto sc = c->streamClient();
+    if (!sc || !c->session_active_)
+        return;
+    if ((resultCode == 405 || resultCode == 501) && !c->keepalive_options_)
+    {
+        c->keepalive_options_ = true;
+        c->sendOptionsCommand(continueAfterKeepalive);
+        return;
+    }
+    c->keepalive_pending_ = false;
+    if (resultCode != 0)
+    {
+        const std::string error = resultMsg ? resultMsg : "RTSP keepalive failed";
+        c->teardown();
+        sc->sessionFailed(resultCode, error);
     }
 }
 

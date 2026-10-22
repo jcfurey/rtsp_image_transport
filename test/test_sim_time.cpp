@@ -23,8 +23,14 @@
 #include <gtest/gtest.h>
 
 #include <image_transport/image_transport.hpp>
+#include <image_transport/subscriber_plugin.hpp>
+#include <pluginlib/class_loader.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rosgraph_msgs/msg/clock.hpp>
+#if __has_include(<rclcpp/experimental/executors/events_executor/events_executor.hpp>)
+#include <rclcpp/experimental/executors/events_executor/events_executor.hpp>
+#define RTSP_TEST_HAS_EVENTS_EXECUTOR 1
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -40,22 +46,26 @@
 using namespace std::chrono_literals;
 using namespace rtsp_image_transport::test;
 
-/* image_transport 6.4 replaced the plugin entry points with ones that take node
-   interfaces. Encoding and transport work through that API, but it does not
-   include the node clock interface the subscriber needs for simulated stamps. */
-#define TRANSPORT_SUPPORTS_SIM_TIME (CURRENT_IMAGE_TRANSPORT_VERSION < FKIE_VERSION_TUPLE(6, 4, 0))
-#define SKIP_IF_SIM_TIME_UNSUPPORTED()                                                              \
-    do                                                                                              \
-    {                                                                                               \
-        if (!TRANSPORT_SUPPORTS_SIM_TIME)                                                           \
-            GTEST_SKIP() << "image_transport " << (CURRENT_IMAGE_TRANSPORT_VERSION >> 16) << "."     \
-                         << ((CURRENT_IMAGE_TRANSPORT_VERSION >> 8) & 0xff)                          \
-                         << " does not give subscriber plugins the node clock interface needed "      \
-                            "for simulated image stamps";                                            \
-    } while (0)
-
 namespace
 {
+
+void spinSome(const rclcpp::Node::SharedPtr& node)
+{
+    rclcpp::ExecutorOptions options;
+    options.context = node->get_node_base_interface()->get_context();
+    rclcpp::executors::SingleThreadedExecutor executor(options);
+    executor.add_node(node);
+    executor.spin_some();
+}
+
+template<class Plugin>
+void checkWireMessageType(const Plugin& plugin)
+{
+    // Metadata discovery was added after the node-interface API. Keep this
+    // regression usable with distributions whose base class predates it.
+    if constexpr (requires { plugin.getMessageType(); })
+        EXPECT_EQ(plugin.getMessageType(), "std_msgs/msg/String");
+}
 
 /* Drives /clock the way a simulator or `ros2 bag play --clock` does */
 class SimClock
@@ -91,7 +101,7 @@ public:
         while (std::chrono::steady_clock::now() < deadline)
         {
             set(now_ns_);
-            rclcpp::spin_some(node_);
+            spinSome(node_);
             if (node_->get_clock()->now().nanoseconds() >= now_ns_ && now_ns_ > 0)
                 return true;
             std::this_thread::sleep_for(10ms);
@@ -110,12 +120,15 @@ private:
 class TransportFixture
 {
 public:
-    TransportFixture(const std::string& node_name, bool use_sim_time)
-    {
-        rclcpp::NodeOptions options;
-        options.append_parameter_override("use_sim_time", use_sim_time);
-        node_ = std::make_shared<rclcpp::Node>(node_name, options);
-    }
+  TransportFixture(const std::string& node_name, bool use_sim_time,
+                   const rclcpp::Context::SharedPtr& context = nullptr)
+  {
+      rclcpp::NodeOptions options;
+      if (context)
+          options.context(context);
+      options.append_parameter_override("use_sim_time", use_sim_time);
+      node_ = std::make_shared<rclcpp::Node>(node_name, options);
+  }
 
     bool start(const std::string& topic = "camera/image")
     {
@@ -126,7 +139,7 @@ public:
         };
         try
         {
-#if RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API
+#if !RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
             publisher_ = image_transport::create_publisher(node_.get(), topic);
             subscriber_ = image_transport::create_subscription(node_.get(), topic, collect, "rtsp");
 #else
@@ -163,7 +176,7 @@ public:
                 clock->set(stamp);
             for (int i = 0; i < 4; ++i)
             {
-                rclcpp::spin_some(node_);
+                spinSome(node_);
                 std::this_thread::sleep_for(8ms);
             }
         }
@@ -200,8 +213,7 @@ TEST(Transport, DeliversImagesEndToEnd)
        URL over the latched topic, connect, decode. Also proves the publisher
        and subscriber QoS settings actually match each other. */
     TransportFixture fixture("rtsp_transport_roundtrip", /*use_sim_time=*/false);
-    if (!fixture.start())
-        GTEST_SKIP() << "rtsp transport plugin not loadable: " << fixture.failure_;
+    ASSERT_TRUE(fixture.start()) << fixture.failure_;
 
     rclcpp::Clock wall(RCL_SYSTEM_TIME);
     const std::size_t got = fixture.pump(3, 60s, nullptr, wall.now().nanoseconds());
@@ -235,8 +247,7 @@ TEST(Transport, PresentationTimesKeepTheSpacingOfTheImageStamps)
        microseconds. One discontinuity is allowed: the client re-synchronises
        its presentation clock on the first RTCP sender report after PLAY. */
     TransportFixture fixture("rtsp_transport_pacing", /*use_sim_time=*/false);
-    if (!fixture.start("pacing/image"))
-        GTEST_SKIP() << "rtsp transport plugin not loadable: " << fixture.failure_;
+    ASSERT_TRUE(fixture.start("pacing/image")) << fixture.failure_;
 
     rclcpp::Clock wall(RCL_SYSTEM_TIME);
     /* Enough images to span several key frames, whose parameter sets make the
@@ -273,11 +284,10 @@ TEST(Transport, PluginsAreActuallyDrivenByImageTransport)
        topic appears, no RTSP server is ever started, and no video flows. The
        parameters are the cheapest visible proof that our code ran. */
     TransportFixture fixture("rtsp_transport_alive", /*use_sim_time=*/false);
-    if (!fixture.start("alive/image"))
-        GTEST_SKIP() << "rtsp transport plugin not loadable: " << fixture.failure_;
+    ASSERT_TRUE(fixture.start("alive/image")) << fixture.failure_;
     for (int i = 0; i < 50; ++i)
     {
-        rclcpp::spin_some(fixture.node_);
+        spinSome(fixture.node_);
         std::this_thread::sleep_for(20ms);
     }
     EXPECT_TRUE(fixture.node_->has_parameter("alive.image.rtsp.codec"))
@@ -334,14 +344,22 @@ TEST(Transport, PluginsAreActuallyDrivenByImageTransport)
         << "the relative topic lost its first character while constructing parameter names";
 }
 
+TEST(Transport, PluginManifestReportsTheUrlWireType)
+{
+    pluginlib::ClassLoader<image_transport::SubscriberPlugin> loader("image_transport",
+                                                                    "image_transport::SubscriberPlugin");
+    auto plugin = loader.createUniqueInstance("image_transport/rtsp_sub");
+    EXPECT_EQ(plugin->getTransportName(), "rtsp");
+    checkWireMessageType(*plugin);
+}
+
 TEST(Transport, SubscriberQosMatchesPublisher)
 {
     /* Both ends force RELIABLE and TRANSIENT_LOCAL on the URL topic. If those
        ever drift apart the subscriber silently receives nothing, so check the
        endpoints agree rather than waiting for video to fail. */
     TransportFixture fixture("rtsp_transport_qos", /*use_sim_time=*/false);
-    if (!fixture.start("qos/image"))
-        GTEST_SKIP() << "rtsp transport plugin not loadable: " << fixture.failure_;
+    ASSERT_TRUE(fixture.start("qos/image")) << fixture.failure_;
 
     const std::string url_topic = fixture.node_->get_effective_namespace() == "/"
                                       ? "/qos/image/rtsp"
@@ -349,7 +367,7 @@ TEST(Transport, SubscriberQosMatchesPublisher)
     std::vector<rclcpp::TopicEndpointInfo> publishers, subscribers;
     for (int i = 0; i < 100 && (publishers.empty() || subscribers.empty()); ++i)
     {
-        rclcpp::spin_some(fixture.node_);
+        spinSome(fixture.node_);
         publishers = fixture.node_->get_publishers_info_by_topic(url_topic);
         subscribers = fixture.node_->get_subscriptions_info_by_topic(url_topic);
         std::this_thread::sleep_for(20ms);
@@ -371,7 +389,6 @@ TEST(Transport, SubscriberQosMatchesPublisher)
 
 TEST(Transport, DeliversImagesStampedInSimulatedTime)
 {
-    SKIP_IF_SIM_TIME_UNSUPPORTED();
     /* With use_sim_time the rest of the system works in the simulated time
        base. Images arriving stamped with the sender's wall clock would be
        hours or years away from it, and every downstream TF lookup or message
@@ -383,8 +400,7 @@ TEST(Transport, DeliversImagesStampedInSimulatedTime)
     ASSERT_TRUE(clock.waitUntilAdopted()) << "the node clock never picked up /clock";
     ASSERT_TRUE(fixture.node_->get_clock()->ros_time_is_active());
 
-    if (!fixture.start("sim/image"))
-        GTEST_SKIP() << "rtsp transport plugin not loadable: " << fixture.failure_;
+    ASSERT_TRUE(fixture.start("sim/image")) << fixture.failure_;
 
     const std::size_t got = fixture.pump(3, 60s, &clock, sim_start);
     ASSERT_GE(got, 1u) << "no image made it through the rtsp transport under simulated time";
@@ -403,7 +419,6 @@ TEST(Transport, DeliversImagesStampedInSimulatedTime)
 
 TEST(Transport, KeepsDeliveringWhenTheClockJumpsBackwards)
 {
-    SKIP_IF_SIM_TIME_UNSUPPORTED();
     /* `ros2 bag play --loop --clock` sends the clock back to the start of the
        recording. The stream has to carry on rather than stalling. */
     TransportFixture fixture("rtsp_transport_bag_loop", /*use_sim_time=*/true);
@@ -412,8 +427,7 @@ TEST(Transport, KeepsDeliveringWhenTheClockJumpsBackwards)
     clock.set(sim_start);
     ASSERT_TRUE(clock.waitUntilAdopted());
 
-    if (!fixture.start("loop/image"))
-        GTEST_SKIP() << "rtsp transport plugin not loadable: " << fixture.failure_;
+    ASSERT_TRUE(fixture.start("loop/image")) << fixture.failure_;
 
     const std::size_t before = fixture.pump(2, 45s, &clock, sim_start);
     ASSERT_GE(before, 1u) << "nothing arrived before the loop";
@@ -422,12 +436,74 @@ TEST(Transport, KeepsDeliveringWhenTheClockJumpsBackwards)
     clock.set(sim_start);
     for (int i = 0; i < 20; ++i)
     {
-        rclcpp::spin_some(fixture.node_);
+        spinSome(fixture.node_);
         std::this_thread::sleep_for(10ms);
     }
     const std::size_t after = fixture.pump(before + 2, 45s, &clock, sim_start);
     EXPECT_GT(after, before) << "the stream stopped delivering images after the clock jumped backwards";
 }
+
+TEST(Transport, SimulatedTimeCanBeEnabledAndPausedAtRuntime)
+{
+    TransportFixture fixture("rtsp_transport_clock_switch", false);
+    ASSERT_TRUE(fixture.start("switch/image")) << fixture.failure_;
+    ASSERT_GE(fixture.pump(2, 20s, nullptr, fixture.node_->now().nanoseconds()), 2u);
+
+    ASSERT_TRUE(fixture.node_->set_parameter(rclcpp::Parameter("use_sim_time", true)).successful);
+    SimClock clock(fixture.node_);
+    constexpr std::int64_t sim_start = 1234000000000LL;
+    clock.set(sim_start);
+    ASSERT_TRUE(clock.waitUntilAdopted());
+    const auto before = fixture.count();
+    ASSERT_GE(fixture.pump(before + 3, 20s, &clock, sim_start), before + 3);
+    EXPECT_LT(rclcpp::Time(fixture.received().back().header.stamp).nanoseconds(), sim_start + 60000000000LL);
+
+    // No further /clock messages: the network and executor must keep working,
+    // and receive stamps must remain at the paused ROS time.
+    const auto paused = clock.nowNs();
+    const auto count = fixture.count();
+    ASSERT_GE(fixture.pump(count + 3, 20s, nullptr, paused, 0), count + 3);
+    EXPECT_EQ(rclcpp::Time(fixture.received().back().header.stamp).nanoseconds(), paused);
+
+    ASSERT_TRUE(fixture.node_->set_parameter(rclcpp::Parameter("use_sim_time", false)).successful);
+    const auto resume_count = fixture.count();
+    ASSERT_GE(fixture.pump(resume_count + 3, 20s, nullptr, fixture.node_->now().nanoseconds()),
+              resume_count + 3);
+    EXPECT_GT(rclcpp::Time(fixture.received().back().header.stamp).nanoseconds(), 1000000000000000000LL);
+}
+
+TEST(Transport, SupportsANonDefaultRosContext)
+{
+    auto context = std::make_shared<rclcpp::Context>();
+    context->init(0, nullptr);
+    {
+        TransportFixture fixture("rtsp_transport_context", false, context);
+        ASSERT_TRUE(fixture.start("context/image")) << fixture.failure_;
+        EXPECT_GE(fixture.pump(3, 20s, nullptr, fixture.node_->now().nanoseconds()), 3u);
+    }
+    context->shutdown("explicit-context transport test complete");
+}
+
+#ifdef RTSP_TEST_HAS_EVENTS_EXECUTOR
+TEST(Transport, DeliversFramesThroughEventsExecutor)
+{
+    TransportFixture fixture("rtsp_transport_events", false);
+    ASSERT_TRUE(fixture.start("events/image")) << fixture.failure_;
+    rclcpp::experimental::executors::EventsExecutor executor;
+    executor.add_node(fixture.node_);
+    const auto deadline = std::chrono::steady_clock::now() + 20s;
+    unsigned sequence = 0;
+    while (fixture.count() < 3 && std::chrono::steady_clock::now() < deadline)
+    {
+        auto image = makeTestImage(320, 240, sequence++);
+        image.header.stamp = fixture.node_->now();
+        fixture.publisher_.publish(image);
+        executor.spin_some();
+        std::this_thread::sleep_for(20ms);
+    }
+    EXPECT_GE(fixture.count(), 3u);
+}
+#endif
 
 int main(int argc, char** argv)
 {
