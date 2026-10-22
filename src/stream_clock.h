@@ -38,7 +38,8 @@ namespace rtsp_image_transport
  * that jump backwards, which receivers cannot follow.
  *
  * The mapping is re-anchored whenever the input goes backwards, jumps forward
- * independently of wall time, or lands implausibly far from real time. Between re-anchors the
+ * independently of wall time, falls behind elapsed wall time while encoding is
+ * idle, or lands implausibly far from real time. Between re-anchors the
  * spacing of the stamps is preserved exactly, so genuine frame timing survives.
  *
  * Call it once per image and give every packet of that image the result. A
