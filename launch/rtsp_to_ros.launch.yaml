@@ -25,6 +25,22 @@ launch:
       default: /camera/image_raw
       description: sensor_msgs/Image topic the decoded video is published on
   - arg:
+      name: frame_id
+      default: ''
+      description: Optical frame assigned to decoded image headers
+  - arg:
+      name: timestamp_source
+      default: '2'
+      description: Image stamps (0 sender clock, 1 receive clock, 2 automatic with simulated time support)
+  - arg:
+      name: use_sim_time
+      default: 'false'
+      description: Use /clock for receive timestamps
+  - arg:
+      name: low_latency
+      default: 'true'
+      description: Minimize decoder buffering (disable for a camera with B-frames)
+  - arg:
       name: max_latency
       default: '0.2'
       description: >-
@@ -48,6 +64,14 @@ launch:
       default: '2.0'
       description: RTSP handshake and media timeout in seconds (0 disables the watchdog)
   - arg:
+      name: reconnect_minwait
+      default: '0.1'
+      description: Initial delay between connection attempts in seconds
+  - arg:
+      name: reconnect_maxwait
+      default: '30.0'
+      description: Maximum delay between connection attempts in seconds
+  - arg:
       name: video_subsession
       default: '0'
       description: Zero-based index over the server's video subsessions
@@ -70,6 +94,15 @@ launch:
           value: rtsp
         - name: out_transport
           value: raw
+        - name: use_sim_time
+          value: $(var use_sim_time)
+          type: bool
+        - name: in.rtsp.frame_id
+          value: $(var frame_id)
+          type: str
+        - name: in.rtsp.timestamp_source
+          value: $(var timestamp_source)
+          type: int
 
         # RTP on its own UDP sockets, with a receive buffer big enough that
         # the kernel is not the thing dropping datagrams. The kernel caps the
@@ -93,6 +126,12 @@ launch:
         - name: in.rtsp.timeout
           value: $(var timeout)
           type: float
+        - name: in.rtsp.reconnect_minwait
+          value: $(var reconnect_minwait)
+          type: float
+        - name: in.rtsp.reconnect_maxwait
+          value: $(var reconnect_maxwait)
+          type: float
         - name: in.rtsp.decoder_stall_timeout
           value: $(var decoder_stall_timeout)
           type: float
@@ -100,7 +139,7 @@ launch:
         # Emit each picture as soon as it is complete rather than holding it
         # in the reordering buffer. Turn off only for a source with B-frames.
         - name: in.rtsp.low_latency
-          value: true
+          value: $(var low_latency)
           type: bool
         - name: in.rtsp.use_hw_decoder
           value: true

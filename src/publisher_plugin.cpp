@@ -171,7 +171,7 @@ std::string PublisherPlugin::getTransportName() const
     return "rtsp";
 }
 
-#if RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API
+#if !RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
 void PublisherPlugin::advertiseImpl(rclcpp::Node* node, const std::string& base_topic, rmw_qos_profile_t custom_qos,
                                     rclcpp::PublisherOptions options)
 {
@@ -512,6 +512,7 @@ void PublisherPlugin::updateParameters()
             if (changelevel < LVL_SERVER)
                 server_->stop();
             server_->start(config_->codec, config_->use_ip_multicast);
+            stream_clock_.reset();
             update_url_ = true;
         }
         if (changelevel >= LVL_CODEC)
@@ -576,7 +577,6 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
         {
             encoder_ = std::make_unique<StreamEncoder>(config_->codec,
                                                        config_->use_hw_encoder && !hardware_failed_, logger_);
-            stream_clock_.reset();
             encoder_->setBitrate(config_->target_bitrate);
             encoder_->setFramerate(config_->expected_framerate);
             encoder_->setKeyframeInterval(config_->keyframe_interval);
@@ -591,7 +591,7 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
         }
         if (image.header.stamp.sec == 0 && image.header.stamp.nanosec == 0)
             RCLCPP_WARN_THROTTLE(logger_, *steady_clock_, 10000,
-                                 "[%s] image header time stamp is not set, expect broken RTSP stream",
+                                 "[%s] image header time stamp is not set; using receive time for RTP pacing",
                                  topic_name_.c_str());
         if (encoder_->encodeVideo(image) > 0)
         {
@@ -619,8 +619,9 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
             }
             server_->sendAccessUnit(access_unit);
             if (stream_clock_.reanchorCount() != reanchors_before)
-                RCLCPP_INFO(logger_, "[%s] image time stamps jumped, re-anchoring the RTP timeline",
-                            topic_name_.c_str());
+                RCLCPP_INFO_THROTTLE(logger_, *steady_clock_, 10000,
+                                     "[%s] image time stamps jumped, re-anchoring the RTP timeline",
+                                     topic_name_.c_str());
         }
     }
     catch (const InvalidImageError& e)
@@ -646,7 +647,8 @@ void PublisherPlugin::publish(const sensor_msgs::msg::Image& image, const Publis
 void PublisherPlugin::onGraphChange()
 {
     std::lock_guard<std::mutex> lock{mutex_};
-    if (getNumSubscribers() == 0 && encoder_ && server_ && !(server_->hasActiveStreams() || server_->needsCodecParameters()))
+    if (getNumSubscribers() == 0 && encoder_ && server_ &&
+        !(server_->hasActiveStreams() || server_->needsCodecParameters()))
     {
         RCLCPP_INFO(logger_, "[%s] stop encoding for %s", topic_name_.c_str(), server_->url().c_str());
         encoder_.reset();

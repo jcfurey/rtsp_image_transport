@@ -29,6 +29,7 @@
 
 #include <image_transport/subscriber_plugin.hpp>
 #include <rclcpp/subscription.hpp>
+#include <rclcpp/time_source.hpp>
 #include <rclcpp/timer.hpp>
 #include <std_msgs/msg/string.hpp>
 
@@ -57,14 +58,12 @@ public:
     std::size_t getNumPublishers() const override;
 
 protected:
-#if RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API
+#if !RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
     void subscribeImpl(rclcpp::Node* node, const std::string& base_topic, const Callback& callback,
                        rmw_qos_profile_t custom_qos, rclcpp::SubscriptionOptions options) override;
 #endif
 #if RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
-    /* Newer image_transport releases pass only their required node interfaces.
-       The implementation uses a short wall timer in place of a custom waitable
-       and a system clock when the node clock interface is unavailable. */
+    /* Newer image_transport releases pass only their required node interfaces. */
     void subscribeImpl(image_transport::RequiredInterfaces node_interfaces, const std::string& base_topic,
                        const Callback& callback, rclcpp::QoS custom_qos,
                        rclcpp::SubscriptionOptions options) override;
@@ -73,6 +72,14 @@ protected:
 
 private:
     friend class SubscriberPluginTestPeer;
+    enum class ReconnectCause
+    {
+        None,
+        Timeout,
+        Failure,
+        Finished,
+        Reconfigure
+    };
     struct QueuedFrame
     {
         FrameDataPtr data;
@@ -89,7 +96,8 @@ private:
     void disconnectClient();
     bool useReceiveTimestamps() const;
     void reportMissingHwDecoder(const StreamDecoder& decoder);
-    void reconnect();
+    bool reconnectAllowed() const;
+    void reconnect(ReconnectCause cause);
     void cooldownTimerCallback(std::uint64_t generation);
     void pushFrame(const FrameDataPtr& frame,
                    std::chrono::steady_clock::time_point received_at = std::chrono::steady_clock::now());
@@ -107,24 +115,27 @@ private:
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr url_subscription_;
     bool shutdown_ = false;
     bool session_finished_ = false;
+    ReconnectCause reconnect_cause_ = ReconnectCause::None;
     std::uint64_t connection_generation_ = 0;
     std::atomic<int> timestamp_source_{2};
     rclcpp::Logger logger_;
     std::string topic_name_, param_base_name_;
     bool failed_;
-    std::chrono::milliseconds cooldown_;
+    std::chrono::milliseconds cooldown_{100};
     std::unique_ptr<Config> config_;
     rclcpp::node_interfaces::NodeTimersInterface::WeakPtr node_timers_;
     rclcpp::node_interfaces::NodeBaseInterface::WeakPtr node_base_;
     rclcpp::node_interfaces::NodeParametersInterface::WeakPtr node_param_;
     rclcpp::node_interfaces::NodeWaitablesInterface::WeakPtr node_waitables_;
+    rclcpp::node_interfaces::NodeWaitablesInterface::SharedPtr owned_waitables_;
     rclcpp::node_interfaces::PostSetParametersCallbackHandle::SharedPtr param_cb_handle_;
     rclcpp::Clock::SharedPtr clock_;
+    std::unique_ptr<rclcpp::TimeSource> clock_source_;
     /* For log throttling, which must not stall with a paused simulated clock. */
     rclcpp::Clock::SharedPtr steady_clock_ = std::make_shared<rclcpp::Clock>(RCL_STEADY_TIME);
     rclcpp::CallbackGroup::SharedPtr cooldown_cb_group_, scheduled_cb_group_;
     rclcpp::Duration old_lag_;
-    rclcpp::WallTimer<rclcpp::VoidCallbackType>::SharedPtr cooldown_timer_, frame_timer_;
+    rclcpp::WallTimer<rclcpp::VoidCallbackType>::SharedPtr cooldown_timer_;
     /* Local guard for cooldown and timer bookkeeping. Session events are
        dispatched on the executor under callback_gate_. */
     mutable std::mutex cooldown_mutex_;

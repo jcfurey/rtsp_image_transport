@@ -27,9 +27,10 @@
 #include "streaming_error.h"
 #include "topic_parameter.h"
 
-#include <rclcpp/detail/add_guard_condition_to_rcl_wait_set.hpp>
-#include <rclcpp/waitable.hpp>
 #include <rclcpp/create_subscription.hpp>
+#include <rclcpp/exceptions.hpp>
+#include <rclcpp/node_interfaces/node_waitables.hpp>
+#include <rclcpp/waitable.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -39,11 +40,8 @@ namespace rtsp_image_transport
 {
 
 /* From image_transport 6.4 the plugin entry points take node interfaces rather
-   than a node, and the old ones are never called. RequiredInterfaces does not
-   include the clock or waitables interfaces. The newer implementation therefore
-   uses a short wall timer to process queued frames on the executor and falls
-   back to a system clock for receive timestamps. See RTSP_IMAGE_TRANSPORT_* in
-   init.h for the 6.4 and 7.0 boundaries. */
+   than a node. The base interface still lets us attach an executor waitable;
+   a TimeSource supplies a ROS clock independently of the node clock interface. */
 
 namespace
 {
@@ -62,7 +60,7 @@ public:
     using Signature = std::function<void()>;
     using SharedPtr = std::shared_ptr<ScheduledCB>;
 
-    explicit ScheduledCB(const Signature& func);
+    ScheduledCB(const Signature& func, const rclcpp::Context::SharedPtr& context);
     void trigger();
 
     std::size_t get_number_of_ready_guard_conditions() override;
@@ -83,7 +81,10 @@ private:
     std::atomic<bool> pending_{false};
 };
 
-ScheduledCB::ScheduledCB(const Signature& func) : func_(func) {}
+ScheduledCB::ScheduledCB(const Signature& func, const rclcpp::Context::SharedPtr& context)
+    : func_(func), cond_(context)
+{
+}
 
 void ScheduledCB::trigger()
 {
@@ -106,9 +107,21 @@ std::shared_ptr<void> ScheduledCB::take_data_by_entity_id(std::size_t id)
     return nullptr;
 }
 
-void ScheduledCB::set_on_ready_callback(std::function<void(std::size_t, int)>) {}
+void ScheduledCB::set_on_ready_callback(std::function<void(std::size_t, int)> callback)
+{
+    if (!callback)
+    {
+        clear_on_ready_callback();
+        return;
+    }
+    cond_.set_on_trigger_callback([callback = std::move(callback)](std::size_t count)
+                                  { callback(count, 0); });
+}
 
-void ScheduledCB::clear_on_ready_callback() {}
+void ScheduledCB::clear_on_ready_callback()
+{
+    cond_.set_on_trigger_callback(nullptr);
+}
 
 void ScheduledCB::add_to_wait_set(rcl_wait_set_t& wait_set)
 {
@@ -116,7 +129,10 @@ void ScheduledCB::add_to_wait_set(rcl_wait_set_t& wait_set)
        GuardCondition::add_to_wait_set() instead pins the condition to one
        particular wait-set object, which breaks callers such as spin_some()
        that legitimately construct a fresh executor for every call. */
-    rclcpp::detail::add_guard_condition_to_rcl_wait_set(wait_set, cond_);
+    const auto result =
+        rcl_wait_set_add_guard_condition(&wait_set, &cond_.get_rcl_guard_condition(), nullptr);
+    if (result != RCL_RET_OK)
+        rclcpp::exceptions::throw_from_rcl_error(result, "failed to add RTSP frame notification to wait set");
 }
 
 bool ScheduledCB::is_ready(const rcl_wait_set_t&)
@@ -216,14 +232,17 @@ void SubscriberPlugin::shutdown()
     ++connection_generation_;
     param_cb_handle_.reset();
     disconnectClient();
-    frame_timer_.reset();
     notify_frame_ = {};
     if (auto waitables = node_waitables_.lock(); waitables && scheduled_cb_)
         waitables->remove_waitable(scheduled_cb_, scheduled_cb_group_);
     scheduled_cb_.reset();
     scheduled_cb_group_.reset();
+    node_waitables_.reset();
+    owned_waitables_.reset();
     {
         std::lock_guard<std::mutex> lock{cooldown_mutex_};
+        if (cooldown_timer_)
+            cooldown_timer_->cancel();
         cooldown_cb_group_.reset();
         cooldown_timer_.reset();
     }
@@ -231,6 +250,7 @@ void SubscriberPlugin::shutdown()
     decoder_.store(nullptr);
     clearQueuedFrames();
     url_subscription_.reset();
+    clock_source_.reset();
 }
 
 std::string SubscriberPlugin::getTransportName() const
@@ -262,15 +282,13 @@ bool SubscriberPlugin::useReceiveTimestamps() const
         case TimestampFromReceiver:
             return true;
         default:
-            /* ros_time_is_active() throws when called on a system or steady
-               clock in newer rclcpp releases. The node-interface plugin API
-               has no clock interface and deliberately installs a system clock,
-               so check its type before asking about a ROS-time override. */
+            /* ros_time_is_active() throws on system and steady clocks in
+               newer rclcpp releases, so check the type before querying it. */
             return clock_ && clock_->get_clock_type() == RCL_ROS_TIME && clock_->ros_time_is_active();
     }
 }
 
-#if RTSP_IMAGE_TRANSPORT_HAS_LEGACY_PLUGIN_API
+#if !RTSP_IMAGE_TRANSPORT_USES_NODE_INTERFACES
 void SubscriberPlugin::subscribeImpl(rclcpp::Node* node, const std::string& base_topic, const Callback& callback,
                                      rmw_qos_profile_t custom_qos, rclcpp::SubscriptionOptions options)
 {
@@ -304,8 +322,8 @@ void SubscriberPlugin::subscribeImpl(rclcpp::Node* node, const std::string& base
         std::move(on_url), options);
     logger_ = node->get_logger();
     clock_ = node->get_clock();
-    ScheduledCB::SharedPtr scheduled_cb =
-        std::make_shared<ScheduledCB>(callback_gate_->wrap([this] { processFrame(); }));
+    ScheduledCB::SharedPtr scheduled_cb = std::make_shared<ScheduledCB>(
+        callback_gate_->wrap([this] { processFrame(); }), node->get_node_base_interface()->get_context());
     scheduled_cb_ = scheduled_cb;
     /* Cached so the hot receive path does not need a dynamic_cast per NAL unit */
     notify_frame_ = [scheduled_cb]() { scheduled_cb->trigger(); };
@@ -359,7 +377,13 @@ void SubscriberPlugin::subscribeImpl(image_transport::RequiredInterfaces node_in
     auto node_timers = node_interfaces.get_node_timers_interface();
     auto node_parameters = node_interfaces.get_node_parameters_interface();
     logger_ = node_interfaces.get_node_logging_interface()->get_logger();
-    clock_ = std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME);
+    clock_ = std::make_shared<rclcpp::Clock>(RCL_ROS_TIME);
+    clock_source_ = std::make_unique<rclcpp::TimeSource>();
+    clock_source_->attachClock(clock_);
+    // TimeSource uses base, topics, logging and parameters to manage /clock.
+    // The graph, services and node clock interfaces are retained but unused.
+    clock_source_->attachNode(node_base, topics_interface, nullptr, nullptr,
+                              node_interfaces.get_node_logging_interface(), nullptr, node_parameters);
     topic_name_ = base_topic;
     node_base_ = node_base;
     node_timers_ = node_timers;
@@ -378,27 +402,13 @@ void SubscriberPlugin::subscribeImpl(image_transport::RequiredInterfaces node_in
     updateParameters();
 
     scheduled_cb_group_ = node_base->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-    frame_timer_ = std::make_shared<rclcpp::WallTimer<rclcpp::VoidCallbackType>>(
-        2ms, callback_gate_->wrap([this] { processFrame(); }), node_base->get_context());
-    node_timers->add_timer(frame_timer_, scheduled_cb_group_);
-    RCLCPP_INFO(logger_, "[%s] using image_transport node-interface API with executor timer frame delivery",
-                topic_name_.c_str());
-
-    /* RequiredInterfaces carries no clock interface, so clock_ above is a plain
-       system clock and automatic timestamp_source picks sender time. Nothing
-       on this path can produce a simulated stamp at all. Say so rather than
-       letting every published image carry a wall clock time in a simulated time
-       base. */
-    if (node_parameters->has_parameter("use_sim_time")
-        && node_parameters->get_parameter("use_sim_time").get_value<bool>())
-    {
-        RCLCPP_ERROR(logger_,
-                     "[%s] use_sim_time is set, but image_transport %d.%d gives this transport no clock "
-                     "interface, so published images will be stamped from the wall clock and not from /clock. "
-                     "Use image_transport 6.3 or earlier if the stamps have to follow simulated time",
-                     topic_name_.c_str(), CURRENT_IMAGE_TRANSPORT_VERSION >> 16,
-                     (CURRENT_IMAGE_TRANSPORT_VERSION >> 8) & 0xff);
-    }
+    owned_waitables_ = std::make_shared<rclcpp::node_interfaces::NodeWaitables>(node_base.get());
+    node_waitables_ = owned_waitables_;
+    auto scheduled_cb = std::make_shared<ScheduledCB>(callback_gate_->wrap([this] { processFrame(); }),
+                                                      node_base->get_context());
+    scheduled_cb_ = scheduled_cb;
+    notify_frame_ = [scheduled_cb] { scheduled_cb->trigger(); };
+    owned_waitables_->add_waitable(scheduled_cb_, scheduled_cb_group_);
 }
 #endif
 
@@ -413,11 +423,14 @@ void SubscriberPlugin::internalCallback(const std_msgs::msg::String::ConstShared
     clearQueuedFrames();
     RCLCPP_DEBUG(logger_, "[%s] received updated RTSP URL: %s", topic_name_.c_str(), msg->data.c_str());
     failed_ = false;
+    reconnect_cause_ = ReconnectCause::None;
     old_lag_ = 0s;
     callback_ = callback;
     {
         std::lock_guard<std::mutex> lock{cooldown_mutex_};
         cooldown_ = config_->reconnect_minwait;
+        if (cooldown_timer_)
+            cooldown_timer_->cancel();
         cooldown_cb_group_.reset();
         cooldown_timer_.reset();
     }
@@ -448,10 +461,7 @@ void SubscriberPlugin::internalCallback(const std_msgs::msg::String::ConstShared
         RCLCPP_ERROR(logger_, "[%s] %s", topic_name_.c_str(), e.what());
         failed_ = true;
         clearQueuedFrames();
-        if (reconnectAfterFailure(config_->reconnect_policy))
-        {
-            reconnect();
-        }
+        reconnect(ReconnectCause::Failure);
     }
 }
 
@@ -500,7 +510,8 @@ void SubscriberPlugin::reportMissingHwDecoder(const StreamDecoder& decoder)
 
 void SubscriberPlugin::receiveDataStream(VideoCodec codec, MediaSubsession* subsession, const FrameDataPtr& data)
 {
-    RCLCPP_DEBUG_THROTTLE(logger_, *clock_, 30000, "[%s] receiving video frames from RTSP stream", topic_name_.c_str());
+    RCLCPP_DEBUG_THROTTLE(logger_, *steady_clock_, 30000, "[%s] receiving video frames from RTSP stream",
+                          topic_name_.c_str());
     if (useReceiveTimestamps())
     {
         /* The RTP presentation time is the sender's wall clock, which says
@@ -676,6 +687,10 @@ void SubscriberPlugin::updateParameters()
         1000 * np->get_parameter(param_base_name_ + ".reconnect_minwait").as_double()));
     new_config.reconnect_maxwait = std::chrono::milliseconds(static_cast<std::chrono::milliseconds::rep>(
         1000 * np->get_parameter(param_base_name_ + ".reconnect_maxwait").as_double()));
+    // Compare effective settings, including the anti-spin floor. Comparing a
+    // raw zero maximum with the stored floor reset backoff on unrelated edits.
+    new_config.reconnect_maxwait =
+        std::max({new_config.reconnect_maxwait, new_config.reconnect_minwait, 100ms});
 
     int changelevel = 0;
     if (new_config.decoder.use_hw_decoder != config_->decoder.use_hw_decoder
@@ -692,6 +707,9 @@ void SubscriberPlugin::updateParameters()
         || new_config.rtp_buffer_size != config_->rtp_buffer_size)
         changelevel |= LVL_CONNECTION;
 
+    const bool retry_settings_changed = new_config.reconnect_policy != config_->reconnect_policy ||
+                                        new_config.reconnect_minwait != config_->reconnect_minwait ||
+                                        new_config.reconnect_maxwait != config_->reconnect_maxwait;
     *config_ = new_config;
     timestamp_source_.store(config_->timestamp_source);
     {
@@ -701,21 +719,22 @@ void SubscriberPlugin::updateParameters()
     }
     try
     {
+        if (retry_settings_changed)
         {
             std::lock_guard<std::mutex> lock{cooldown_mutex_};
             cooldown_ = config_->reconnect_minwait;
         }
-        if (config_->reconnect_maxwait < config_->reconnect_minwait)
-            config_->reconnect_maxwait = config_->reconnect_minwait;
-        /* Zero for both would retry an unreachable camera as fast as the
-           executor can spin. */
-        config_->reconnect_maxwait = std::max(config_->reconnect_maxwait, std::chrono::milliseconds(100));
         if (client_)
         {
             client_->setSessionTimeout(config_->timeout);
             if (changelevel & (LVL_CONNECTION | LVL_CODEC))
             {
-                reconnect();
+                reconnect(ReconnectCause::Reconfigure);
+                return;
+            }
+            if (retry_settings_changed && failed_ && reconnect_cause_ != ReconnectCause::None)
+            {
+                reconnect(reconnect_cause_);
                 return;
             }
         }
@@ -727,10 +746,7 @@ void SubscriberPlugin::updateParameters()
         RCLCPP_ERROR(logger_, "[%s] %s", topic_name_.c_str(), e.what());
         failed_ = true;
         clearQueuedFrames();
-        if (reconnectAfterFailure(config_->reconnect_policy))
-        {
-            reconnect();
-        }
+        reconnect(ReconnectCause::Failure);
     }
 }
 
@@ -820,6 +836,14 @@ void SubscriberPlugin::processFrame()
             {
                 while (sensor_msgs::msg::Image::UniquePtr decoded = decoder->nextFrame())
                 {
+                    // PLAY can succeed on a camera that never sends a picture.
+                    // Reset backoff only after decoding proves the feed works.
+                    if (reconnect_cause_ != ReconnectCause::None)
+                    {
+                        std::lock_guard<std::mutex> lock{cooldown_mutex_};
+                        cooldown_ = config_->reconnect_minwait;
+                        reconnect_cause_ = ReconnectCause::None;
+                    }
                     decoded->header.frame_id = config_->frame_id;
                     sensor_msgs::msg::Image::ConstSharedPtr img(std::move(decoded));
                     produced = true;
@@ -886,18 +910,7 @@ void SubscriberPlugin::processFrame()
         RCLCPP_ERROR(logger_, "[%s] %s", topic_name_.c_str(), e.what());
         failed_ = true;
         clearQueuedFrames();
-        if (reconnectAfterFailure(config_->reconnect_policy))
-        {
-            reconnect();
-        }
-        else
-        {
-            /* Nothing will consume the stream any more. Left connected, it
-               kept the socket and receive thread busy and, with max_latency=0,
-               queued data without bound. A parameter change reconnects. */
-            disconnectClient();
-            clearQueuedFrames();
-        }
+        reconnect(ReconnectCause::Failure);
     }
     bool pending;
     {
@@ -909,15 +922,15 @@ void SubscriberPlugin::processFrame()
     if (!pending && session_finished_)
     {
         session_finished_ = false;
-        if (reconnectAfterNormalEnd(config_->reconnect_policy))
-            reconnect();
+        reconnect(ReconnectCause::Finished);
     }
 }
 
 void SubscriberPlugin::sessionStarted()
 {
     std::lock_guard<std::mutex> lock{cooldown_mutex_};
-    cooldown_ = config_->reconnect_minwait;
+    if (cooldown_timer_)
+        cooldown_timer_->cancel();
     cooldown_timer_.reset();
 }
 
@@ -925,20 +938,14 @@ void SubscriberPlugin::sessionTimeout()
 {
     RCLCPP_ERROR(logger_, "[%s] session timeout for stream at %s", topic_name_.c_str(),
                  client_ ? client_->url().c_str() : "(unknown)");
-    if (reconnectAfterTimeout(config_->reconnect_policy))
-    {
-        reconnect();
-    }
+    reconnect(ReconnectCause::Timeout);
 }
 
 void SubscriberPlugin::sessionFailed(int code, const std::string& message)
 {
     RCLCPP_ERROR(logger_, "[%s] %s failed. %s (%d)", topic_name_.c_str(),
                  client_ ? client_->url().c_str() : "(unknown)", message.c_str(), code);
-    if (reconnectAfterFailure(config_->reconnect_policy))
-    {
-        reconnect();
-    }
+    reconnect(code == 408 ? ReconnectCause::Timeout : ReconnectCause::Failure);
 }
 
 void SubscriberPlugin::sessionFinished()
@@ -949,23 +956,52 @@ void SubscriberPlugin::sessionFinished()
     session_finished_ = true;
 }
 
-void SubscriberPlugin::reconnect()
+bool SubscriberPlugin::reconnectAllowed() const
+{
+    switch (reconnect_cause_)
+    {
+    case ReconnectCause::Timeout:
+        return reconnectAfterTimeout(config_->reconnect_policy);
+    case ReconnectCause::Failure:
+        return reconnectAfterFailure(config_->reconnect_policy);
+    case ReconnectCause::Finished:
+        return reconnectAfterNormalEnd(config_->reconnect_policy);
+    case ReconnectCause::Reconfigure:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void SubscriberPlugin::reconnect(ReconnectCause cause)
 {
     if (shutdown_ || !client_)
         return;
     disconnectClient();
     ++connection_generation_;
+    failed_ = true;
+    reconnect_cause_ = cause;
     decoder_.store(nullptr);
     client_->setVideoSubsession(static_cast<std::size_t>(config_->video_subsession));
     client_->setRtpOverTcp(config_->rtp_over_tcp);
     client_->setRtpBufferSize(static_cast<unsigned>(config_->rtp_buffer_size));
     clearQueuedFrames();
+    {
+        std::lock_guard<std::mutex> lock{cooldown_mutex_};
+        if (cooldown_timer_)
+            cooldown_timer_->cancel();
+        cooldown_timer_.reset();
+    }
+    if (!reconnectAllowed())
+        return;
     rclcpp::node_interfaces::NodeBaseInterface::SharedPtr nb = node_base_.lock();
     rclcpp::node_interfaces::NodeTimersInterface::SharedPtr nt = node_timers_.lock();
     if (nb && nt)
     {
         // Session events and timer callbacks are serialized by callback_gate_.
         std::lock_guard<std::mutex> lock{cooldown_mutex_};
+        // Even a requested zero wait yields for at least one millisecond.
+        cooldown_ = std::clamp(cooldown_, 1ms, config_->reconnect_maxwait);
         RCLCPP_INFO(logger_, "[%s] new connection attempt in %0.3lf seconds", topic_name_.c_str(),
                     1e-3 * cooldown_.count());
         /* One group for every retry timer: the node keeps a list entry per
@@ -986,11 +1022,18 @@ void SubscriberPlugin::reconnect()
 void SubscriberPlugin::cooldownTimerCallback(std::uint64_t generation)
 {
     std::lock_guard<std::recursive_mutex> state_lock{callback_gate_->mutex};
-    if (shutdown_ || generation != connection_generation_)
+    if (shutdown_ || generation != connection_generation_ || !reconnectAllowed())
         return;
+    // A timer event already taken by an executor may survive cancellation.
+    // Claim this retry once so another event from the same timer is stale.
+    ++connection_generation_;
     {
         std::lock_guard<std::mutex> lock{cooldown_mutex_};
-        cooldown_timer_.reset();  // just in case
+        // Releasing our shared_ptr does not cancel a timer the executor has
+        // already taken. Explicitly disarm this one-shot retry before connect.
+        if (cooldown_timer_)
+            cooldown_timer_->cancel();
+        cooldown_timer_.reset();
     }
     clearQueuedFrames();
     if (!client_)
@@ -1002,8 +1045,7 @@ void SubscriberPlugin::cooldownTimerCallback(std::uint64_t generation)
     catch (const std::exception& e)
     {
         RCLCPP_ERROR(logger_, "[%s] %s", topic_name_.c_str(), e.what());
-        if (reconnectAfterFailure(config_->reconnect_policy))
-            reconnect();
+        reconnect(ReconnectCause::Failure);
     }
 }
 

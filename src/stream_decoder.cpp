@@ -198,7 +198,7 @@ std::shared_ptr<AVBufferRef> sharedHwDevice(AVHWDeviceType type, const std::stri
 {
     /* Recursive because creating a QSV device asks for a VAAPI device below */
     static std::recursive_mutex mutex;
-    static std::map<std::pair<AVHWDeviceType, std::string>, AVBufferRef*> cache;
+    static std::map<std::pair<AVHWDeviceType, std::string>, std::shared_ptr<AVBufferRef>> cache;
 
     std::lock_guard<std::recursive_mutex> lock{mutex};
     const std::pair<AVHWDeviceType, std::string> key{type, device_path};
@@ -231,18 +231,20 @@ std::shared_ptr<AVBufferRef> sharedHwDevice(AVHWDeviceType type, const std::stri
             RCLCPP_DEBUG(logger, "%s hardware device%s%s is unavailable: %s", hwDeviceName(type).c_str(),
                          path ? " " : "", path ? path : "",
                          av_make_error_string(errbuf, sizeof(errbuf), result));
-            device = nullptr;
+            av_buffer_unref(&device);
         }
         else
         {
             RCLCPP_INFO(logger, "opened %s device%s%s for hardware accelerated video decoding",
                         hwDeviceName(type).c_str(), path ? " " : "", path ? path : "");
         }
-        entry = cache.emplace(key, device).first;
+        // Keep shared ownership while caching, including at static teardown.
+        // Raw AVBufferRef pointers here leaked every successfully opened GPU.
+        entry = cache.emplace(key, std::shared_ptr<AVBufferRef>(device, free_buffer)).first;
     }
     if (!entry->second)
         return std::shared_ptr<AVBufferRef>();
-    return std::shared_ptr<AVBufferRef>(av_buffer_ref(entry->second), free_buffer);
+    return entry->second;
 }
 
 /* Reports whether the decoder can be driven by the given hardware device, and

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "stream_client.h"
 #include "stream_decoder.h"
 #include "streaming_error.h"
 #include "subscriber_plugin.h"
@@ -116,6 +117,37 @@ class SubscriberPluginTestPeer
     static std::size_t stalls(const SubscriberPlugin& plugin)
     {
         return plugin.decoder_stalls_;
+    }
+    static void attachClient(SubscriberPlugin& plugin, const rclcpp::Node::SharedPtr& node)
+    {
+        plugin.node_base_ = node->get_node_base_interface();
+        plugin.node_timers_ = node->get_node_timers_interface();
+        plugin.client_ = StreamClient::create("input", "not-an-rtsp-url");
+    }
+    static void fail(SubscriberPlugin& plugin, int code = 404)
+    {
+        plugin.sessionFailed(code, "test failure");
+    }
+    static void started(SubscriberPlugin& plugin)
+    {
+        plugin.sessionStarted();
+    }
+    static auto timer(SubscriberPlugin& plugin)
+    {
+        return plugin.cooldown_timer_;
+    }
+    static auto cooldown(const SubscriberPlugin& plugin)
+    {
+        return plugin.cooldown_;
+    }
+    static void setCooldown(SubscriberPlugin& plugin, std::chrono::milliseconds wait)
+    {
+        plugin.cooldown_ = wait;
+        plugin.reconnect_cause_ = SubscriberPlugin::ReconnectCause::Failure;
+    }
+    static auto generation(const SubscriberPlugin& plugin)
+    {
+        return plugin.connection_generation_;
     }
 };
 
@@ -482,4 +514,67 @@ TEST_F(SubscriberPerformance, NoDropModeYieldsAndReschedulesUntilTheQueueIsDrain
     drain();
     EXPECT_EQ(images.size(), 40u);
     EXPECT_GE(notifications, 2u);
+}
+
+TEST_F(SubscriberPerformance, RetryTimerIsDisarmedWhileExecutorStillOwnsIt)
+{
+    SubscriberPluginTestPeer::attachClient(*plugin, node);
+    SubscriberPluginTestPeer::fail(*plugin);
+    auto timer = SubscriberPluginTestPeer::timer(*plugin);
+    ASSERT_TRUE(timer);
+    EXPECT_FALSE(timer->is_canceled());
+    auto execution = timer->call();
+    ASSERT_TRUE(execution);
+    timer->execute_callback(execution);
+    EXPECT_TRUE(timer->is_canceled());
+    EXPECT_FALSE(SubscriberPluginTestPeer::timer(*plugin));
+    const auto generation = SubscriberPluginTestPeer::generation(*plugin);
+    timer->execute_callback(execution); // an already queued executor event
+    EXPECT_EQ(SubscriberPluginTestPeer::generation(*plugin), generation);
+    EXPECT_FALSE(SubscriberPluginTestPeer::timer(*plugin));
+}
+
+TEST_F(SubscriberPerformance, PlayAndUnrelatedParametersDoNotEraseBackoff)
+{
+    SubscriberPluginTestPeer::setCooldown(*plugin, 800ms);
+    SubscriberPluginTestPeer::started(*plugin);
+    EXPECT_EQ(SubscriberPluginTestPeer::cooldown(*plugin), 800ms);
+    ASSERT_TRUE(node->set_parameter(rclcpp::Parameter("input.rtsp.frame_id", "optical_frame")).successful);
+    EXPECT_EQ(SubscriberPluginTestPeer::cooldown(*plugin), 800ms);
+    ASSERT_TRUE(node->set_parameters_atomically({rclcpp::Parameter("input.rtsp.reconnect_minwait", 0.0),
+                                                rclcpp::Parameter("input.rtsp.reconnect_maxwait", 0.0)}).successful);
+    SubscriberPluginTestPeer::setCooldown(*plugin, 50ms);
+    ASSERT_TRUE(node->set_parameter(rclcpp::Parameter("input.rtsp.frame_id", "other_optical_frame")).successful);
+    EXPECT_EQ(SubscriberPluginTestPeer::cooldown(*plugin), 50ms);
+}
+
+TEST_F(SubscriberPerformance, ChangingRetryPolicyCancelsAndResumesPendingRetries)
+{
+    SubscriberPluginTestPeer::attachClient(*plugin, node);
+    SubscriberPluginTestPeer::fail(*plugin);
+    auto first_timer = SubscriberPluginTestPeer::timer(*plugin);
+    ASSERT_TRUE(first_timer);
+    ASSERT_TRUE(node->set_parameter(rclcpp::Parameter("input.rtsp.reconnect_policy", 0)).successful);
+    EXPECT_TRUE(first_timer->is_canceled());
+    EXPECT_FALSE(SubscriberPluginTestPeer::timer(*plugin));
+    ASSERT_TRUE(node->set_parameter(rclcpp::Parameter("input.rtsp.reconnect_policy", 1)).successful);
+    EXPECT_FALSE(SubscriberPluginTestPeer::timer(*plugin)) << "policy 1 must not retry a 404";
+    SubscriberPluginTestPeer::fail(*plugin, 408);
+    EXPECT_TRUE(SubscriberPluginTestPeer::timer(*plugin)) << "policy 1 must retry a handshake timeout";
+    ASSERT_TRUE(node->set_parameter(rclcpp::Parameter("input.rtsp.reconnect_policy", 0)).successful);
+    EXPECT_FALSE(SubscriberPluginTestPeer::timer(*plugin));
+    ASSERT_TRUE(node->set_parameter(rclcpp::Parameter("input.rtsp.reconnect_policy", 3)).successful);
+    EXPECT_TRUE(SubscriberPluginTestPeer::timer(*plugin));
+}
+
+TEST_F(SubscriberPerformance, ADecodedImageResetsTheRetryBackoff)
+{
+    SubscriberPluginTestPeer::setCooldown(*plugin, 800ms);
+    const auto packets = encodeTestStream(VideoCodec::H264, 320, 240, 3);
+    ASSERT_FALSE(packets.empty());
+    for (std::size_t i = 0; i < packets.size(); ++i)
+        SubscriberPluginTestPeer::push(*plugin, accessUnit(packets[i], i));
+    SubscriberPluginTestPeer::process(*plugin);
+    ASSERT_GT(images.size(), 0u);
+    EXPECT_EQ(SubscriberPluginTestPeer::cooldown(*plugin), 100ms);
 }

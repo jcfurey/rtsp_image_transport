@@ -308,6 +308,7 @@ if(BUILD_TESTING)
         test_codec_tables
         test_frame_extractor
         test_reconnect_policy
+        test_rtsp_keepalive
         test_ffmpeg_logging
         test_robustness
     )
