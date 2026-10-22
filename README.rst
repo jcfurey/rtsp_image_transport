@@ -81,7 +81,7 @@ link loses packets and has headroom to spare::
 
    With no periodic key frame, a client joining a stream that is *already
    running* has nothing to start from and must wait out a full sweep before
-   its picture is complete. Encoding begins when the first client connects, so
+   its picture is complete. Continuous encoding begins when the first client connects, so
    that client still gets a key frame and is unaffected. A decoder-level late
    join after the initial IDR is covered by the regression suite; the untested
    end-to-end case is a **second simultaneous RTSP viewer**, or any
@@ -116,7 +116,11 @@ preventing old images from queuing ahead of the encoder. The encoder itself is
 configured for no B-frames, zero look-ahead and the hardware encoder's
 low-latency preset.
 
-The relay is demand-driven. While no native client is playing the stream,
+The relay is demand-driven. H.264/H.265 publishers first encode an initial
+image to retain decoder setup data for SDP. This lets Android and other
+clients accept the first DESCRIBE without another viewer starting video first.
+Setup data survives client disconnects and is cleared on session restart.
+After that initial setup, while no native client is playing the stream,
 ``image_transport republish`` releases its raw input subscription and the
 encoder does no work. A native RTSP PLAY request activates the subscription in
 about 10 ms; disconnecting the last client releases it again. Merely reading

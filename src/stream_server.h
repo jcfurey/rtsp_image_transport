@@ -55,6 +55,8 @@ public:
     StreamServer& operator=(StreamServer&&) = delete;
     void sendAccessUnit(const std::vector<FrameDataPtr>& frames) noexcept;
     bool hasActiveStreams() const noexcept;
+    // Encode a bounded initial access unit so first viewers receive usable SDP.
+    bool needsCodecParameters() const noexcept;
     std::size_t activeStreamCount() const noexcept;
     VideoCodec codec() const noexcept;
     unsigned preferredPacketSize() const noexcept;
@@ -70,6 +72,7 @@ protected:
     void newStreamSource(FramedSource* source, FrameInjector* injector) noexcept;
     void closeStreamSource(FramedSource* source) noexcept;
     RTPSink* activeSinkForSDP();
+    VideoRTPSink* createRTPSink(Groupsock* groupsock, unsigned char payload_type);
 
 private:
     using StreamMapping = std::map<FramedSource*, FrameInjector*>;
@@ -90,6 +93,7 @@ private:
        destroyed in this particular order. */
     mutable std::mutex streams_mutex_;
     StreamMapping streams_;
+    std::vector<unsigned char> sps_, pps_, vps_;
     // Only accessed on the Live555 thread. A departing client must remove its
     // SDP sink before another DESCRIBE can inspect a dangling pointer.
     std::map<FramedSource*, VideoRTPSink*> unicast_sinks_;
