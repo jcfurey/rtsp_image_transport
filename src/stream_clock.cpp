@@ -58,10 +58,15 @@ rclcpp::Time StreamClock::toWallClock(const rclcpp::Time& stamp, const rclcpp::T
     const std::int64_t step = stamp_ns - last_input_ns_;
     const std::int64_t wall_step = std::max<std::int64_t>(0, now_ns - last_wall_ns_);
     const bool jumped_forward = step > wall_step && step - wall_step > MAX_FRAME_GAP_NS;
+    // Demand-driven encoding does not see the loops that occur while no one
+    // watches. A returning viewer may have a small positive source step after
+    // minutes of wall time. Anchor that first picture now; waiting for the next
+    // rewind would insert the whole idle interval into an active RTP stream.
+    const bool fell_behind = step > 0 && wall_step > step && wall_step - step > MAX_FRAME_GAP_NS;
     // Adding an offset to an arbitrary source stamp could overflow int64_t.
     const bool can_advance = step > 0 && step <= std::numeric_limits<std::int64_t>::max() - last_output_ns_;
     std::int64_t output_ns = can_advance ? last_output_ns_ + step : last_output_ns_;
-    if (!can_advance || jumped_forward || std::llabs(output_ns - now_ns) > MAX_WALL_CLOCK_OFFSET_NS)
+    if (!can_advance || jumped_forward || fell_behind || std::llabs(output_ns - now_ns) > MAX_WALL_CLOCK_OFFSET_NS)
     {
         /* The ROS clock jumped: a bag looped, the simulation was reset, or the
            publisher was restarted. Re-anchor on real time and carry on from

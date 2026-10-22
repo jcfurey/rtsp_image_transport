@@ -163,6 +163,37 @@ TEST(StreamClock, RealElapsedTimeKeepsTheCaptureGap)
     EXPECT_EQ(clock.reanchorCount(), 0u);
 }
 
+TEST(StreamClock, ReturningAfterUnobservedBagLoopsDoesNotInsertTheIdleInterval)
+{
+    StreamClock clock;
+    clock.toWallClock(rclcpp::Time(0), rclcpp::Time(WALL_NOW));
+    // Five minutes without an encoder callback; a 60 s bag is now nine seconds
+    // into its next pass. The source stamp advanced, so a rewind check alone
+    // would miss the discontinuity until the viewer reached the next loop.
+    constexpr std::int64_t second = 1000000000LL;
+    const auto returning = clock.toWallClock(rclcpp::Time(9 * second),
+                                             rclcpp::Time(WALL_NOW + 300 * second));
+    EXPECT_EQ(returning.nanoseconds(), WALL_NOW + 300 * second);
+    const auto next = clock.toWallClock(rclcpp::Time(9 * second + FRAME),
+                                        rclcpp::Time(WALL_NOW + 300 * second + FRAME));
+    EXPECT_EQ(next.nanoseconds() - returning.nanoseconds(), FRAME);
+    const auto looped = clock.toWallClock(rclcpp::Time(0),
+                                          rclcpp::Time(WALL_NOW + 300 * second + 2 * FRAME));
+    EXPECT_EQ(looped.nanoseconds() - next.nanoseconds(), FRAME)
+        << "the next bag rewind created minutes of receiver buffering";
+}
+
+TEST(StreamClock, LongRealCaptureGapPreservesAnExistingCameraClockOffset)
+{
+    StreamClock clock;
+    constexpr std::int64_t second = 1000000000LL;
+    clock.toWallClock(rclcpp::Time(WALL_NOW + 120 * second), rclcpp::Time(WALL_NOW));
+    const auto next = clock.toWallClock(rclcpp::Time(WALL_NOW + 420 * second),
+                                        rclcpp::Time(WALL_NOW + 300 * second));
+    EXPECT_EQ(next.nanoseconds(), WALL_NOW + 420 * second);
+    EXPECT_EQ(clock.reanchorCount(), 0u);
+}
+
 TEST(StreamClock, ExtremeSourceStampsCannotOverflowTheMappedTime)
 {
     StreamClock clock;
