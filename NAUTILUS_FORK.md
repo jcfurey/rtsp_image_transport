@@ -3,6 +3,62 @@
 Remote: [`jcfurey/rtsp_image_transport`](https://github.com/jcfurey/rtsp_image_transport),
 branch `cam_wip`.
 
+## ZED capture and native playback
+
+The package owns `launch/zed_rtsp.launch.py` and the installed `play_rtsp`
+helper. Run the optimized example without a Nautilus workspace:
+
+```bash
+ros2 launch rtsp_image_transport zed_rtsp.launch.py \
+  composed:=true output_encoding:=yuv422_yuy2 framerate:=60 bitrate:=12000000
+# In another terminal:
+ros2 run rtsp_image_transport play_rtsp
+```
+
+The [general playback guide](docs/low_latency_playback.rst) covers the shared
+viewer settings and existing ROS decoder controls for any RTSP camera.
+The [ZED guide](docs/zed_rtsp.rst) covers optional USB capture dependencies,
+all launch arguments, viewer overrides, and the measured latency comparisons.
+Camera and encoder can share a process with intra-process delivery, native
+YUYV avoids RGB conversion, and the player uses video clock sync and a single
+decoder thread. The generic transport does not acquire a dependency on the
+optional camera driver's OpenCV stack.
+
+NVENC's `zerolatency` option does not disable FFmpeg's separate asynchronous
+output queue. The encoder now sets `delay=0`, so the first image can produce
+output without future images. A GPU regression failed before the fix and
+passed afterward; all 31 encoder tests passed on the validation host.
+The final 60 fps runs measured 62-67 ms from V4L2 capture timestamp to renderer
+completion, excluding compositor and physical display scanout. The portable
+summary is in [benchmark/zed_rtsp_latency.json](benchmark/zed_rtsp_latency.json).
+
+## RealSense and Lucid capture profiles
+
+`camera_rtsp.launch.py` owns the shared camera/encoder/decoder integration;
+the ZED, RealSense, and Lucid launch entry points select driver-specific
+profiles. RealSense defaults to color-only capture with unused depth/IR/IMU,
+alignment, point clouds, and synchronization disabled. Lucid preserves its
+native format and exposes supported driver packet, serial, PTP, and GenICam
+configuration controls. Both default to composition with intra-process image
+delivery. Driver/SDK dependencies remain optional.
+
+The [camera profile guide](docs/camera_profiles.rst) records the exact driver
+APIs, override behavior, and validation scope. A D435i was tested with RGB8 and
+native YUYV at 1280x720/30 fps, plus YUYV at 848x480/60 fps. Native playback,
+an additional RTSP client, and raw/decoded ROS images were verified. A
+TRI050S1-Q at 10.2.2.36 was also tested at native 2448x2048 Bayer/15 fps with
+NVENC and the native viewer. Full-resolution decoded ROS delivery was about
+10.6 fps in the simultaneous subscription check; the guide records that limit.
+Other existing camera applications can use the generic image-topic-to-RTSP
+launch without replacing their capture drivers.
+
+The Lucid check exposed another camera-independent startup bug: four
+dependent pictures received before the first random-access picture could
+reject a working GPU. The startup probe now starts its no-output budget at
+that picture, with bounded waiting and replay storage. The live decoder stays
+on CUDA, and H.264/H.265 late-join regressions pass; a genuinely silent device
+still falls back and replays its initialization packets.
+
 ## Immediate server restart
 
 The publisher's listeners now use `SO_REUSEADDR`, without `SO_REUSEPORT`, so a

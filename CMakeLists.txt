@@ -244,6 +244,17 @@ target_link_libraries(
 
 install(TARGETS ${PROJECT_NAME} LIBRARY DESTINATION lib)
 install(FILES plugin.xml DESTINATION share/${PROJECT_NAME})
+install(PROGRAMS scripts/play_rtsp DESTINATION lib/${PROJECT_NAME})
+install(FILES benchmark/zed_rtsp_latency.json DESTINATION share/${PROJECT_NAME}/benchmark)
+install(FILES
+        launch/camera_rtsp.launch.py
+        launch/zed_rtsp.launch.py
+        launch/realsense_rtsp.launch.py
+        launch/lucid_rtsp.launch.py
+        launch/ros_to_rtsp_h264.launch.yaml
+        launch/ros_to_rtsp_h265.launch.yaml
+        launch/rtsp_to_ros.launch.yaml
+        DESTINATION share/${PROJECT_NAME}/launch)
 
 # Measurement programs. Off by default: they take minutes, some need a lossy
 # link and NET_ADMIN, and their output is numbers to read rather than
@@ -289,6 +300,7 @@ endif()
 # Tests
 if(BUILD_TESTING)
     ament_auto_find_test_dependencies()
+    ament_add_pytest_test(test_camera_launch test/test_camera_launch.py TIMEOUT 30)
 
     set(unit_tests
         test_video_codec
@@ -358,4 +370,4 @@ endif()
 # Ament package handling. ament_auto_package() installs the executables to
 # lib/${PROJECT_NAME}, which is where ros2 run looks for them.
 pluginlib_export_plugin_description_file(image_transport plugin.xml)
-ament_auto_package(INSTALL_TO_SHARE launch)
+ament_auto_package(INSTALL_TO_SHARE docs)

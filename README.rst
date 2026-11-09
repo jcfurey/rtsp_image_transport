@@ -107,8 +107,12 @@ The output ROS topic carries the URL, not the video. Read it once, then hand
 the value to ffplay, VLC, GStreamer, or another RTSP client::
 
   ros2 topic echo --once /camera/image_h264/rtsp
-  ffplay -rtsp_transport tcp -fflags nobuffer -flags low_delay \
-      rtsp://HOST:8555/
+  ros2 run rtsp_image_transport play_rtsp rtsp://HOST:8555/ -rtsp_transport tcp
+
+``play_rtsp`` is an installed ffplay helper with the tested playback settings:
+single-threaded low-delay decoding, video clock sync, reduced buffering, and
+an SDL vsync override. Its default UDP profile targets local viewing; supply
+additional ffplay options after the URL to override those defaults.
 
 The examples request best-effort input QoS with depth 1. That accepts both the
 usual ``SensorDataQoS`` camera publisher and a reliable publisher, while
@@ -136,6 +140,60 @@ child transport topic::
       -p out.rtsp.codec:=H264 -p out.rtsp.use_hw_encoder:=true \
       -r in:=/camera/image_raw \
       -r out/rtsp:=/camera/image_h264/rtsp
+
+Native RTSP Playback
+====================
+
+The installed helper works with any compatible RTSP camera stream::
+
+  ros2 run rtsp_image_transport play_rtsp rtsp://HOST:8555/PATH
+
+The `general playback guide <docs/low_latency_playback.rst>`_ explains the
+camera-independent viewer profile, UDP/TCP and buffering overrides, the ROS
+decoder's existing hardware and queue-latency controls, and how to measure the
+complete playback path. The helper changes settings only for its ffplay
+process; camera capture configuration stays in the source's launch file.
+
+Camera Capture Profiles
+=======================
+
+The package provides composed capture/encoding profiles for RealSense color
+and Lucid GigE cameras, alongside the ZED example::
+
+  ros2 launch rtsp_image_transport realsense_rtsp.launch.py
+  ros2 launch rtsp_image_transport lucid_rtsp.launch.py serial_number:=220903154
+
+Run one capture command for the attached camera, then use ``play_rtsp`` in
+another terminal. Vendor drivers and SDKs are optional. The `camera profile
+guide <docs/camera_profiles.rst>`_ documents color-only RealSense settings,
+optional native YUYV, native Lucid formats, GigE packet controls, parameter
+overrides, existing camera applications, and the hardware-validation limits.
+
+USB ZED Capture and Playback
+===========================
+
+The package includes a standalone ZED 2 UVC example with native YUYV capture,
+composed camera/encoder nodes, and an optional RTSP-to-ROS decoder. With the
+optional ``v4l2_camera`` and ``v4l-utils`` dependencies installed::
+
+  ros2 launch rtsp_image_transport zed_rtsp.launch.py \
+      composed:=true output_encoding:=yuv422_yuy2 \
+      framerate:=60 bitrate:=12000000
+
+In another terminal::
+
+  ros2 run rtsp_image_transport play_rtsp
+
+The `ZED capture and playback guide <docs/zed_rtsp.rst>`_ documents all launch
+options, playback overrides, optional dependencies, and the measurement
+method. Repeated real-camera runs measured 62-67 ms from the V4L2 capture
+timestamp to renderer completion at 2560x720 stereo and 60 fps; compositor and
+physical display latency are additional. No Nautilus workspace is required.
+
+NVENC now explicitly disables its asynchronous output delay. The
+``zerolatency`` setting alone disables reordering but leaves ready encoded
+frames queued until future frames arrive. A hardware regression test checks
+that the first image produces output without those extra input frames.
 
 RTSP to ROS Image Topic
 =======================

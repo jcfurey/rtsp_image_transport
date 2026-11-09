@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Native playback settings validated with the package's camera examples.
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: ros2 run rtsp_image_transport play_rtsp [RTSP_URL] [FFPLAY_OPTIONS...]
+
+Play an RTSP stream with the tested local low-latency settings.
+RTSP_URL defaults to rtsp://127.0.0.1:8555/ (the camera launch examples).
+Put the URL before any additional ffplay options. Additional options override
+the corresponding defaults, for example:
+
+  ros2 run rtsp_image_transport play_rtsp rtsp://camera:8555/ \
+    -rtsp_transport tcp
+
+Defaults: RTP over UDP, 2 MiB receive buffer, single-threaded low-delay decoding,
+reduced input buffering, no RTP reorder queue, video clock sync, frame dropping,
+and no audio. SDL_RENDER_VSYNC defaults to 0; an explicit value is preserved.
+For a remote UDP link, adjust -max_delay and -reorder_queue_size as needed.
+EOF
+}
+
+if [[ "${1:-}" == '--help' || "${1:-}" == '-h' ]]; then
+    usage
+    exit 0
+fi
+
+url='rtsp://127.0.0.1:8555/'
+if (( $# > 0 )); then
+    if [[ "$1" == -* ]]; then
+        printf '%s\n' 'play_rtsp: put the RTSP URL before ffplay options (see --help)' >&2
+        exit 2
+    fi
+    url="$1"
+    shift
+fi
+
+if ! command -v ffplay >/dev/null 2>&1; then
+    printf '%s\n' 'play_rtsp: ffplay is required; install the FFmpeg command-line tools' >&2
+    exit 127
+fi
+
+export SDL_RENDER_VSYNC="${SDL_RENDER_VSYNC:-0}"
+exec ffplay \
+    -rtsp_transport udp -buffer_size 2097152 \
+    -fflags nobuffer -flags low_delay -threads 1 \
+    -max_delay 0 -reorder_queue_size 0 \
+    -framedrop -sync video -noinfbuf -an \
+    "$@" "$url"

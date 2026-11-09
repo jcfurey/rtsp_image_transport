@@ -1,0 +1,26 @@
+{
+  "date": "2026-11-09",
+  "camera": "ZED 2 UVC stereo",
+  "image_width": 2560,
+  "image_height": 720,
+  "ros_distribution": "Lyrical",
+  "ffmpeg_version": "8.0.1",
+  "encoder": "h264_nvenc",
+  "method": "V4L2 monotonic capture timestamp embedded in image pixels before conversion/publication, recovered from decoded pixels, compared at SDL_RenderPresent completion. First five displayed seconds excluded.",
+  "measurement_excludes": [
+    "compositor and physical display scanout",
+    "sensor time not represented in the V4L2 timestamp"
+  ],
+  "viewer_viewport": [1280, 360],
+  "sdl_render_vsync": 0,
+  "results": [
+    {"configuration": "RGB, separate processes, external clock, original NVENC", "fps": 30, "median_ms": [391]},
+    {"configuration": "native YUYV, separate processes, video sync, original NVENC", "fps": 30, "median_ms": [175, 177]},
+    {"configuration": "native YUYV, composed, video sync, original NVENC", "fps": 30, "median_ms": [156, 161]},
+    {"configuration": "native YUYV, composed, video sync, NVENC delay=0", "fps": 30, "median_ms": [93, 97], "p95_ms": [94, 98]},
+    {"configuration": "native YUYV, composed, video sync, NVENC delay=0, 12 Mbit/s", "fps": 60, "median_ms": [62, 67], "p95_ms": [63, 68], "displayed_frames": [1224, 1227], "steady_display_fps": [59.996, 59.997], "invalid_timestamp_frames": 0}
+  ],
+  "encoder_tests": {"tests": 31, "failures": 0, "errors": 0},
+  "capture_command": "ros2 launch rtsp_image_transport zed_rtsp.launch.py composed:=true output_encoding:=yuv422_yuy2 framerate:=60 bitrate:=12000000",
+  "playback_command": "ros2 run rtsp_image_transport play_rtsp"
+}
