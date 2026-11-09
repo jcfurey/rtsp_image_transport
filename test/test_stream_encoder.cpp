@@ -143,6 +143,30 @@ TEST(StreamEncoder, ProducesPacketsForBgr8Input)
         EXPECT_GT(packet->length(), 0u);
 }
 
+TEST(StreamEncoder, NvencProducesFirstImageWithoutPrimingFrames)
+{
+    std::unique_ptr<StreamEncoder> encoder;
+    try
+    {
+        encoder = std::make_unique<StreamEncoder>(VideoCodec::H264, /*use_hw_encoder=*/true);
+    }
+    catch (const StreamingError&)
+    {
+        GTEST_SKIP() << "no usable H.264 encoder";
+    }
+    if (std::strcmp(encoder->context()->codec->name, "h264_nvenc") != 0)
+        GTEST_SKIP() << "NVENC is not the selected hardware encoder";
+
+    encoder->setFramerate(30);
+    // A live camera must not supply several future images before the first
+    // image becomes available. NVENC's async output delay is independent of
+    // the zero-reordering option and otherwise holds back ready bitstreams.
+    const auto image = makeTestImage(320, 240, 0);
+    ASSERT_GT(encoder->encodeVideo(image), 0u)
+        << "NVENC buffered the first image until later images arrive";
+    EXPECT_NE(encoder->nextPacket(), nullptr);
+}
+
 TEST(StreamEncoder, SplitsAnnexBStreamIntoIndividualNalUnits)
 {
     /* Live555 expects one NAL unit per frame from the source, without the

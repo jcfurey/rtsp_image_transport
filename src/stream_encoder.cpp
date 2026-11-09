@@ -351,6 +351,9 @@ void StreamEncoder::setupEncoder(const AVCodec* encoder, bool silent)
             else
                 set_codec_option(ctx_, "preset", "llhp", silent, logger_);
             set_codec_option(ctx_, "zerolatency", 1, silent, logger_);
+            // Zero reordering does not disable FFmpeg's separate async output
+            // queue. Release ready bitstreams without waiting for future frames.
+            set_codec_option(ctx_, "delay", 0, silent, logger_);
         }
         else if (strstr(encoder->name, "x26"))
         {
