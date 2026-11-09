@@ -154,6 +154,7 @@ private:
        does not pre-fill its frames. Sparsely sampled; see the implementation. */
     double unwrittenFraction(const AVFrame* frame) const noexcept;
     void resetWorkingBuffers();
+    void clearHardwareProbe() noexcept;
     bool fallBackAndReplay(const std::string& reason, std::size_t& replayed);
 
     rclcpp::Logger logger_;
@@ -183,6 +184,9 @@ private:
     std::shared_ptr<SwsContext> sws_;
     std::deque<sensor_msgs::msg::Image::UniquePtr> frames_;
     std::vector<FrameDataPtr> hardware_probe_packets_;
+    std::size_t hardware_probe_wait_packets_ = 0;
+    std::size_t hardware_probe_decodable_packets_ = 0;
+    bool hardware_probe_random_access_ = false;
     bool hardware_candidate_proven_ = false;
     bool replaying_probe_packets_ = false;
     bool restart_replay_ = false;

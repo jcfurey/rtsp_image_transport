@@ -28,8 +28,9 @@ class StreamDecoderTestPeer
     static void emulateHardwareCandidate(StreamDecoder& decoder)
     {
         decoder.hardware_ = true;
-        decoder.candidates_ = {{"h264", AV_HWDEVICE_TYPE_NONE, AV_PIX_FMT_NONE, true},
-                               {"h264", AV_HWDEVICE_TYPE_NONE, AV_PIX_FMT_NONE, false}};
+        const std::string name = decoder.codec() == VideoCodec::H265 ? "hevc" : "h264";
+        decoder.candidates_ = {{name, AV_HWDEVICE_TYPE_NONE, AV_PIX_FMT_NONE, true},
+                               {name, AV_HWDEVICE_TYPE_NONE, AV_PIX_FMT_NONE, false}};
         decoder.candidate_index_ = 0;
     }
     static bool proven(const StreamDecoder& decoder)
@@ -253,6 +254,54 @@ TEST(DecoderPerformance, SilentStartupStillFallsBackAndReplaysInitialization)
     EXPECT_EQ(StreamDecoderTestPeer::candidate(decoder), 1u);
     EXPECT_FALSE(decoder.isHardwareAccelerated());
 }
+
+class LateJoinTest : public ::testing::TestWithParam<VideoCodec>
+{
+};
+
+TEST_P(LateJoinTest, JoiningBetweenKeyFramesDoesNotRejectAWorkingDevice)
+{
+    const auto codec = GetParam();
+    auto packets = encodeTestStream(codec, 320, 240, 20);
+    ASSERT_EQ(packets.size(), 20u);
+    // Model an RTSP join: SDP supplies SPS/PPS, but the first IDR was sent
+    // before this client connected. Preserve the actual encoded P pictures.
+    std::vector<std::uint8_t> parameters;
+    const auto& first = packets.front();
+    for (std::size_t i = 0; i + 3 < first.size(); ++i)
+    {
+        if (first[i] != 0 || first[i + 1] != 0 || first[i + 2] != 1)
+            continue;
+        const auto type = codec == VideoCodec::H264 ? first[i + 3] & 0x1f : (first[i + 3] >> 1) & 0x3f;
+        std::size_t end = i + 3;
+        while (end + 2 < first.size()
+               && !(first[end] == 0 && first[end + 1] == 0 && first[end + 2] == 1))
+            ++end;
+        if (end + 2 >= first.size())
+            end = first.size();
+        if ((codec == VideoCodec::H264 && (type == 7 || type == 8))
+            || (codec == VideoCodec::H265 && type >= 32 && type <= 34))
+            parameters.insert(parameters.end(), first.begin() + i, first.begin() + end);
+        i = end - 1;
+    }
+    ASSERT_FALSE(parameters.empty());
+    packets[1].insert(packets[1].begin(), parameters.begin(), parameters.end());
+
+    StreamDecoder decoder(codec, softwareOptions());
+    StreamDecoderTestPeer::emulateHardwareCandidate(decoder);
+    // Like a hardware decoder waiting for references, accept the P pictures
+    // without returning them. This must not exhaust a four-picture GPU probe.
+    decoder.context()->skip_frame = AVDISCARD_NONKEY;
+    EXPECT_EQ(feed(decoder, packets, 1, 10), 0u);
+    EXPECT_EQ(StreamDecoderTestPeer::candidate(decoder), 0u);
+    EXPECT_LE(StreamDecoderTestPeer::retainedPackets(decoder), 2u);
+    EXPECT_EQ(feed(decoder, packets, 10, 11), 1u);
+    decoder.context()->skip_frame = AVDISCARD_DEFAULT;
+    EXPECT_EQ(feed(decoder, packets, 11, 20), 9u);
+    EXPECT_EQ(StreamDecoderTestPeer::candidate(decoder), 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(H26x, LateJoinTest, ::testing::Values(VideoCodec::H264, VideoCodec::H265));
 
 TEST(DecoderPerformance, DeviceFallbackRetainsTheRequestedDropMode)
 {

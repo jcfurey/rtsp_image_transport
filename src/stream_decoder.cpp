@@ -112,6 +112,26 @@ bool isKeyFrame(const AVFrame* frame) noexcept
 #endif
 }
 
+/* A late RTSP join can deliver valid P pictures before any references. They
+   cannot prove that a hardware decoder is broken. FrameExtractor supplies
+   Annex B access units, so recognize H.264 IDR and H.265 BLA/IDR/CRA here. */
+bool hasRandomAccessPicture(VideoCodec codec, const FrameData& data) noexcept
+{
+    if (codec != VideoCodec::H264 && codec != VideoCodec::H265)
+        return true;
+    for (std::size_t i = 0; i + 3 < data.length(); ++i)
+    {
+        const auto* bytes = data.data() + i;
+        if (bytes[0] != 0 || bytes[1] != 0 || bytes[2] != 1)
+            continue;
+        const unsigned type = codec == VideoCodec::H264 ? bytes[3] & 0x1f : (bytes[3] >> 1) & 0x3f;
+        if ((codec == VideoCodec::H264 && type == 5)
+            || (codec == VideoCodec::H265 && i + 4 < data.length() && type >= 16 && type <= 21))
+            return true;
+    }
+    return false;
+}
+
 /* Colour space conversion is the most expensive step of the decoding pipeline
    for large frames, so let libswscale spread it over a few threads if the
    installed version supports it. Sets `threaded` when the returned context
@@ -689,7 +709,7 @@ bool StreamDecoder::fallBackToNextCandidate(const std::string& reason)
 bool StreamDecoder::fallBackAndReplay(const std::string& reason, std::size_t& replayed)
 {
     std::vector<FrameDataPtr> packets = std::move(hardware_probe_packets_);
-    hardware_probe_packets_.clear();
+    clearHardwareProbe();
     replayed = 0;
     if (!fallBackToNextCandidate(reason))
         return false;
@@ -721,6 +741,14 @@ bool StreamDecoder::fallBackAndReplay(const std::string& reason, std::size_t& re
     return true;
 }
 
+void StreamDecoder::clearHardwareProbe() noexcept
+{
+    hardware_probe_packets_.clear();
+    hardware_probe_wait_packets_ = 0;
+    hardware_probe_decodable_packets_ = 0;
+    hardware_probe_random_access_ = false;
+}
+
 void StreamDecoder::resetWorkingBuffers()
 {
     initialized_ = false;
@@ -733,7 +761,7 @@ void StreamDecoder::resetWorkingBuffers()
     width_ = 0;
     height_ = 0;
     last_pixel_format_ = AV_PIX_FMT_NONE;
-    hardware_probe_packets_.clear();
+    clearHardwareProbe();
     hardware_candidate_proven_ = false;
 }
 
@@ -742,7 +770,7 @@ void StreamDecoder::setDecodeFrames(DecodeFrames which) noexcept
     decode_frames_ = which;
     // A suppressed picture is neither evidence of failure nor something to replay.
     if (which != DecodeFrames::All)
-        hardware_probe_packets_.clear();
+        clearHardwareProbe();
     switch (which)
     {
         case DecodeFrames::All:
@@ -792,7 +820,21 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
     constexpr std::size_t hardware_probe_limit = 4;
     const bool probing = hardware_ && !hardware_candidate_proven_ && decode_frames_ == DecodeFrames::All;
     if (probing && !replaying_probe_packets_)
+    {
+        if (!hardware_probe_random_access_)
+        {
+            hardware_probe_random_access_ = hasRandomAccessPicture(codec_, *data)
+                                             || ++hardware_probe_wait_packets_ >= KEYFRAME_WAIT_LIMIT;
+            // Keep the first packet's SDP parameter sets while waiting, but
+            // do not retain a whole GOP of unusable dependent pictures.
+            if (hardware_probe_packets_.size() > 1)
+                hardware_probe_packets_.erase(hardware_probe_packets_.begin() + 1,
+                                               hardware_probe_packets_.end());
+        }
+        if (hardware_probe_random_access_)
+            ++hardware_probe_decodable_packets_;
         hardware_probe_packets_.push_back(data);
+    }
 
     if (!initialized_)
     {
@@ -822,7 +864,7 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
         const bool rejected = hw_format_rejected_.exchange(false);
         if (result == AVERROR_INVALIDDATA && !(hardware_ && rejected))
         {
-            hardware_probe_packets_.clear();
+            clearHardwareProbe();
             throw DecodingError(message);
         }
         std::size_t replayed = 0;
@@ -836,7 +878,7 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
         // Successful decoding proves the device even if startup or drop policy
         // withholds this particular image from the subscriber.
         hardware_candidate_proven_ = true;
-        hardware_probe_packets_.clear();
+        clearHardwareProbe();
         if (discardFrame(frm_.get()))
         {
             av_frame_unref(frm_.get());
@@ -898,7 +940,7 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
         const bool rejected = hw_format_rejected_.exchange(false);
         if (result == AVERROR_INVALIDDATA && !(hardware_ && rejected))
         {
-            hardware_probe_packets_.clear();
+            clearHardwareProbe();
             throw DecodingError(message);
         }
         std::size_t replayed = 0;
@@ -908,10 +950,10 @@ std::size_t StreamDecoder::decodeVideo(const FrameDataPtr& data)
     }
     if (count > 0)
     {
-        hardware_probe_packets_.clear();
+        clearHardwareProbe();
     }
     else if (probing && !hardware_candidate_proven_ && !replaying_probe_packets_
-             && hardware_probe_packets_.size() >= hardware_probe_limit)
+             && hardware_probe_decodable_packets_ >= hardware_probe_limit)
     {
         std::size_t replayed = 0;
         if (fallBackAndReplay("hardware decoder produced no frames during startup", replayed))
