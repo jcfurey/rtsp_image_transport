@@ -21,6 +21,7 @@
  * every plane that must survive untouched.
  */
 #include "frame_fill.h"
+#include "frame_data.h"
 
 #include <gtest/gtest.h>
 
@@ -36,6 +37,23 @@ extern "C"
 
 namespace rtsp_image_transport
 {
+TEST(FrameTiming, PresentationEvidenceSurvivesReceiveTimeRestamping)
+{
+    const unsigned char data[] = {0, 0, 1, 5};
+    FrameData frame(data, sizeof(data), rclcpp::Time(123, 456, RCL_SYSTEM_TIME));
+    const auto utc = frame.receiveUtcNs();
+    const auto monotonic = frame.receiveMonotonicNs();
+    frame.setStamp(rclcpp::Time(789, 0, RCL_SYSTEM_TIME));
+    EXPECT_EQ(frame.presentationStamp().nanoseconds(), 123000000456LL);
+    EXPECT_EQ(frame.stamp().nanoseconds(), 789000000000LL);
+    EXPECT_GT(utc, 0);
+    EXPECT_GT(monotonic, 0);
+    EXPECT_EQ(frame.receiveUtcNs(), utc);
+    EXPECT_EQ(frame.receiveMonotonicNs(), monotonic);
+    EXPECT_FALSE(frame.rtp_timestamp.has_value());
+    EXPECT_FALSE(frame.rtcp_synchronized);
+}
+
 namespace
 {
 

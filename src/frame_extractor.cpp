@@ -194,7 +194,14 @@ void FrameExtractor::flushPending()
     if (length == 0)
         return;
     const rclcpp::Time ts(buffer_time_.tv_sec, 1000ull * buffer_time_.tv_usec);
-    sc->receiveStreamData(codec_, subsession_, std::make_shared<FrameData>(buffer_.data(), length, ts));
+    auto frame = std::make_shared<FrameData>(buffer_.data(), length, ts);
+    if (auto* rtp = subsession_ ? subsession_->rtpSource() : nullptr)
+    {
+        frame->rtp_timestamp = buffer_rtp_time_;
+        frame->rtp_ssrc = rtp->lastReceivedSSRC();
+        frame->rtcp_synchronized = rtp->hasBeenSynchronizedUsingRTCP();
+    }
+    sc->receiveStreamData(codec_, subsession_, frame);
     buffer_length_ = 0;
     have_buffer_time_ = false;
 }
@@ -243,7 +250,14 @@ void FrameExtractor::closeMarkedAccessUnit()
     if (length == 0)
         return;
     const rclcpp::Time ts(buffer_time_.tv_sec, 1000ull * buffer_time_.tv_usec);
-    sc->receiveStreamData(codec_, subsession_, std::make_shared<FrameData>(buffer_.data(), length, ts));
+    auto frame = std::make_shared<FrameData>(buffer_.data(), length, ts);
+    if (auto* rtp = subsession_ ? subsession_->rtpSource() : nullptr)
+    {
+        frame->rtp_timestamp = buffer_rtp_time_;
+        frame->rtp_ssrc = rtp->lastReceivedSSRC();
+        frame->rtcp_synchronized = rtp->hasBeenSynchronizedUsingRTCP();
+    }
+    sc->receiveStreamData(codec_, subsession_, frame);
     delivered_length_ = length;
     have_buffer_time_ = false;
 }
@@ -339,8 +353,14 @@ void FrameExtractor::deliverNalUnit(unsigned frameSize, unsigned numTruncatedByt
             /* Everything sharing the old stamp has arrived; send it, then start
                the new picture with the NAL unit that just came in. */
             const rclcpp::Time ts(buffer_time_.tv_sec, 1000ull * buffer_time_.tv_usec);
-            sc->receiveStreamData(codec_, subsession_,
-                                  std::make_shared<FrameData>(buffer_.data(), prefix_length, ts));
+            auto frame = std::make_shared<FrameData>(buffer_.data(), prefix_length, ts);
+            if (rtp)
+            {
+                frame->rtp_timestamp = buffer_rtp_time_;
+                frame->rtp_ssrc = rtp->lastReceivedSSRC();
+                frame->rtcp_synchronized = rtp->hasBeenSynchronizedUsingRTCP();
+            }
+            sc->receiveStreamData(codec_, subsession_, frame);
             const std::size_t carried = prefix_size + frameSize;
             std::memmove(buffer_.data(), buffer_.data() + prefix_length, carried);
             buffer_length_ = carried;

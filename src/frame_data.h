@@ -25,6 +25,8 @@
 
 #include <cstddef>
 #include <memory>
+#include <cstdint>
+#include <optional>
 
 namespace rtsp_image_transport
 {
@@ -53,11 +55,20 @@ public:
     {
         stamp_ = stamp;
     }
+    const rclcpp::Time& presentationStamp() const noexcept { return presentation_stamp_; }
+    std::int64_t receiveUtcNs() const noexcept { return receive_utc_ns_; }
+    std::int64_t receiveMonotonicNs() const noexcept { return receive_monotonic_ns_; }
+    std::optional<std::uint32_t> rtp_timestamp;
+    std::optional<std::uint32_t> rtp_ssrc;
+    bool rtcp_synchronized = false;
 
 private:
     unsigned char* data_;
     std::size_t length_;
     rclcpp::Time stamp_;
+    rclcpp::Time presentation_stamp_;
+    std::int64_t receive_utc_ns_;
+    std::int64_t receive_monotonic_ns_;
 };
 
 using FrameDataPtr = std::shared_ptr<FrameData>;

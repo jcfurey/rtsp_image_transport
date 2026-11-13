@@ -28,6 +28,7 @@
 #include "topic_parameter.h"
 
 #include <rclcpp/create_subscription.hpp>
+#include <rclcpp/create_publisher.hpp>
 #include <rclcpp/exceptions.hpp>
 #include <rclcpp/node_interfaces/node_waitables.hpp>
 #include <rclcpp/waitable.hpp>
@@ -250,6 +251,7 @@ void SubscriberPlugin::shutdown()
     decoder_.store(nullptr);
     clearQueuedFrames();
     url_subscription_.reset();
+    timing_publisher_.reset();
     clock_source_.reset();
 }
 
@@ -306,6 +308,8 @@ void SubscriberPlugin::subscribeImpl(rclcpp::Node* node, const std::string& base
     custom_qos.durability = RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
     /* An incompatible publisher otherwise just means no video, with nothing in
        the log to explain it. */
+    timing_publisher_ = node->create_publisher<std_msgs::msg::String>(base_topic + "/timing", 100);
+    timing_instance_ = std::chrono::steady_clock::now().time_since_epoch().count();
     options.event_callbacks.incompatible_qos_callback = callback_gate_->wrap(
         [this](rclcpp::QOSRequestedIncompatibleQoSInfo& info)
         {
@@ -370,6 +374,9 @@ void SubscriberPlugin::subscribeImpl(image_transport::RequiredInterfaces node_in
         [this, callback](std_msgs::msg::String::ConstSharedPtr msg) { internalCallback(msg, callback); });
     auto parameters_interface = node_interfaces.get_node_parameters_interface();
     auto topics_interface = node_interfaces.get_node_topics_interface();
+    timing_publisher_ = rclcpp::create_publisher<std_msgs::msg::String>(
+        parameters_interface, topics_interface, base_topic + "/timing", rclcpp::QoS(100));
+    timing_instance_ = std::chrono::steady_clock::now().time_since_epoch().count();
     url_subscription_ = rclcpp::create_subscription<std_msgs::msg::String>(
         parameters_interface, topics_interface, base_topic + "/rtsp", custom_qos, std::move(on_url), options);
 
@@ -510,6 +517,27 @@ void SubscriberPlugin::reportMissingHwDecoder(const StreamDecoder& decoder)
 
 void SubscriberPlugin::receiveDataStream(VideoCodec codec, MediaSubsession* subsession, const FrameDataPtr& data)
 {
+    const auto ingress_id = timing_ingress_id_.fetch_add(1);
+    if (timing_publisher_ && timing_publisher_->get_subscription_count() > 0)
+    {
+        const auto optional_number = [](const auto& value)
+        { return value ? std::to_string(*value) : std::string("null"); };
+        std_msgs::msg::String timing;
+        timing.data = "{\"schema_version\":1,\"source_id\":\"" + std::string(url_subscription_->get_topic_name()) +
+            "\",\"instance\":\"" + std::to_string(timing_instance_) + "\",\"ingress_id\":" +
+            std::to_string(ingress_id) + ",\"receipt\":{\"utc_ns\":" +
+            std::to_string(data->receiveUtcNs()) + ",\"monotonic_ns\":" +
+            std::to_string(data->receiveMonotonicNs()) + "},\"library_presentation_time_ns\":" +
+            std::to_string(data->presentationStamp().nanoseconds()) +
+            ",\"codec\":\"" + std::string(videoCodecName(codec)) + "\",\"media_clock_rate_hz\":" +
+            (subsession ? std::to_string(subsession->rtpTimestampFrequency()) : std::string("null")) +
+            ",\"rtp_timestamp\":" + optional_number(data->rtp_timestamp) +
+            ",\"rtp_ssrc\":" + optional_number(data->rtp_ssrc) +
+            ",\"rtcp_synchronized\":" + (data->rtcp_synchronized ? "true" : "false") +
+            ",\"boundary\":\"completed_access_unit\",\"quality\":\"unverified_media_clock\","
+            "\"measurement_time_ns\":null,\"uncertainty_ns\":null}";
+        timing_publisher_->publish(timing);
+    }
     RCLCPP_DEBUG_THROTTLE(logger_, *steady_clock_, 30000, "[%s] receiving video frames from RTSP stream",
                           topic_name_.c_str());
     if (useReceiveTimestamps())

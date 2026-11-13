@@ -29,6 +29,7 @@
 
 #include <image_transport/subscriber_plugin.hpp>
 #include <rclcpp/subscription.hpp>
+#include <rclcpp/publisher.hpp>
 #include <rclcpp/time_source.hpp>
 #include <rclcpp/timer.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -113,6 +114,9 @@ private:
     // the event loop wait on the executor.
     std::shared_ptr<CallbackGate> callback_gate_ = std::make_shared<CallbackGate>();
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr url_subscription_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr timing_publisher_;
+    std::atomic<std::uint64_t> timing_ingress_id_{0};
+    std::int64_t timing_instance_{};
     bool shutdown_ = false;
     bool session_finished_ = false;
     ReconnectCause reconnect_cause_ = ReconnectCause::None;

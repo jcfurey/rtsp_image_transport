@@ -21,6 +21,7 @@
 #include "frame_data.h"
 
 #include <algorithm>
+#include <chrono>
 
 extern "C"
 {
@@ -33,7 +34,11 @@ namespace rtsp_image_transport
 FrameData::FrameData(const unsigned char* data, std::size_t length,
                      const rclcpp::Time& stamp)
     : data_(new unsigned char[length + AV_INPUT_BUFFER_PADDING_SIZE]),
-      length_(length), stamp_(stamp)
+      length_(length), stamp_(stamp), presentation_stamp_(stamp),
+      receive_utc_ns_(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count()),
+      receive_monotonic_ns_(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count())
 {
     std::copy_n(data, length, data_);
     std::fill_n(data_ + length, AV_INPUT_BUFFER_PADDING_SIZE, 0);

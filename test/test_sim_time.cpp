@@ -27,6 +27,7 @@
 #include <pluginlib/class_loader.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rosgraph_msgs/msg/clock.hpp>
+#include <std_msgs/msg/string.hpp>
 #if __has_include(<rclcpp/experimental/executors/events_executor/events_executor.hpp>)
 #include <rclcpp/experimental/executors/events_executor/events_executor.hpp>
 #define RTSP_TEST_HAS_EVENTS_EXECUTOR 1
@@ -215,9 +216,20 @@ TEST(Transport, DeliversImagesEndToEnd)
     TransportFixture fixture("rtsp_transport_roundtrip", /*use_sim_time=*/false);
     ASSERT_TRUE(fixture.start()) << fixture.failure_;
 
+    std::vector<std::string> observations;
+    const auto timing = fixture.node_->create_subscription<std_msgs::msg::String>(
+        "camera/image/timing", 100,
+        [&observations](std_msgs::msg::String::ConstSharedPtr message)
+        { observations.push_back(message->data); });
+
     rclcpp::Clock wall(RCL_SYSTEM_TIME);
     const std::size_t got = fixture.pump(3, 60s, nullptr, wall.now().nanoseconds());
     ASSERT_GE(got, 1u) << "no image made it through the rtsp transport";
+    ASSERT_FALSE(observations.empty());
+    EXPECT_NE(observations.back().find("\"library_presentation_time_ns\":"), std::string::npos);
+    EXPECT_NE(observations.back().find("\"monotonic_ns\":"), std::string::npos);
+    EXPECT_NE(observations.back().find("\"quality\":\"unverified_media_clock\""), std::string::npos);
+    EXPECT_EQ(observations.back().find("\"rtp_timestamp\":null"), std::string::npos);
 
     for (const auto& img : fixture.received())
     {
